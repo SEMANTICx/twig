@@ -15,9 +15,8 @@
 //!   2. a correct port that is slower per call is not worth enabling — cost is a
 //!      gate too
 
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -44,29 +43,14 @@ impl Candidate {
 
     /// JSON in, JSON out. A non-zero exit is the candidate's error channel.
     pub fn run(&self, input: &Value) -> Result<Value, String> {
-        let mut child = Command::new(&self.program)
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", self.program))?;
-        {
-            let stdin = child.stdin.as_mut().ok_or("no stdin")?;
-            stdin
-                .write_all(input.to_string().as_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let first = stderr.lines().next().unwrap_or("").trim().to_string();
-            return Err(format!(
-                "exit {}: {first}",
-                out.status.code().unwrap_or(-1)
-            ));
-        }
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("json: {e}"))
+        let mut cmd=Command::new(&self.program);
+        cmd.args(&self.args);
+        let out=crate::execution::run_process(&mut cmd,input.to_string().as_bytes(),
+            std::time::Duration::from_secs(120),1_048_576).map_err(|e|format!("spawn {}: {e}",self.program))?;
+        if out.timed_out {return Err("timeout: differential candidate exceeded 120s".into());}
+        if out.truncated {return Err("candidate output exceeds 1 MiB".into());}
+        if out.exit_code!=Some(0) {return Err(format!("exit {}: {}",out.exit_code.unwrap_or(-1),String::from_utf8_lossy(&out.stderr)));}
+        serde_json::from_slice(&out.stdout).map_err(|e|format!("json: {e}"))
     }
 }
 

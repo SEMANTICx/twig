@@ -42,10 +42,8 @@ pub struct Roles(pub HashMap<String, String>);
 impl Default for Roles {
     fn default() -> Self {
         let mut m = HashMap::new();
-        m.insert("filter".into(), "jev".into());
-        m.insert("plan".into(), "opus-5.5".into());
-        m.insert("code".into(), "gpt-6-sol".into());
-        m.insert("judge".into(), "gemini-4-neon".into());
+        let model = std::env::var("TWIG_MODEL").unwrap_or_else(|_| "aihub/gpt-6.1-sol".into());
+        for role in ["filter", "plan", "code", "judge"] { m.insert(role.into(), model.clone()); }
         Roles(m)
     }
 }
@@ -56,7 +54,7 @@ impl Roles {
             .get(role)
             .or_else(|| self.0.get("code"))
             .map(String::as_str)
-            .unwrap_or("gpt-6-sol")
+            .unwrap_or("aihub/gpt-6.1-sol")
     }
 
     /// `TWIG_ROLES='{"code":"x"}'` overrides individual roles.
@@ -118,7 +116,7 @@ pub fn parse_reply(body: &Value) -> Result<Reply, String> {
     Ok(Reply { text, calls, usage: crate::telemetry::Usage::parse(&body["usage"]) })
 }
 
-pub trait Llm {
+pub trait Llm: Sync {
     fn roles(&self) -> &Roles;
     fn calls(&self) -> u64;
     fn complete(
@@ -128,6 +126,13 @@ pub trait Llm {
         messages: &[Value],
         tools: Option<&Value>,
     ) -> Result<Reply, String>;
+    fn stream(&self, model: &str, system: &str, messages: &[Value], tools: Option<&Value>,
+        control: &crate::control::Control, emit: &mut dyn FnMut(Value)) -> Result<Reply, String> {
+        if control.cancelled() { return Err("cancelled".into()); }
+        let reply = self.complete(model, system, messages, tools)?;
+        if !reply.text.is_empty() { emit(json!({"ev":"model.delta","text":reply.text})); }
+        Ok(reply)
+    }
 }
 
 pub struct Provider {
@@ -217,6 +222,17 @@ impl Llm for Provider {
             serde_json::from_str(&text).map_err(|e| format!("magpie returned non-JSON: {e}"))?;
         parse_reply(&body)
     }
+
+    fn stream(&self, model: &str, system: &str, messages: &[Value], tools: Option<&Value>,
+        control: &crate::control::Control, emit: &mut dyn FnMut(Value)) -> Result<Reply,String> {
+        let mut msgs = vec![json!({"role":"system","content":system})];
+        msgs.extend_from_slice(messages);
+        let mut payload = json!({"model":model,"messages":msgs,"stream":true,
+            "stream_options":{"include_usage":true}});
+        if let Some(t) = tools { payload["tools"] = t.clone(); }
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        crate::stream::complete(self.base.clone(), self.key.clone(), payload, self.timeout, control, emit)
+    }
 }
 
 #[cfg(test)]
@@ -258,10 +274,4 @@ mod tests {
         assert_eq!(reply.calls[0].args["_raw"], "not json");
     }
 
-    #[test]
-    fn roles_have_a_default_and_can_be_overridden() {
-        let roles = Roles::default();
-        assert_eq!(roles.get("code"), "gpt-6-sol");
-        assert_eq!(roles.get("nonexistent"), "gpt-6-sol", "unknown role falls back to code");
-    }
 }

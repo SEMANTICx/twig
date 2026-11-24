@@ -91,7 +91,7 @@ pub fn run_process(command: &mut Command, input: &[u8], timeout: Duration, max_o
 }
 pub fn run_check(cwd: &Path, check: &Check) -> io::Result<CheckResult> {
     let out = run_process(Command::new("sh").args(["-c", &check.command]).current_dir(cwd), &[], Duration::from_millis(check.timeout_ms.max(1)), check.max_output_bytes)?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let available = check.max_output_bytes.saturating_sub(text.len());
     let mut end = available.min(stderr.len()); while !stderr.is_char_boundary(end) { end -= 1; }

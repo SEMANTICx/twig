@@ -75,6 +75,7 @@ impl Record {
         }
         // an empty chain is still a chain
         OpenOptions::new().create(true).append(true).open(&path)?;
+        Self::verify_chain(&path).map_err(|(i,e)|std::io::Error::other(format!("record corruption at {i}: {e}")))?;
         let mut prev = GENESIS.to_string();
         let mut seq = 0u64;
         if let Ok(file) = std::fs::File::open(&path) {
@@ -115,7 +116,7 @@ impl Record {
         map.insert("prev".into(), json!(self.prev));
         if let Value::Object(fields) = extra {
             for (k, v) in fields {
-                map.insert(k, v);
+                if !["seq","ts","sid","kind","prev","hash"].contains(&k.as_str()) { map.insert(k, v); }
             }
         }
         let mut body = Value::Object(map);
@@ -126,6 +127,7 @@ impl Record {
 
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         writeln!(file, "{body}")?;
+        file.sync_data()?;
         self.prev = hash;
         self.seq += 1;
         Ok(body)

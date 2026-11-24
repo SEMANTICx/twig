@@ -36,6 +36,11 @@ pub fn run_turn(
     audit_sink: &mut dyn FnMut(&ToolCall, &str),
     emit: &mut dyn FnMut(Value),
 ) -> Result<TurnResult, String> {
+    run_turn_live(ctx, audit_sink, emit, &crate::control::Control::default(), false)
+}
+
+pub fn run_turn_live(ctx: TurnCtx<'_>, audit_sink: &mut dyn FnMut(&ToolCall, &str),
+    emit: &mut dyn FnMut(Value), control: &crate::control::Control, interactive: bool) -> Result<TurnResult,String> {
     let TurnCtx {
         llm,
         tools,
@@ -46,6 +51,11 @@ pub fn run_turn(
         system,
         model,
     } = ctx;
+    if control.cancelled() { return Ok(TurnResult { done:true, reason:"cancelled", text:String::new() }); }
+    for steering in control.take_steering() {
+        messages.push(json!({"role":"user","content":steering}));
+        record.append("steering.applied", json!({"text":steering})).map_err(|e|e.to_string())?;
+    }
 
     let turns_used = messages
         .iter()
@@ -71,7 +81,7 @@ pub fn run_turn(
     }
 
     emit(json!({"ev": "turn.started", "model": model, "turns_used": turns_used}));
-    let reply = llm.complete(model, system, messages, Some(&tools.schema()))?;
+    let reply = llm.stream(model, system, messages, Some(&tools.schema()), control, emit)?;
     record
         .append(
             "model.reply",
@@ -85,6 +95,12 @@ pub fn run_turn(
             }),
         )
         .map_err(|e| e.to_string())?;
+    let mut assistant = json!({"role":"assistant","content":reply.text,"tool_calls":reply.calls.iter()
+        .map(|c|json!({"id":c.id,"type":"function","function":{"name":c.name,"arguments":c.args.to_string()}}))
+        .collect::<Vec<_>>()});
+    if reply.calls.is_empty(){assistant.as_object_mut().unwrap().remove("tool_calls");}
+    messages.push(assistant.clone());
+    record.append("message", json!({"message":assistant})).map_err(|e|e.to_string())?;
 
     if reply.calls.is_empty() {
         record
@@ -116,6 +132,7 @@ pub fn run_turn(
     let mut results: Vec<Value> = Vec::with_capacity(reply.calls.len());
     for (call, tier) in reply.calls.iter().zip(tiers) {
         if tier == Tier::Deny {
+            if interactive { control.begin_approval(&call.id); }
             emit(json!({"ev": "approval.requested", "id": call.id, "args": call.args}));
             record
                 .append(
@@ -123,15 +140,23 @@ pub fn run_turn(
                     json!({"id": call.id, "args": call.args}),
                 )
                 .map_err(|e| e.to_string())?;
-            results.push(json!({
-                "tool_call_id": call.id,
-                "content": "blocked: hard-deny, needs approval"
-            }));
-            continue;
+            record.append("messages.checkpoint", json!({"messages":messages,"pending_call":{
+                "id":call.id,"name":call.name,"args":call.args}})).map_err(|e|e.to_string())?;
+            let approved = if interactive { control.approval(&call.id) } else { Some(false) };
+            if approved.is_none() {
+                return Ok(TurnResult {done:true,reason:"awaiting_approval",text:String::new()});
+            }
+            record.append("approval.resolved", json!({"id":call.id,"allow":approved==Some(true)})).map_err(|e|e.to_string())?;
+            emit(json!({"ev":"approval.resolved","id":call.id,"allow":approved==Some(true)}));
+            if approved != Some(true) {
+                results.push(json!({"tool_call_id":call.id,"content":"denied by user"}));
+                continue;
+            }
         }
 
         emit(json!({"ev": "tool.started", "id": call.id, "tier": tier.as_str()}));
-        let output = tools.run(call);
+        let output = if control.cancelled() { "cancelled before execution".into() }
+            else { tools.run_live(call, control, emit) };
         record
             .append(
                 "tool.result",
@@ -155,22 +180,6 @@ pub fn run_turn(
         }));
     }
 
-    let assistant_calls: Vec<Value> = reply
-        .calls
-        .iter()
-        .map(|c| {
-            json!({
-                "id": c.id,
-                "type": "function",
-                "function": {"name": c.name, "arguments": c.args.to_string()}
-            })
-        })
-        .collect();
-    messages.push(json!({
-        "role": "assistant",
-        "content": reply.text,
-        "tool_calls": assistant_calls
-    }));
     for item in &results {
         messages.push(json!({
             "role": "tool",
@@ -178,6 +187,7 @@ pub fn run_turn(
             "content": item["content"]
         }));
     }
+    record.append("messages.checkpoint", json!({"messages":messages})).map_err(|e|e.to_string())?;
 
     emit(json!({
         "ev": "turn.completed",

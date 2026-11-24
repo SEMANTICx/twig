@@ -51,6 +51,11 @@ fn status_without_reaping(pid: u32) -> std::io::Result<Option<i32>> {
 }
 
 pub fn run(cwd: &Path, command: &str, timeout: Duration) -> std::io::Result<Output> {
+    run_live(cwd, command, timeout, &crate::control::Control::default(), &mut |_| {})
+}
+
+pub fn run_live(cwd: &Path, command: &str, timeout: Duration,
+    control: &crate::control::Control, emit: &mut dyn FnMut(String)) -> std::io::Result<Output> {
     let (mut reader, writer) = UnixStream::pair()?;
     reader.set_nonblocking(true)?;
     let capture = reader.try_clone()?; // all fallible descriptor duplication precedes spawn
@@ -70,6 +75,7 @@ pub fn run(cwd: &Path, command: &str, timeout: Duration) -> std::io::Result<Outp
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    if bytes.len() < CAP { emit(String::from_utf8_lossy(&buf[..n]).into_owned()); }
                     let take = n.min(CAP.saturating_sub(bytes.len()));
                     bytes.extend_from_slice(&buf[..take]);
                     discarded |= take < n;
@@ -84,6 +90,10 @@ pub fn run(cwd: &Path, command: &str, timeout: Duration) -> std::io::Result<Outp
     let (code, timed_out) = loop {
         drain(&mut reader)?;
         if let Some(code) = status_without_reaping(owner.child.id())? { break (code, false); }
+        if control.cancelled() {
+            kill_group(owner.child.id());
+            break (130, false);
+        }
         if Instant::now() >= deadline {
             kill_group(owner.child.id());
             break (124, true);

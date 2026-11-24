@@ -51,6 +51,8 @@ impl SkillIndex {
             entries.push(SkillMetadata { name, description, path });
             if entries.len() > MAX_SKILLS { return Err(io::Error::new(io::ErrorKind::InvalidData, "too many skills")); }
         }
+        entries.sort_by(|a,b|a.name.cmp(&b.name));
+        Ok(Self {root,entries})
     }
     pub fn metadata(&self) -> &[SkillMetadata] { &self.entries }
     pub fn load(&self, name: &str) -> io::Result<String> {

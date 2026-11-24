@@ -3,3 +3,5 @@
 /.twig/
 /harness.json.baseline
 *.log
+__pycache__/
+*.pyc

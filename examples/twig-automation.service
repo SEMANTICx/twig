@@ -1,0 +1,14 @@
+[Unit]
+Description=Twig repository maintenance
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/twig automate %h/.config/twig/automation.json
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=-%h/.config/twig/environment
+UMask=0077
+
+[Install]
+WantedBy=default.target

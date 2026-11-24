@@ -83,7 +83,7 @@ impl SubagentPool {
         let request = format!("{}\n", json!({"id":1,"method":"turn","params":{"input":task,"role":role.as_str()}}));
         command.args(["/tool/twig", "serve", "/workspace", "/runs"])
             .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", "/nonexistent")
-            .env("TWIG_BASE_URL", std::env::var("TWIG_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3425/v1"));
+            .env("TWIG_BASE_URL", std::env::var("TWIG_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3425/v1".into()));
         let capture = run_process(&mut command, request.as_bytes(), self.config.timeout, self.config.max_output_bytes)?;
         let mut raw = String::from_utf8_lossy(&capture.stdout).into_owned();
         raw.push_str(&String::from_utf8_lossy(&capture.stderr));

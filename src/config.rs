@@ -19,7 +19,7 @@ Do not ask for permission for ordinary work. Do not explain at length what you a
 about to do; do it and show the result.";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct HarnessConfig {
     pub system: String,
     pub bash_description: String,
@@ -29,6 +29,10 @@ pub struct HarnessConfig {
     pub bash_timeout_secs: u64,
     pub max_turns: u32,
     pub stall_turns: u32,
+    pub context_max_bytes: usize,
+    pub isolation: bool,
+    pub network: bool,
+    pub subagent_concurrency: usize,
 }
 
 impl Default for HarnessConfig {
@@ -44,6 +48,10 @@ impl Default for HarnessConfig {
             bash_timeout_secs: 120,
             max_turns: 40,
             stall_turns: 6,
+            context_max_bytes: 120_000,
+            isolation: false,
+            network: true,
+            subagent_concurrency: 3,
         }
     }
 }
@@ -60,6 +68,8 @@ const BOUNDS: &[(&str, u64, u64)] = &[
 
 impl HarnessConfig {
     pub fn validate(&self) -> Result<(), String> {
+        if !(8_000..=2_000_000).contains(&self.context_max_bytes) { return Err("context_max_bytes must be 8000..2000000".into()); }
+        if !(1..=8).contains(&self.subagent_concurrency) { return Err("subagent_concurrency must be 1..8".into()); }
         let values = [
             self.max_output as u64,
             self.read_max_lines as u64,
@@ -147,5 +157,5 @@ impl HarnessConfig {
 }
 
 pub fn project_config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("harness.json")
+    crate::paths::config_path()
 }

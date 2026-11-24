@@ -186,14 +186,37 @@ fn selfcheck() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let cmd = args.first().map(String::as_str).unwrap_or("chat");
 
     match cmd {
+        "--version" | "version" => println!("twig {}",env!("CARGO_PKG_VERSION")),
         "selfcheck" => selfcheck(),
+        "chat" => {
+            if let Err(e)=twig::terminal::chat(args.get(1).map(String::as_str).unwrap_or("."), args.get(2).map(String::as_str)) {
+                eprintln!("twig: {e}"); std::process::exit(1);
+            }
+        }
+        "doctor" => {
+            println!("config: {}\nstate: {}", twig::paths::config_path().display(), twig::paths::state_dir().display());
+            for exe in ["git","gh","bwrap"] {
+                let ok=std::process::Command::new(exe).arg("--version").output().is_ok_and(|o|o.status.success());
+                println!("{exe}: {}",if ok {"available"}else{"missing"});
+            }
+            println!("magpie: set TWIG_BASE_URL/TWIG_MODEL or TWIG_ROLES. Default gateway http://127.0.0.1:3425/v1");
+        }
+        "config" => {
+            let path=twig::paths::config_path();
+            if args.get(1).is_some_and(|a|a=="init") {
+                if path.exists(){eprintln!("config exists: {}",path.display());std::process::exit(1);}
+                if let Some(parent)=path.parent(){std::fs::create_dir_all(parent).expect("config directory");}
+                HarnessConfig::default().save(&path).expect("write config");
+            }
+            println!("{}",path.display());
+        }
 
         "serve" => {
             let worktree = args.get(1).cloned().unwrap_or_else(|| ".".to_string());
-            let runs = args.get(2).cloned().unwrap_or_else(|| "runs".to_string());
+            let runs = args.get(2).cloned().unwrap_or_else(|| twig::paths::state_dir().join("sessions").display().to_string());
             let provider = Provider::new();
             let (cfg, source) = match HarnessConfig::resolve() {
                 Ok(c) => c,
@@ -202,12 +225,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            let sid = blake3::hash(
-                format!("{}-{}", std::process::id(), now_nanos()).as_bytes(),
-            )
-            .to_hex()
-            .to_string();
-            let mut daemon = match Daemon::new(&provider, &worktree, &runs, &sid[..12], &cfg) {
+            let sid = args.get(3).cloned().unwrap_or_else(twig::paths::session_id);
+            if !twig::paths::valid_session(&sid) { eprintln!("invalid session id"); std::process::exit(1); }
+            let mut daemon = match Daemon::new(&provider, &worktree, &runs, &sid, &cfg) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("twig: {e}");
@@ -216,7 +236,7 @@ fn main() {
             };
             eprintln!("twig: base={} sid={} config={source}", provider.base(), daemon.sid());
             let stdin = std::io::stdin();
-            if let Err(e) = daemon.serve(BufReader::new(stdin.lock()), std::io::stdout()) {
+            if let Err(e) = daemon.serve(BufReader::new(stdin), std::io::stdout()) {
                 eprintln!("twig: {e}");
                 std::process::exit(1);
             }
@@ -264,7 +284,9 @@ fn main() {
             let twig = std::env::current_exe().expect("current exe");
             let scratch = tempdir("improve");
             let out = twig::config::project_config_path();
-            let report = out.with_file_name("improve-report.md");
+            if let Some(parent)=out.parent(){std::fs::create_dir_all(parent).expect("config directory");}
+            let report = twig::paths::state_dir().join("improve-report.md");
+            std::fs::create_dir_all(twig::paths::state_dir()).expect("state directory");
             let opt = twig::improve::Options {
                 evals: &root, twig: &twig, scratch: &scratch, out: &out, report: &report,
                 reps: 2, workers: workers(), rounds, k: 2, wall: wall(),
@@ -284,6 +306,13 @@ fn main() {
             }
         }
 
+        "eval-import" => {
+            if args.len()!=4 { eprintln!("usage: twig eval-import CORPUS REPO MANIFEST.json");std::process::exit(2); }
+            let result=std::fs::read_to_string(&args[3]).map_err(|e|e.to_string())
+                .and_then(|s|serde_json::from_str::<twig::eval::ImportTask>(&s).map_err(|e|e.to_string()))
+                .and_then(|task|twig::eval::import_snapshot(Path::new(&args[1]),Path::new(&args[2]),&task));
+            match result {Ok(path)=>println!("{}",path.display()),Err(e)=>{eprintln!("import: {e}");std::process::exit(1);}}
+        }
         "record" => {
             let path = args.get(1).cloned().unwrap_or_else(|| "runs".to_string());
             match Record::verify_chain(Path::new(&path)) {
@@ -350,6 +379,7 @@ fn main() {
             println!(
                 "twig 0.2.0 — a thin agent harness\n\n\
                  usage:\n  \
+                 twig chat [worktree] [session] terminal interface (default)\n  \
                  twig serve [worktree] [runs]   JSON-RPC over stdio\n  \
                  twig selfcheck                 offline checks (no network)\n  \
                  twig record <file.jsonl>       verify the hash chain\n  \
@@ -365,13 +395,6 @@ fn main() {
     }
 }
 
-fn now_nanos() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
 
 fn workers() -> usize {
     std::env::var("TWIG_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
