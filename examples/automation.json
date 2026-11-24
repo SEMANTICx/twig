@@ -1,0 +1,22 @@
+{
+  "repository": "OWNER/REPO",
+  "repository_path": ".",
+  "label": "twig",
+  "state_dir": "../.twig-automation",
+  "poll_interval_secs": 300,
+  "include_pull_requests": false,
+  "check_command": "cargo test",
+  "check_timeout_secs": 600,
+  "lease_secs": 3600,
+  "permissions": {
+    "replies": false,
+    "push": false,
+    "create_pr": false,
+    "merge": false,
+    "release": false
+  },
+  "reply": null,
+  "create_pr": false,
+  "merge": false,
+  "release_tag": null
+}
