@@ -75,8 +75,9 @@ impl SubagentPool {
         let runs = run_dir.canonicalize()?;
         let mut command = Command::new(&self.config.bwrap);
         command.args(["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
+        command.args(["--dir", "/workspace", "--dir", "/runs", "--dir", "/tool"]);
+        command.args(["--ro-bind-try"]).arg(self.config.twig.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "twig path is not UTF-8"))?).arg("/tool/twig");
         for path in ["/home", "/root", "/tmp", "/run/user"] { command.args(["--tmpfs", path]); }
-        command.args(["--dir", "/workspace", "--dir", "/runs", "--dir", "/tool", "--ro-bind-try"]).arg(self.config.twig.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "twig path is not UTF-8"))?).arg("/tool/twig");
         if role.read_only() { command.args(["--ro-bind"]).arg(&worktree).arg("/workspace"); }
         else { command.args(["--bind"]).arg(&worktree).arg("/workspace"); }
         command.args(["--bind"]).arg(&runs).arg("/runs").args(["--chdir", "/workspace"]);
