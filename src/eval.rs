@@ -20,6 +20,13 @@ use serde_json::{json, Value};
 
 use crate::classify::{classify_rows, FailureKind};
 
+#[path = "eval_dataset.rs"]
+pub mod dataset;
+#[path = "eval_sandbox.rs"]
+mod sandbox;
+pub use dataset::{import_snapshot, ImportTask, Split};
+
+#[derive(Clone)]
 pub struct Task {
     pub name: String,
     pub dir: PathBuf,
@@ -30,6 +37,8 @@ pub struct Task {
     /// not memorise the exam.
     pub forbid: Vec<String>,
     pub trajectory: Vec<crate::trajectory::Rule>,
+    pub split: Option<Split>,
+    pub source: Option<String>,
 }
 
 pub fn load_tasks(root: &Path, only: Option<&str>) -> Vec<Task> {
@@ -64,23 +73,57 @@ pub fn load_tasks(root: &Path, only: Option<&str>) -> Vec<Task> {
             }),
             None => Vec::new(),
         };
-        tasks.push(Task { name, goal: goal.into(), check, forbid, trajectory, dir });
+        let split = spec.get("split").map(|v| serde_json::from_value(v.clone())
+            .unwrap_or_else(|e| panic!("{}: invalid split: {e}", dir.display())));
+        let source = spec["source"].as_str().map(str::to_string);
+        tasks.push(Task { name, goal: goal.into(), check, forbid, trajectory, dir, split, source });
     }
     tasks
 }
 
 fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)?.flatten() {
-        let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        let kind = entry.file_type()?;
-        if kind.is_dir() {
-            copy_all(&src, &dst)?;
-        } else if kind.is_file() {
-            std::fs::copy(&src, &dst)?;
+    fn copy(from: &Path, to: &Path, root: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            // Linked-worktree pointers are materialized separately on import.
+            if entry.file_name() == ".git" && !kind.is_dir() { continue; }
+            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            if kind.is_dir() { copy(&src, &dst, root)?; }
+            else if kind.is_file() { std::fs::copy(&src, &dst)?; }
+            else if kind.is_symlink() {
+                let target = std::fs::read_link(&src)?;
+                if target.is_absolute() || !src.canonicalize()?.starts_with(root) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "snapshot symlink escapes its repository"));
+                }
+                std::os::unix::fs::symlink(target, dst)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
+    copy(from, to, &from.canonicalize()?)
+}
+
+fn initialize_repo(workspace: &Path, task: &Task) -> Result<(), String> {
+    if workspace.join(".git").is_dir() { return Ok(()); }
+    let git = |args: &[&str]| -> Result<(), String> {
+        let output = Command::new("git").args(args).current_dir(workspace)
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output().map_err(|e| format!("git fixture setup: {e}"))?;
+        if output.status.success() { Ok(()) }
+        else { Err(format!("git fixture setup: {}", String::from_utf8_lossy(&output.stderr))) }
+    };
+    git(&["init", "--quiet"])?;
+    let metadata: Value = serde_json::from_slice(&std::fs::read(task.dir.join("task.json")).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let mut args = vec!["add", "--all", "--", "."];
+    let exclusions: Vec<String> = metadata["wip"].as_array().into_iter().flatten().filter_map(Value::as_str)
+        .map(|path| format!(":(exclude,literal){path}")).collect();
+    args.extend(exclusions.iter().map(String::as_str));
+    git(&args)?;
+    git(&["-c", "user.name=Twig evaluation", "-c", "user.email=eval@localhost", "-c", "commit.gpgsign=false",
+        "commit", "--quiet", "--allow-empty", "-m", "Evaluation snapshot baseline"])
 }
 
 /// Kill a process group. The group outlives its leader while any member lives,
@@ -179,19 +222,22 @@ pub fn run_one(task: &Task, rep: u32, spec: &Spec<'_>) -> Value {
     std::fs::remove_dir_all(&worktree).ok();
     std::fs::remove_dir_all(&runs).ok();
     if let Err(e) = copy_all(&task.dir.join("repo"), &worktree).and_then(|_| std::fs::create_dir_all(&runs)) {
-        return json!({"task": task.name, "rep": rep, "pass": false, "outcome": format!("setup: {e}")});
+        return json!({"task": task.name, "rep": rep, "pass": null, "outcome": format!("setup: {e}")});
+    }
+    if let Err(e) = initialize_repo(&worktree, task) {
+        return json!({"task":task.name,"rep":rep,"pass":null,"outcome":e});
     }
     let stderr = std::fs::File::create(runs.join("stderr.log")).map(Stdio::from).unwrap_or(Stdio::null());
     let started = Instant::now();
-    let spawned = Command::new(spec.twig)
-        .arg("serve").arg(&worktree).arg(&runs)
-        .env("TWIG_CONFIG", spec.config)
-        .process_group(0) // one group per run: killing it takes every server it started
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(stderr)
-        .spawn();
+    let mut command = match sandbox::command(spec.twig, spec.config, &worktree, &runs) {
+        Ok(command) => command,
+        Err(e) => return json!({"task":task.name,"rep":rep,"pass":null,"outcome":e,"isolation":false}),
+    };
+    let spawned = command.process_group(0)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(stderr).spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => return json!({"task": task.name, "rep": rep, "pass": false, "outcome": format!("spawn: {e}")}),
+        Err(e) => return json!({"task": task.name, "rep": rep, "pass": null, "outcome": format!("sandbox spawn: {e}"), "isolation": false}),
     };
     let pgid = child.id();
     if let Some(mut stdin) = child.stdin.take() {
@@ -219,6 +265,10 @@ pub fn run_one(task: &Task, rep: u32, spec: &Spec<'_>) -> Value {
     let secs = started.elapsed().as_secs_f64();
     let result = lines.iter().filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|v| v.get("ev").is_none());
+    if result.is_none() && !killed {
+        let error = std::fs::read_to_string(runs.join("stderr.log")).unwrap_or_default();
+        return json!({"task":task.name,"rep":rep,"pass":null,"outcome":format!("sandbox/agent exited without response: {error}"),"isolation":false});
+    }
     let rows: Vec<Value> = std::fs::read_dir(&runs).into_iter().flatten().flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
@@ -264,7 +314,7 @@ pub fn run_one(task: &Task, rep: u32, spec: &Spec<'_>) -> Value {
     }
     let model_calls = rows.iter().filter(|r| r["kind"] == "model.reply").count() as u64 + u64::from(killed);
     json!({
-        "task": task.name, "rep": rep, "pass": pass, "outcome": outcome,
+        "task": task.name, "rep": rep, "pass": pass, "outcome": outcome, "isolation": true,
         "outcome_pass": outcome_pass, "trajectory": trajectory,
         "usage": usage, "papercuts": papercuts,
         "failure_kind": failure_kind, "killed": killed,
@@ -398,5 +448,18 @@ mod tests {
         let row = json!({"task":"a","pass":true,"usage":{"input_tokens":10,"output_tokens":null}});
         let summary = summarize(&[row]);
         assert!(summary.contains("10/unknown (0/1 runs reported)/unknown"), "{summary}");
+    }
+    #[test]
+    fn fixture_git_baseline_preserves_declared_untracked_work() {
+        let task = load_tasks(Path::new("evals"), Some("05-keep-wip")).remove(0);
+        let workspace = std::env::temp_dir().join(format!("twig-wip-{}", std::process::id()));
+        copy_all(&task.dir.join("repo"), &workspace).unwrap();
+        initialize_repo(&workspace, &task).unwrap();
+        let output = Command::new("git").args(["status", "--porcelain"]).current_dir(&workspace).output().unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("?? notes.txt"));
+        let tracked = Command::new("git").args(["ls-files", "greet.py"]).current_dir(&workspace).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&tracked.stdout).trim(), "greet.py");
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
