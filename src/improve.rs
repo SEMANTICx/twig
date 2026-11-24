@@ -5,7 +5,7 @@
 //! written to the report for a human; the loop never patches its own source,
 //! its checks, or its scoring set.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -15,6 +15,9 @@ use crate::config::HarnessConfig;
 use crate::decisions::Decisions;
 use crate::eval::{run_all, summarize, Spec, Task};
 use crate::provider::Llm;
+
+#[path = "improve_lessons.rs"]
+pub mod lessons;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Score {
@@ -31,6 +34,8 @@ pub struct Score {
     pub per_task: BTreeMap<String, (usize, usize)>,
     pub axes: BTreeMap<String, (usize, usize)>,
     pub unknown: BTreeMap<String, usize>,
+    pub run_models: BTreeMap<String, std::collections::BTreeSet<String>>,
+    pub papercuts: BTreeMap<String, usize>,
 }
 
 impl Score {
@@ -45,8 +50,15 @@ impl Score {
         let mean = |k: &str| rows.iter().map(|r| r[k].as_f64().unwrap_or(0.0)).sum::<f64>() / n;
         let mut axes = BTreeMap::new();
         let mut unknown = BTreeMap::new();
+        let mut run_models = BTreeMap::new();
+        let mut papercuts = BTreeMap::new();
         for row in rows {
             let task = row["task"].as_str().unwrap_or("?");
+            run_models.insert(format!("{task}:{}", row["rep"]), row["usage"]["models"].as_array().into_iter().flatten()
+                .filter_map(Value::as_str).map(str::to_string).collect());
+            for cut in row["papercuts"].as_array().into_iter().flatten() {
+                *papercuts.entry(cut["component"].as_str().unwrap_or("unknown").to_string()).or_default() += 1;
+            }
             for (axis, value) in [("outcome", row.get("outcome_pass").unwrap_or(&row["pass"])),
                 ("trajectory", row.pointer("/trajectory/pass").unwrap_or(&row["pass"]))] {
                 let e = axes.entry(format!("{task}:{axis}")).or_insert((0, 0));
@@ -68,6 +80,8 @@ impl Score {
             per_task,
             axes,
             unknown,
+            run_models,
+            papercuts,
         }
     }
 }
@@ -88,34 +102,46 @@ pub fn noise(rows: &[Value]) -> usize {
 ///   1. no task that always passed may start always failing
 ///   2. more passes, by at least the noise margin
 ///   3. or the same passes, clearly cheaper, without getting worse on the other cost
-pub fn accept(cand: &Score, best: &Score, margin: usize) -> Result<String, String> {
-    if cand.runs != best.runs || cand.models != best.models || cand.per_task.keys().ne(best.per_task.keys()) {
+fn non_regressing(cand: &Score, best: &Score) -> Result<(), String> {
+    if cand.runs == 0 || cand.runs != best.runs || cand.models != best.models
+        || cand.run_models != best.run_models || cand.per_task.keys().ne(best.per_task.keys()) {
         return Err("incomparable run sets or models".into());
     }
-    if cand.unknown != best.unknown { return Err("incomparable trajectory evidence coverage".into()); }
+    if cand.run_models.values().any(|models| models.is_empty()) {
+        return Err("inconclusive: model identity missing".into());
+    }
+    if !cand.unknown.is_empty() || !best.unknown.is_empty() { return Err("inconclusive: unknown quality evidence".into()); }
     if cand.axes.keys().ne(best.axes.keys()) { return Err("incomparable quality axes".into()); }
     for (axis, (passes, count)) in &best.axes {
         let (cp, cn) = cand.axes[axis];
         if cn != *count || cp < *passes { return Err(format!("regression on {axis}")); }
     }
-    for (task, (p, n)) in &best.per_task {
-        let (cp, _) = cand.per_task.get(task).copied().unwrap_or((0, *n));
-        if cp < *p {
-            return Err(format!("regression: {task} went from {p}/{n} to {cp}/{n}"));
+    for (task, (passes, count)) in &best.per_task {
+        let (cp, cn) = cand.per_task[task];
+        if cn != *count || cp < *passes { return Err(format!("regression on {task}")); }
+    }
+    for (component, count) in &cand.papercuts {
+        if *count > best.papercuts.get(component).copied().unwrap_or(0) {
+            return Err(format!("papercut regression in {component}"));
         }
     }
+    if cand.tokens.is_some() != best.tokens.is_some() { return Err("token usage coverage differs".into()); }
+    if let (Some(c), Some(b)) = (cand.tokens, best.tokens) {
+        if c > b * 1.1 { return Err("token consumption regressed >10%".into()); }
+    }
+    Ok(())
+}
+
+pub fn accept(cand: &Score, best: &Score, margin: usize) -> Result<String, String> {
+    non_regressing(cand, best)?;
     if cand.passes >= best.passes + margin {
         return Ok(format!("passes {} -> {} (margin {margin})", best.passes, cand.passes));
     }
     if cand.passes == best.passes {
-        if cand.tokens.is_some() != best.tokens.is_some() {
-            return Err("token usage coverage differs; cannot establish a cost improvement".into());
-        }
         if let (Some(c), Some(b)) = (cand.tokens, best.tokens) {
             if c <= b * 0.85 && cand.secs <= best.secs * 1.1 {
                 return Ok(format!("same passes, mean tokens {b:.0} -> {c:.0} (not dollars)"));
             }
-            if c > b * 1.1 { return Err("same passes but token consumption regressed >10%".into()); }
         }
         if cand.secs <= best.secs * 0.8 && cand.calls <= best.calls * 1.1 {
             return Ok(format!("same passes, mean secs {:.1} -> {:.1}", best.secs, cand.secs));
@@ -130,61 +156,34 @@ pub fn accept(cand: &Score, best: &Score, margin: usize) -> Result<String, Strin
     ))
 }
 
-/// Evidence for the proposer: failed runs, and passing runs that hit a tool
-/// timeout or took more than twice the median. Never the check or its output.
-pub fn digest(rows: &[Value], tasks: &[Task], budget: usize) -> String {
-    let mut secs: Vec<f64> = rows.iter().filter_map(|r| r["secs"].as_f64()).collect();
-    secs.sort_by(|a, b| a.total_cmp(b));
-    let median = secs.get(secs.len() / 2).copied().unwrap_or(0.0).max(1.0);
-    let goals: HashMap<&str, &str> = tasks.iter().map(|t| (t.name.as_str(), t.goal.as_str())).collect();
-    let mut out = String::new();
+/// Only aggregate operational observations from training reach the proposer.
+/// Source goals, task names, tool arguments/output, claims and judge contracts
+/// are deliberately absent: all can contain answers or hidden-check material.
+pub fn digest(rows: &[Value], _tasks: &[Task], budget: usize) -> String {
+    let mut failures = BTreeMap::<String, usize>::new();
+    let mut cuts = BTreeMap::<String, usize>::new();
     for row in rows {
-        let pass = row["pass"] == json!(true);
-        let timeouts = row["tool_timeouts"].as_u64().unwrap_or(0);
-        let slow = row["secs"].as_f64().unwrap_or(0.0) > 2.0 * median;
-        if pass && timeouts == 0 && !slow && row["papercuts"].as_array().is_none_or(|p| p.is_empty()) {
-            continue;
+        if row["pass"] == false {
+            let kind = match row["failure_kind"].as_str() {
+                Some("process") => "process", Some("trajectory") => "trajectory", _ => "content",
+            };
+            *failures.entry(kind.into()).or_default() += 1;
         }
-        let task = row["task"].as_str().unwrap_or("?");
-        let label = if row["pass"].is_null() {
-            "UNGRADED (trajectory evidence unsupported)".to_string()
-        } else if pass {
-            "PASSED BUT COSTLY".to_string()
-        } else {
-            format!("FAILED ({})", row["failure_kind"].as_str().unwrap_or("?"))
-        };
-        let mut block = format!(
-            "\n## run {task} rep {}: {label}\nended: {} | {}s | {} model calls | {timeouts} tool timeouts\ngoal: {}\nsteps:\n",
-            row["rep"], row["outcome"].as_str().unwrap_or("?"), row["secs"], row["model_calls"],
-            goals.get(task).copied().unwrap_or("?"));
-        block.push_str(&format!("outcome_pass: {}; trajectory assessment: {}\n",
-            row["outcome_pass"], row["trajectory"]));
-        if let Some(papercuts) = row["papercuts"].as_array().filter(|p| !p.is_empty()) {
-            block.push_str(&format!("agent-filed papercuts (untrusted observations): {papercuts:?}\n"));
+        for cut in row["papercuts"].as_array().into_iter().flatten() {
+            let component = match cut["component"].as_str() {
+                Some("bash") => "bash", Some("read") => "read", Some("context") => "context", _ => "other",
+            };
+            *cuts.entry(component.into()).or_default() += 1;
         }
-        for step in row["steps"].as_array().into_iter().flatten() {
-            if let Some(level) = step.get("guard") {
-                block.push_str(&format!("  - guard tripped: {level}\n"));
-                continue;
-            }
-            let arg = step["args"]["command"].as_str().or(step["args"]["path"].as_str()).unwrap_or("");
-            let arg: String = arg.chars().take(300).collect();
-            let head: String = step["output_head"].as_str().unwrap_or("").chars().take(200).collect();
-            let bytes = step["bytes"].as_u64().map(|b| format!("{b} bytes")).unwrap_or_else(|| "-".into());
-            block.push_str(&format!("  - {} [{}] {arg}\n    -> ({bytes}) {}\n",
-                step["tool"].as_str().unwrap_or("?"), step["tier"].as_str().unwrap_or("-"),
-                head.replace('\n', " | ")));
-        }
-        if let Some(said) = row["agent_said"].as_str() {
-            block.push_str(&format!("agent's final claim: {said}\n"));
-        }
-        if out.len() + block.len() > budget {
-            out.push_str("\n(further runs omitted for length)\n");
-            break;
-        }
-        out.push_str(&block);
     }
-    out
+    let score = Score::of(rows);
+    let evidence = json!({"training_runs": rows.len(), "passes":score.passes,
+        "unknown":rows.iter().filter(|r| r["pass"].is_null()).count(), "failures":failures,
+        "tool_timeouts":rows.iter().filter_map(|r| r["tool_timeouts"].as_u64()).sum::<u64>(),
+        "mean_model_calls":score.calls, "mean_seconds":score.secs,
+        "mean_reported_tokens":score.tokens, "papercuts_by_component":cuts});
+    let text = evidence.to_string();
+    if text.len() <= budget { text } else { String::new() }
 }
 
 /// Tokens a tuned prompt must not contain. File names (`numparse.py`) and
@@ -302,137 +301,142 @@ pub struct Options<'a> {
 
 pub fn run(llm: &dyn Llm, start: &HarnessConfig, opt: &Options<'_>, log: &(dyn Fn(&str) + Sync))
     -> Result<HarnessConfig, String> {
+    if opt.reps == 0 { return Err("improvement requires at least one repetition".into()); }
     let tasks = crate::eval::load_tasks(opt.evals, None);
-    if tasks.is_empty() {
-        return Err(format!("no tasks under {}", opt.evals.display()));
-    }
     let banned = forbidden(&tasks);
+    let data = crate::eval::dataset::separate(tasks)?;
     let decisions = Decisions::open(opt.report.with_file_name("decisions.tsv")).map_err(|e| e.to_string())?;
-    let mut report = String::from("# twig improve\n");
-    let save = |r: &str| std::fs::write(opt.report, r).ok();
+    let lesson_path = opt.report.with_file_name("lessons.json");
+    let mut history = lessons::context(&lesson_path)?;
+    let mut report = format!("# twig improve\n\nProtected splits: {} train, {} dev, {} final. Only aggregate training evidence reaches the proposer. Dev and final run after proposals stop.\n",
+        data.train.len(), data.dev.len(), data.final_holdout.len());
+    let save = |report: &str| std::fs::write(opt.report, report).map_err(|e| e.to_string());
     let mut n = 0u32;
-    let mut evaluate = |cfg: &HarnessConfig, label: &str| -> Vec<Value> {
+    let mut evaluate = |cfg: &HarnessConfig, label: &str, tasks: &[Task], training: bool| -> Result<Vec<Value>, String> {
         n += 1;
         let dir = opt.scratch.join(format!("{n:02}-{label}"));
-        std::fs::create_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let cfg_path = dir.join("harness.json");
-        cfg.save(&cfg_path).ok();
+        cfg.save(&cfg_path).map_err(|e| e.to_string())?;
         log(&format!("eval {label}: {} tasks x {} reps", tasks.len(), opt.reps));
         let spec = Spec { twig: opt.twig, config: &cfg_path, scratch: &dir, wall: opt.wall };
         let progress = |r: &Value| log(&format!("  {:<18} r{} {} {}s", r["task"].as_str().unwrap_or("?"),
-            r["rep"], if r["pass"].is_null() { "UNGRADED" } else if r["pass"] == json!(true) { "PASS" } else { "FAIL" }, r["secs"]));
-        let rows = run_all(&tasks, opt.reps, opt.workers, &spec, &progress);
-        let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
-        std::fs::write(dir.join("results.jsonl"), body).ok();
-        rows
+            r["rep"], if r["pass"].is_null() { "UNGRADED" } else if r["pass"] == true { "PASS" } else { "FAIL" }, r["secs"]));
+        let rows = run_all(tasks, opt.reps, opt.workers, &spec, &progress);
+        let results = dir.join("results.jsonl");
+        let body: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        std::fs::write(&results, body).map_err(|e| e.to_string())?;
+        if training {
+            let evidence = opt.report.with_file_name("improvement-evidence");
+            std::fs::create_dir_all(&evidence).map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(&results).map_err(|e| e.to_string())?;
+            let durable = evidence.join(format!("{}.jsonl", blake3::hash(&bytes).to_hex()));
+            std::fs::write(&durable, bytes).map_err(|e| e.to_string())?;
+            lessons::record(&lesson_path, &durable, &rows)?;
+        }
+        Ok(rows)
     };
-
-    if opt.out.exists() {
-        std::fs::copy(opt.out, opt.out.with_extension("json.baseline")).ok();
-    }
-    let baseline_rows = evaluate(start, "baseline");
+    let baseline_rows = evaluate(start, "train-baseline", &data.train, true)?;
     let baseline = Score::of(&baseline_rows);
-    let noise_runs = noise(&baseline_rows);
-    report.push_str(&format!("\n## baseline\n\nrerun disagreement: {noise_runs} run(s)\n\n{}\n",
-                             summarize(&baseline_rows)));
-    save(&report);
-
-    let (mut best_cfg, mut best, mut best_rows) = (start.clone(), baseline.clone(), baseline_rows);
-    let mut history = String::new();
-    let mut notes: Vec<String> = Vec::new();
+    let margin = noise(&baseline_rows).max(1);
+    report.push_str(&format!("\n## training baseline\n\n{}\n", summarize(&baseline_rows)));
+    save(&report)?;
+    if baseline_rows.iter().any(|row| row["pass"].is_null() || row["isolation"] != true) {
+        report.push_str("\n**inconclusive**: baseline has unknown evidence or unavailable isolation; no config changed.\n");
+        save(&report)?;
+        return Ok(start.clone());
+    }
+    let (mut best_cfg, mut best, mut best_rows) = (start.clone(), baseline, baseline_rows);
+    let mut notes = Vec::new();
     let mut adopted = false;
     for round in 1..=opt.rounds {
-        let margin = noise_runs.max(1);
-        let evidence = digest(&best_rows, &tasks, 14_000);
-        // Always include a deterministic removal control, even when all tasks pass.
-        let (mut proposals, round_notes) = if evidence.trim().is_empty() {
-            (Vec::new(), Vec::new())
-        } else {
-            match propose(llm, &best_cfg, &evidence, &history, opt.k) {
-                Ok(p) => p,
-                Err(e) => {
-                    report.push_str(&format!("\nproposer failed: {e}; still testing ablation control.\n"));
-                    (Vec::new(), Vec::new())
-                }
+        let evidence = digest(&best_rows, &data.train, 14_000);
+        let (mut proposals, round_notes) = match propose(llm, &best_cfg, &evidence, &history, opt.k) {
+            Ok(proposals) => proposals,
+            Err(error) => {
+                report.push_str(&format!("\nproposer failed: {error}; still testing removal control.\n"));
+                (Vec::new(), Vec::new())
             }
         };
-        if let Some(c) = crate::ablation::candidate(&best_cfg, round) {
-            proposals.push(Proposal { patch: serde_json::to_value(c).map_err(|e| e.to_string())?,
-                rationale: "Deletion-only control: remove one existing prompt paragraph, change no limits.".into() });
+        if let Some(control) = crate::ablation::candidate(&best_cfg, round) {
+            proposals.push(Proposal { patch:serde_json::to_value(control).map_err(|e| e.to_string())?,
+                rationale:"Deletion-only control: remove existing words, change no limits.".into() });
         }
         notes.extend(round_notes);
-        report.push_str(&format!("\n## round {round} (needs +{margin} passes, or same passes and clearly cheaper)\n"));
+        report.push_str(&format!("\n## training round {round}\n"));
         let mut winner: Option<(HarnessConfig, Score, Vec<Value>, String)> = None;
-        for (i, p) in proposals.iter().enumerate() {
+        for (i, proposal) in proposals.iter().enumerate() {
             let label = format!("r{round}c{}", i + 1);
-            let cand = match best_cfg.merged(&p.patch).and_then(|c| lint(&c, &banned).map(|_| c)) {
-                Ok(c) => c,
+            let candidate = match best_cfg.merged(&proposal.patch).and_then(|cfg| lint(&cfg, &banned).map(|_| cfg)) {
+                Ok(candidate) => candidate,
                 Err(why) => {
-                    report.push_str(&format!("\n### {label}: rejected before running: {why}\n> {}\n", p.rationale));
-                    history.push_str(&format!("- {label} rejected ({why}): {}\n", p.rationale));
-                    decisions.log(&format!("reject {label}"), "-", &why).ok();
+                    report.push_str(&format!("\n### {label}: rejected before evaluation: {why}\n"));
+                    // Lint errors can identify heldout tokens. Never feed them back.
+                    history.push_str(&format!("- {label}: rejected by genericity/validation gate.\n"));
                     continue;
                 }
             };
-            let rows = evaluate(&cand, &label);
+            let rows = evaluate(&candidate, &label, &data.train, true)?;
             let score = Score::of(&rows);
             let verdict = accept(&score, &best, margin);
-            report.push_str(&format!("\n### {label}: {}\n> {}\n\nchanges: {}\n\n{}\n",
-                match &verdict { Ok(w) => format!("accepted, {w}"), Err(w) => format!("rejected, {w}") },
-                p.rationale, best_cfg.diff(&cand).join("; "), summarize(&rows)));
-            history.push_str(&format!("- {label} ({}): {} => {}/{} passes\n", best_cfg.diff(&cand).join("; "),
-                p.rationale, score.passes, score.runs));
-            save(&report);
+            report.push_str(&format!("\n### {label}: {verdict:?}\n> {}\n\n{}\n", proposal.rationale, summarize(&rows)));
+            history.push_str(&format!("- {label}: {}. Training evidence: {}\n", if verdict.is_ok() { "improved" } else { "no proven improvement" }, digest(&rows, &data.train, 4_000)));
             if let Ok(why) = verdict {
-                let better = winner.as_ref().is_none_or(|(_, w, _, _)| {
-                    (score.passes, -score.secs) > (w.passes, -w.secs)
-                });
-                if better {
-                    winner = Some((cand, score, rows, why));
+                if winner.as_ref().is_none_or(|(_, previous, _, _)| (score.passes, -score.secs) > (previous.passes, -previous.secs)) {
+                    winner = Some((candidate, score, rows, why));
                 }
             }
         }
-        match winner {
-            Some((cfg, score, rows, why)) => {
-                decisions.log(&format!("adopt round {round}"), "keep previous config", &why).ok();
-                cfg.save(opt.out).map_err(|e| e.to_string())?;
-                report.push_str(&format!("\n**adopted** ({why}), written to {}\n", opt.out.display()));
-                (best_cfg, best, best_rows, adopted) = (cfg, score, rows, true);
-            }
-            None => report.push_str("\nno candidate beat the current config.\n"),
-        }
-        save(&report);
+        if let Some((cfg, score, rows, why)) = winner {
+            decisions.log(&format!("select training round {round}"), "keep previous candidate", &why).map_err(|e| e.to_string())?;
+            (best_cfg, best, best_rows, adopted) = (cfg, score, rows, true);
+        } else { report.push_str("\nNo training candidate demonstrated improvement.\n"); }
+        save(&report)?;
     }
-
+    // There are no proposer calls after this point. Neither holdout can become
+    // iterative optimization feedback, including through persistent lessons.
     if adopted {
-        // Winner's curse: the best of several noisy evaluations is optimistic.
-        // Re-run it once and keep it only if it still beats the baseline.
-        let rows = evaluate(&best_cfg, "confirm");
-        let confirm = Score::of(&rows);
-        let verdict = accept(&confirm, &baseline, noise_runs.max(1));
-        report.push_str(&format!("\n## confirmation re-run\n\n{}\n", summarize(&rows)));
-        match verdict {
-            Ok(why) => report.push_str(&format!("confirmed against baseline: {why}\n")),
-            Err(why) => {
-                let backup = opt.out.with_extension("json.baseline");
-                if backup.exists() {
-                    std::fs::copy(&backup, opt.out).ok();
-                } else {
-                    std::fs::remove_file(opt.out).ok();
+        let dev_base = evaluate(start, "dev-baseline", &data.dev, false)?;
+        let dev_candidate = evaluate(&best_cfg, "dev-confirm", &data.dev, false)?;
+        let confirmation = accept(&Score::of(&dev_candidate), &Score::of(&dev_base), noise(&dev_base).max(1));
+        report.push_str(&format!("\n## dev confirmation\n\nBaseline:\n{}\nCandidate:\n{}\n{confirmation:?}\n", summarize(&dev_base), summarize(&dev_candidate)));
+        if let Err(why) = confirmation {
+            report.push_str(&format!("\n**not confirmed** ({why}): original config retained; final holdout untouched.\n"));
+            best_cfg = start.clone();
+        } else {
+            save(&report)?;
+            // Receipt uses full snapshot/check/contract hashes and create_new;
+            // reservation precedes both arms and also survives interrupted runs.
+            crate::eval::dataset::reserve_final(opt.evals, &data.final_holdout)?;
+            let final_base = evaluate(start, "final-baseline", &data.final_holdout, false)?;
+            let final_candidate = evaluate(&best_cfg, "final-candidate", &data.final_holdout, false)?;
+            let verdict = non_regressing(&Score::of(&final_candidate), &Score::of(&final_base)).and_then(|()| {
+                let candidate = Score::of(&final_candidate);
+                let baseline = Score::of(&final_base);
+                if candidate.secs > baseline.secs * 1.1 || candidate.calls > baseline.calls * 1.1 {
+                    Err("final runtime or model-call cost regressed >10%".to_string())
+                } else { Ok(()) }
+            });
+            report.push_str(&format!("\n## final holdout (consumed once; never proposer feedback)\n\nBaseline:\n{}\nCandidate:\n{}\n", summarize(&final_base), summarize(&final_candidate)));
+            match verdict {
+                Ok(()) => {
+                    if opt.out.exists() { std::fs::copy(opt.out, opt.out.with_extension("json.baseline")).map_err(|e| e.to_string())?; }
+                    best_cfg.save(opt.out).map_err(|e| e.to_string())?;
+                    report.push_str("\n**confirmed**: dev improved and final has no quality/cost regressions. Candidate installed.\n");
                 }
-                decisions.log("revert to baseline", "keep tuned config", &why).ok();
-                report.push_str(&format!("**not confirmed** ({why}): reverted to the baseline config.\n"));
-                best_cfg = start.clone();
+                Err(why) => {
+                    decisions.log("rollback final candidate", "install tuned config", &why).map_err(|e| e.to_string())?;
+                    best_cfg = start.clone();
+                    report.push_str(&format!("\n**final regression or inconclusive evidence** ({why}): rolled back to original config; live file was never changed.\n"));
+                }
             }
         }
-    }
+    } else { report.push_str("\n**no improvement**: original config retained; holdouts untouched.\n"); }
     if !notes.is_empty() {
         report.push_str("\n## code changes the loop cannot make\n\n");
-        for n in &notes {
-            report.push_str(&format!("- {n}\n"));
-        }
+        for note in notes { report.push_str(&format!("- {note}\n")); }
     }
-    save(&report);
+    save(&report)?;
     Ok(best_cfg)
 }
 
@@ -442,7 +446,7 @@ mod tests {
 
     fn rows(spec: &[(&str, &[bool])], secs: f64, calls: f64) -> Vec<Value> {
         spec.iter().flat_map(|(t, passes)| passes.iter().enumerate().map(move |(i, p)|
-            json!({"task": t, "rep": i + 1, "pass": p, "secs": secs, "model_calls": calls})))
+            json!({"task": t, "rep": i + 1, "pass": p, "secs": secs, "model_calls": calls, "usage":{"models":["same"]}})))
             .collect()
     }
 
@@ -514,17 +518,84 @@ mod tests {
     #[test]
     fn trajectory_failure_cannot_hide_a_new_outcome_regression() {
         let base = json!({"task":"a","pass":false,"outcome_pass":true,"trajectory":{"pass":false},
-            "secs":100,"model_calls":4});
+            "secs":100,"model_calls":4,"usage":{"models":["same"]}});
         let cand = json!({"task":"a","pass":false,"outcome_pass":false,"trajectory":{"pass":false},
-            "secs":1,"model_calls":1});
+            "secs":1,"model_calls":1,"usage":{"models":["same"]}});
         assert!(accept(&Score::of(&[cand]), &Score::of(&[base]), 1).is_err());
     }
     #[test]
     fn unknown_trajectory_cannot_be_traded_for_a_proven_violation() {
         let base = json!({"task":"a","pass":null,"outcome_pass":true,"trajectory":{"pass":null},
-            "secs":100,"model_calls":4});
+            "secs":100,"model_calls":4,"usage":{"models":["same"]}});
         let cand = json!({"task":"a","pass":false,"outcome_pass":true,"trajectory":{"pass":false},
-            "secs":1,"model_calls":1});
+            "secs":1,"model_calls":1,"usage":{"models":["same"]}});
         assert!(accept(&Score::of(&[cand]), &Score::of(&[base]), 1).is_err());
+    }
+    #[test]
+    fn proposer_digest_omits_all_source_and_judge_material() {
+        let row = json!({"task":"SECRET", "pass":false, "failure_kind":"content", "goal":"SECRET",
+            "outcome":"SECRET", "judge_tail":"SECRET", "trajectory":{"contract":"SECRET"},
+            "steps":[{"args":{"command":"SECRET"},"output_head":"SECRET"}],
+            "papercuts":[{"component":"SECRET","description":"SECRET"}]});
+        let text = digest(&[row], &[], 14_000);
+        assert!(text.contains("content"));
+        assert!(!text.contains("SECRET"));
+    }
+    #[test]
+    fn final_gates_reject_papercuts_and_unknown_model_identity() {
+        let base = Score::of(&rows(&[("a", &[true])], 10.0, 2.0));
+        assert!(non_regressing(&base, &base).is_ok());
+        let mut candidate = base.clone();
+        candidate.papercuts.insert("read".into(), 1);
+        assert!(non_regressing(&candidate, &base).is_err());
+        candidate = base.clone();
+        candidate.run_models.values_mut().for_each(|models| models.clear());
+        assert!(non_regressing(&candidate, &candidate).is_err());
+    }
+    #[test]
+    fn final_regression_retains_original_file_and_never_reaches_proposer() {
+        use std::os::unix::fs::PermissionsExt;
+        use crate::eval::{ImportTask, Split, import_snapshot};
+        let root = std::env::temp_dir().join(format!("twig-improvement-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let corpus = root.join("corpus");
+        for (name, split) in [("training", Split::Train), ("development", Split::Dev), ("SECRET_FINAL", Split::Final)] {
+            let source = root.join(name);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("mode"), if split == Split::Final { "final" } else { "train" }).unwrap();
+            import_snapshot(&corpus, &source, &ImportTask { name:name.into(), source:format!("real:{name}"),
+                goal:format!("Solve {name}"), split, check:"test -f solved".into(), forbid:vec![], trajectory:vec![], wip:vec![] }).unwrap();
+        }
+        let executable = root.join("solver");
+        std::fs::write(&executable, r##"#!/usr/bin/python3
+import json, pathlib
+config = json.loads(pathlib.Path('/harness.json').read_text())
+tuned = config['max_output'] == 10001
+final = pathlib.Path('/workspace/mode').read_text() == 'final'
+if tuned != final:
+    pathlib.Path('/workspace/solved').write_text('done')
+row = {'kind':'model.reply','model':'same','usage':{'input_tokens':100,'output_tokens':10},'tool_calls':[]}
+pathlib.Path('/runs/evidence.jsonl').write_text(json.dumps(row)+'\n')
+print(json.dumps({'id':1,'result':{'reason':'final','text':'done'}}))
+"##).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let start = HarnessConfig::default();
+        let live = root.join("live.json");
+        start.save(&live).unwrap();
+        let original = std::fs::read(&live).unwrap();
+        let scratch = root.join("scratch");
+        let report = root.join("report.md");
+        let llm = crate::stub::StubLlm::new(vec![crate::stub::StubLlm::text(
+            r#"{"candidates":[{"config":{"max_output":10001},"rationale":"bounded output adjustment"}]}"#)]);
+        let options = Options { evals:&corpus, twig:&executable, scratch:&scratch, out:&live, report:&report,
+            reps:1, workers:1, rounds:1, k:1, wall:Duration::from_secs(10) };
+        let result = run(&llm, &start, &options, &|_| {}).unwrap();
+        assert_eq!(result, start);
+        assert_eq!(std::fs::read(live).unwrap(), original);
+        assert!(std::fs::read_to_string(report).unwrap().contains("rolled back"));
+        assert_eq!(llm.seen().len(), 1);
+        assert!(!llm.seen()[0].contains("SECRET_FINAL"));
+        assert!(crate::eval::dataset::separate(crate::eval::load_tasks(&corpus, None)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
