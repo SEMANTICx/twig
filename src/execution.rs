@@ -16,8 +16,9 @@ pub struct Check {
     #[serde(default = "default_output")]
     pub max_output_bytes: usize,
 }
-fn default_timeout() -> u64 { 120_000 }
-fn default_output() -> usize { 1_048_576 }
+const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub command: String,
@@ -47,6 +48,9 @@ fn drain(stream: &mut UnixStream, bytes: &mut Vec<u8>, remaining: &mut usize) ->
 }
 /// Nonblocking bounded stdin/stdout/stderr; terminates all children before reaping.
 pub fn run_process(command: &mut Command, input: &[u8], timeout: Duration, max_output_bytes: usize) -> io::Result<Capture> {
+    if input.len() > MAX_INPUT_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "process input exceeds 8 MiB")); }
+    let max_output_bytes = max_output_bytes.min(MAX_OUTPUT_BYTES);
+    let timeout = timeout.min(MAX_TIMEOUT);
     let (mut stdin, input_child) = UnixStream::pair()?;
     let (mut stdout, out_child) = UnixStream::pair()?;
     let (mut stderr, err_child) = UnixStream::pair()?;
@@ -91,11 +95,12 @@ pub fn run_process(command: &mut Command, input: &[u8], timeout: Duration, max_o
 }
 pub fn run_check(cwd: &Path, check: &Check) -> io::Result<CheckResult> {
     let out = run_process(Command::new("sh").args(["-c", &check.command]).current_dir(cwd), &[], Duration::from_millis(check.timeout_ms.max(1)), check.max_output_bytes)?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let available = check.max_output_bytes.saturating_sub(text.len());
     let mut end = available.min(stderr.len()); while !stderr.is_char_boundary(end) { end -= 1; }
     text.push_str(&stderr[..end]);
+    if text.len() > check.max_output_bytes { let mut end = check.max_output_bytes; while !text.is_char_boundary(end) { end -= 1; } text.truncate(end); }
     let truncated = out.truncated || end < stderr.len();
     Ok(CheckResult { command: check.command.clone(), output: text, exit_code: out.exit_code, timed_out: out.timed_out, truncated, passed: !out.timed_out && out.exit_code == Some(0) })
 }
@@ -106,7 +111,11 @@ pub struct DifferentialResult { pub passed: bool, pub cases: usize, pub failures
 /// JSON-lines protocol; malformed or extra output is a failure, never ignored.
 pub fn run_differential(cwd: &Path, command: &str, cases: &[DifferentialCase], timeout: Duration, max_output_bytes: usize) -> io::Result<DifferentialResult> {
     let mut payload = Vec::new();
-    for case in cases { serde_json::to_writer(&mut payload, &case.input)?; payload.push(b'\n'); }
+    for case in cases {
+        serde_json::to_writer(&mut payload, &case.input)?;
+        payload.push(b'\n');
+        if payload.len() > MAX_INPUT_BYTES { return Err(io::Error::new(io::ErrorKind::InvalidInput, "differential input exceeds 8 MiB")); }
+    }
     let out = run_process(Command::new("sh").args(["-c", command]).current_dir(cwd), &payload, timeout, max_output_bytes)?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let actual: Result<Vec<Value>, _> = text.lines().map(serde_json::from_str).collect();
