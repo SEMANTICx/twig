@@ -1,0 +1,5 @@
+ts	choice	rejected	why
+1795522825	reject r1c1	-	names a scoring-set token "offline"
+1795523527	adopt round 2	keep previous config	same passes, mean secs 30.5 -> 18.8
+1795526776	adopt round 1	keep previous config	passes 3 -> 4 (margin 1)
+1795526837	revert to baseline	keep tuned config	regression on 11-hidden-spec:trajectory

@@ -1,0 +1,1 @@
+{"goal":"`python3 test_report.py` fails. Fix the root cause, not the symptom. Do not edit any test file.","check":"python3 test_report.py && python3 test_invoice.py && git diff --quiet -- test_report.py test_invoice.py","targets":"content"}

@@ -1,0 +1,1 @@
+{"goal":"Add a /health endpoint to app.py that returns HTTP 200 with the JSON body {\"status\": \"ok\"}. Start the server and request /health to prove it works. Leave the existing / endpoint working."}

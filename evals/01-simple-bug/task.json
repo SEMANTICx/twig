@@ -1,0 +1,1 @@
+{"goal":"`python3 test_calc.py` fails. Fix it so it prints ok. Do not edit test_calc.py.","check":"python3 test_calc.py && git diff --quiet -- test_calc.py","targets":"process","trajectory":[{"kind":"successful_command","argv":["python3","test_calc.py"]}]}

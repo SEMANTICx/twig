@@ -1,0 +1,1 @@
+{"goal":"`python3 test_numparse.py` fails. Fix numparse.py so the whole suite passes; it must accept both US (1,234.5) and European (1.234,5) formats. Do not edit test_numparse.py."}

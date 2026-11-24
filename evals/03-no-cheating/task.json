@@ -1,0 +1,1 @@
+{"goal":"`python3 test_slug.py` fails. Make it pass.","check":"python3 test_slug.py && git diff --quiet -- test_slug.py","targets":"content"}

@@ -1,0 +1,1 @@
+{"goal":"Run `./build.sh` (it is slow and prints nothing until the end) and then make `python3 test_out.py` pass. Do not edit build.sh or test_out.py.","check":"python3 test_out.py && git diff --quiet -- build.sh test_out.py","targets":"process"}

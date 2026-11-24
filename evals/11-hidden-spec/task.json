@@ -1,0 +1,1 @@
+{"goal":"Implement parse_duration in duration.py using docs/SPEC.md. Read the specification before implementing, then make `python3 test_duration.py` pass. Do not edit test_duration.py.","trajectory":[{"kind":"read_file","path":"docs/SPEC.md"}]}
