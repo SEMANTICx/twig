@@ -26,7 +26,7 @@ pub struct SubagentConfig {
     pub network: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubagentResult { pub role: String, pub worktree: PathBuf, pub output: String, pub exit_code: Option<i32>, pub timed_out: bool, pub truncated: bool, pub events: Vec<Value>, pub result: Option<Value> }
+pub struct SubagentResult { pub role: String, pub worktree: PathBuf, pub run_dir: PathBuf, pub output: String, pub exit_code: Option<i32>, pub timed_out: bool, pub truncated: bool, pub events: Vec<Value>, pub result: Option<Value>, pub approved: Option<bool>, pub review_summary: Option<String> }
 #[derive(Clone)]
 pub struct SubagentPool { config: Arc<SubagentConfig>, slots: Arc<Mutex<usize>> }
 #[derive(Debug)]
@@ -44,16 +44,14 @@ impl SubagentPool {
         *available -= 1; Ok(Slot(self.slots.clone()))
     }
     pub fn run(&self, role: Role, task: &str) -> io::Result<SubagentResult> {
-        let _slot = self.acquire()?;
         self.run_inner(role, task)
     }
     fn run_inner(&self, role: Role, task: &str) -> io::Result<SubagentResult> {
         if task.trim().is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "subagent task is empty")); }
+        let _slot = self.acquire()?;
         let repo = self.config.repository.canonicalize()?;
-        let git = |args: &[&str]| Command::new("git").args(args).current_dir(&repo).output();
-        let status = git(&["status", "--porcelain"])?;
+        let status = Command::new("git").args(["status", "--porcelain"]).current_dir(&repo).output()?;
         if !status.status.success() { return Err(io::Error::other("cannot inspect repository status")); }
-        // The caller's shared edits are never copied into or modified by the agent.
         std::fs::create_dir_all(&self.config.runs_root)?;
         let root = self.config.runs_root.canonicalize()?;
         let name = format!("twig-agent-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
@@ -71,19 +69,28 @@ impl SubagentPool {
         result
     }
     fn run_in_worktree(&self, role: Role, task: &str, worktree: &Path, run_dir: &Path) -> io::Result<SubagentResult> {
-        let worktree = worktree.canonicalize()?;
-        let runs = run_dir.canonicalize()?;
+        let host_worktree = worktree.canonicalize()?;
+        let host_runs = run_dir.canonicalize()?;
         let mut command = Command::new(&self.config.bwrap);
-        command.args(["--die-with-parent", "--new-session", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]);
-        for path in ["/home", "/root", "/tmp", "/run/user"] { command.args(["--tmpfs", path]); }
-        command.args(["--dir", "/workspace", "--dir", "/runs", "--dir", "/tool", "--ro-bind-try"]).arg(self.config.twig.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "twig path is not UTF-8"))?).arg("/tool/twig");
-        if role.read_only() { command.args(["--ro-bind"]).arg(&worktree).arg("/workspace"); }
-        else { command.args(["--bind"]).arg(&worktree).arg("/workspace"); }
-        command.args(["--bind"]).arg(&runs).arg("/runs").args(["--chdir", "/workspace"]);
+        command.args(["--die-with-parent", "--new-session", "--unshare-pid", "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib"]);
+        for lib in ["/lib64", "/usr/lib"] { if Path::new(lib).exists() { command.args(["--ro-bind", lib, lib]); } }
+        command.args(["--dir", "/etc", "--dir", "/tool", "--dir", "/workspace", "--dir", "/runs", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+        command.args(["--ro-bind"]).arg(&self.config.twig).arg("/tool/twig");
+        for path in ["/etc/ssl", "/etc/resolv.conf"] { if Path::new(path).exists() { command.args(["--ro-bind", path, path]); } }
+        if role.read_only() {
+            command.args(["--ro-bind"]).arg(&host_worktree).arg("/workspace");
+            command.args(["--ro-bind"]).arg(&host_runs).arg("/runs");
+        } else {
+            command.args(["--bind"]).arg(&host_worktree).arg("/workspace");
+            command.args(["--bind"]).arg(&host_runs).arg("/runs");
+        }
+        if !self.config.network { command.arg("--unshare-net"); }
+        command.args(["--chdir", "/workspace", "--", "/tool/twig", "serve", "/workspace", "/runs"])
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", "/tmp").env("TWIG_SUBAGENT", "1");
+        for key in ["TWIG_MODEL", "TWIG_ROLES", "TWIG_BASE_URL", "TWIG_API_KEY"] {
+            if let Ok(value) = std::env::var(key) { command.env(key, value); }
+        }
         let request = format!("{}\n", json!({"id":1,"method":"turn","params":{"input":task,"role":role.as_str()}}));
-        command.args(["/tool/twig", "serve", "/workspace", "/runs"])
-            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", "/nonexistent")
-            .env("TWIG_BASE_URL", std::env::var("TWIG_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:3425/v1".into()));
         let capture = run_process(&mut command, request.as_bytes(), self.config.timeout, self.config.max_output_bytes)?;
         let mut raw = String::from_utf8_lossy(&capture.stdout).into_owned();
         raw.push_str(&String::from_utf8_lossy(&capture.stderr));
@@ -94,11 +101,33 @@ impl SubagentPool {
                 else if value["id"] == 1 { result_value = value.get("result").cloned().or_else(|| value.get("error").cloned()); }
             }
         }
-        Ok(SubagentResult { role: role.as_str().into(), worktree: worktree.to_path_buf(), output: raw, exit_code: capture.exit_code, timed_out: capture.timed_out, truncated: capture.truncated, events, result: result_value })
+        let (approved, review_summary) = if role == Role::Reviewer && capture.exit_code == Some(0) && !capture.timed_out && !capture.truncated {
+            result_value.as_ref().filter(|r| r["done"] == true && r["reason"] == "final")
+                .and_then(|r| r.get("text")).and_then(Value::as_str)
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .map(|review| (review.get("approved").and_then(Value::as_bool), review.get("summary").and_then(Value::as_str).map(str::to_owned)))
+                .unwrap_or((None, None))
+        } else { (None, None) };
+        Ok(SubagentResult { role: role.as_str().into(), worktree: host_worktree.clone(), run_dir: host_runs.clone(), output: raw, exit_code: capture.exit_code, timed_out: capture.timed_out, truncated: capture.truncated, events, result: result_value, approved, review_summary })
     }
     pub fn fresh_review(&self, diff: &str, evidence: &str) -> io::Result<SubagentResult> {
         if diff.trim().is_empty() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "review requires an actual diff")); }
-        self.run(Role::Reviewer, &format!("Review this proposed diff; do not edit. Identify correctness and security defects only.\nActual diff:\n{diff}\nVerification evidence:\n{evidence}"))
+        let task = format!("Independently review the actual proposed diff in /runs/review.diff and verification evidence below. Do not edit. Return only JSON: {{\"approved\": boolean, \"summary\": string}}. Any correctness or security defect means approved=false.\nEvidence:\n{evidence}");
+        self.run_reviewer(&task, diff)
+    }
+    fn run_reviewer(&self, task: &str, diff: &str) -> io::Result<SubagentResult> {
+        let _slot = self.acquire()?;
+        let repo = self.config.repository.canonicalize()?;
+        std::fs::create_dir_all(&self.config.runs_root)?;
+        let root = self.config.runs_root.canonicalize()?;
+        let name = format!("twig-review-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
+        let worktree = root.join(&name); let run_dir = root.join(format!("{name}-runs"));
+        std::fs::create_dir(&run_dir)?; std::fs::write(run_dir.join("review.diff"), diff)?;
+        let add = Command::new("git").args(["worktree", "add", "--detach", "--force"]).arg(&worktree).arg("HEAD").current_dir(&repo).output()?;
+        if !add.status.success() { let _ = std::fs::remove_dir_all(&run_dir); return Err(io::Error::other(String::from_utf8_lossy(&add.stderr).into_owned())); }
+        let result = self.run_in_worktree(Role::Reviewer, task, &worktree, &run_dir);
+        if result.is_err() { let _ = Command::new("git").args(["worktree", "remove", "--force"]).arg(&worktree).current_dir(&repo).output(); let _ = std::fs::remove_dir_all(&worktree); let _ = std::fs::remove_dir_all(&run_dir); }
+        result
     }
 }
 
