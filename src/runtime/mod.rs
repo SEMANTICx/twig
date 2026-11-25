@@ -238,6 +238,8 @@ pub struct Daemon<'a> {
     _lease: Lease,
     context: Context,
     check: Option<Check>,
+    model_override: Option<String>,
+    title: Option<String>,
 }
 
 impl<'a> Daemon<'a> {
@@ -267,6 +269,12 @@ impl<'a> Daemon<'a> {
         let record =
             Record::open(runs_dir.join(format!("{sid}.jsonl")), sid).map_err(|e| e.to_string())?;
         let rows = record.tail(usize::MAX).map_err(|e| e.to_string())?;
+        let title = rows
+            .iter()
+            .rev()
+            .find(|r| r["kind"] == "session.renamed")
+            .and_then(|r| r["title"].as_str())
+            .map(str::to_owned);
         let recovered = recover_session(&rows, default_check);
         let guard =
             Guard::new(&worktree, cfg.max_turns, cfg.stall_turns, 3).ignoring([runs_dir.clone()]);
@@ -280,6 +288,8 @@ impl<'a> Daemon<'a> {
             _lease: lease,
             context,
             check: recovered.check,
+            model_override: None,
+            title,
             tools: Tools::with_config(&worktree, cfg),
             system: cfg.system.clone(),
             worktree,
@@ -361,7 +371,111 @@ impl<'a> Daemon<'a> {
         emit: &mut dyn FnMut(Value),
     ) -> Result<Value, String> {
         match method {
-            "ping" => Ok(json!({"pong": true, "sid": self.sid()})),
+            "ping" => {
+                let model = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.llm.roles().get("code").to_string());
+                Ok(json!({
+                    "pong": true,
+                    "sid": self.sid(),
+                    "model": model,
+                    "title": self.title,
+                    "context_bytes": self.context.used_bytes(&self.messages),
+                    "context_max": self.context.max_bytes(),
+                }))
+            }
+
+            "session.history" => {
+                let model = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.llm.roles().get("code").to_string());
+                let turns = self
+                    .messages
+                    .iter()
+                    .filter(|m| m["role"] == "assistant")
+                    .count();
+                let playbooks: Vec<Value> = self
+                    .playbooks
+                    .iter()
+                    .map(|p| json!({"name": p.name, "when": p.when, "steps": p.steps}))
+                    .collect();
+                Ok(json!({
+                    "sid": self.sid(),
+                    "title": self.title,
+                    "model": model,
+                    "turns": turns,
+                    "messages": self.messages,
+                    "pending": self.pending,
+                    "context_bytes": self.context.used_bytes(&self.messages),
+                    "context_max": self.context.max_bytes(),
+                    "playbooks": playbooks,
+                    "skills": self.tools.skill_metadata(),
+                }))
+            }
+
+            "session.rename" => {
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or("session.rename requires nonempty title")?
+                    .to_owned();
+                self.title = Some(title.clone());
+                self.record
+                    .append("session.renamed", json!({"title": title}))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"title": title}))
+            }
+
+            "session.compact" => {
+                let model = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.llm.roles().get("code").to_string());
+                match self.context.compact_now(&mut self.messages, self.llm, &model)? {
+                    Some(compaction) => {
+                        self.record
+                            .append("context.compacted", json!({"compaction": compaction}))
+                            .map_err(|e| e.to_string())?;
+                        self.record
+                            .append("messages.checkpoint", json!({"messages": self.messages}))
+                            .map_err(|e| e.to_string())?;
+                        emit(json!({"ev": "context.compacted", "compaction": compaction}));
+                        Ok(json!({
+                            "compacted": true,
+                            "compaction": compaction,
+                            "context_bytes": self.context.used_bytes(&self.messages),
+                            "context_max": self.context.max_bytes(),
+                        }))
+                    }
+                    None => Ok(json!({
+                        "compacted": false,
+                        "context_bytes": self.context.used_bytes(&self.messages),
+                        "context_max": self.context.max_bytes(),
+                    })),
+                }
+            }
+
+            "model.set" => {
+                let requested = params
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("");
+                if requested.is_empty() || requested == "reset" || requested == "default" {
+                    self.model_override = None;
+                } else {
+                    self.model_override = Some(requested.to_owned());
+                }
+                let active = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.llm.roles().get("code").to_string());
+                Ok(json!({"model": active}))
+            }
 
             "steer" => {
                 let text = params["input"]
@@ -418,7 +532,10 @@ impl<'a> Daemon<'a> {
 
                 let input = params.get("input").and_then(Value::as_str).unwrap_or("");
                 let role = params.get("role").and_then(Value::as_str).unwrap_or("code");
-                let model = self.llm.roles().get(role).to_string();
+                let model = self
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.llm.roles().get(role).to_string());
                 if !self.pending.is_empty() {
                     return Err("pending tool approval must be resolved first; explicitly /approve ID or /deny ID".into());
                 }
@@ -515,6 +632,11 @@ impl<'a> Daemon<'a> {
                     if !result.deferred_calls.is_empty() {
                         self.deferred_calls = result.deferred_calls;
                     }
+                    emit(json!({
+                        "ev": "context.usage",
+                        "bytes": self.context.used_bytes(&self.messages),
+                        "max_bytes": self.context.max_bytes()
+                    }));
 
                     if !result.done {
                         continue;

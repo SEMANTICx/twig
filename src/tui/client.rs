@@ -7,6 +7,7 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -35,6 +36,15 @@ impl TerminalGuard {
         Ok(Self)
     }
 
+    pub fn set_mouse(enabled: bool) {
+        let mut stdout = io::stdout();
+        if enabled {
+            let _ = execute!(stdout, EnableMouseCapture);
+        } else {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+    }
+
     pub fn suspend() {
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
@@ -46,16 +56,15 @@ impl TerminalGuard {
         );
     }
 
-    pub fn resume() -> Result<(), String> {
+    pub fn resume(mouse_enabled: bool) -> Result<(), String> {
         enable_raw_mode().map_err(|e| format!("resume raw mode: {e}"))?;
         let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        )
-        .map_err(|e| format!("resume alternate screen: {e}"))
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+            .map_err(|e| format!("resume alternate screen: {e}"))?;
+        if mouse_enabled {
+            let _ = execute!(stdout, EnableMouseCapture);
+        }
+        Ok(())
     }
 }
 
@@ -63,6 +72,179 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         Self::suspend();
     }
+}
+
+/// Kitty native desktop notification (OSC 99): ignored when focused, delivered to WM when unfocused.
+pub fn notify_osc99(title: &str, body: &str) {
+    let clean = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(160)
+            .collect()
+    };
+    let mut stdout = io::stdout();
+    let _ = write!(
+        stdout,
+        "\x1b]99;i=twig:d=0:p=title;{}\x1b\\\x1b]99;i=twig:d=1:p=body;{}\x1b\\",
+        clean(title),
+        clean(body)
+    );
+    let _ = stdout.flush();
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub sid: String,
+    pub label: String,
+    pub turns: usize,
+    pub age: String,
+}
+
+/// Scan `~/.local/state/twig/sessions/*.jsonl` newest-first for `/resume`.
+pub fn list_sessions() -> Vec<SessionSummary> {
+    let dir = paths::state_dir().join("sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(SystemTime, std::path::PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .map(|e| {
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (mtime, e.path())
+        })
+        .collect();
+    files.sort_by_key(|a| std::cmp::Reverse(a.0));
+
+    let now = SystemTime::now();
+    let mut out = Vec::new();
+    for (mtime, path) in files.into_iter().take(25) {
+        let Some(sid) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut title: Option<String> = None;
+        let mut first_user: Option<String> = None;
+        let mut turns = 0usize;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(row) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            match row["kind"].as_str() {
+                Some("session.renamed") => {
+                    if let Some(t) = row["title"].as_str() {
+                        title = Some(t.to_owned());
+                    }
+                }
+                Some("message") => match row["message"]["role"].as_str() {
+                    Some("user") if first_user.is_none() => {
+                        if let Some(c) = row["message"]["content"].as_str() {
+                            let one: String = c.replace('\n', " ").trim().chars().take(72).collect();
+                            if !one.is_empty() {
+                                first_user = Some(one);
+                            }
+                        }
+                    }
+                    Some("assistant") => turns += 1,
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let label = title
+            .or(first_user)
+            .unwrap_or_else(|| "(empty session)".to_owned());
+        let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
+        let age = if secs < 60 {
+            format!("{secs}s ago")
+        } else if secs < 3600 {
+            format!("{}m ago", secs / 60)
+        } else if secs < 86_400 {
+            format!("{}h ago", secs / 3600)
+        } else {
+            format!("{}d ago", secs / 86_400)
+        };
+        out.push(SessionSummary {
+            sid,
+            label,
+            turns,
+            age,
+        });
+    }
+    out
+}
+
+/// Run a local quick shell command (`!cmd`) directly in `repo` without spending LLM tokens.
+pub fn run_local_shell(repo: &str, cmd: &str) -> (String, Option<i32>, Duration) {
+    let started = Instant::now();
+    match Command::new("sh")
+        .arg("-lc")
+        .arg(cmd)
+        .current_dir(repo)
+        .output()
+    {
+        Ok(out) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            let err = String::from_utf8_lossy(&out.stderr);
+            if !err.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&err);
+            }
+            (combined, out.status.code(), started.elapsed())
+        }
+        Err(e) => (format!("failed to run command: {e}"), Some(1), started.elapsed()),
+    }
+}
+
+/// Collect working-tree diff (or staged diff if unstaged is empty) for `/diff` and `/review`.
+pub fn run_git_diff(repo: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(["-C", repo, "diff"])
+        .output()
+        .map_err(|e| format!("git diff: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if !text.trim().is_empty() {
+        return Ok(text);
+    }
+    let staged = Command::new("git")
+        .args(["-C", repo, "diff", "--cached"])
+        .output()
+        .map_err(|e| format!("git diff --cached: {e}"))?;
+    Ok(String::from_utf8_lossy(&staged.stdout).into_owned())
+}
+
+/// Invoke `twig review <repo> <diff>` as an independent fresh read-only reviewer for `/review`.
+pub fn run_independent_review(repo: &str) -> Result<String, String> {
+    let diff = run_git_diff(repo)?;
+    if diff.trim().is_empty() {
+        return Err("no unstaged or staged git changes to review".into());
+    }
+    let diff_path = std::env::temp_dir().join(format!("twig-review-{}.diff", std::process::id()));
+    std::fs::write(&diff_path, &diff).map_err(|e| e.to_string())?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = Command::new(exe)
+        .arg("review")
+        .arg(repo)
+        .arg(&diff_path)
+        .output()
+        .map_err(|e| format!("spawn twig review: {e}"))?;
+    let _ = std::fs::remove_file(&diff_path);
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        return Err(if !err.is_empty() { err } else { stdout });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 pub fn detect_git_branch(repo: &str) -> Option<String> {

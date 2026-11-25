@@ -1,8 +1,9 @@
-//! Borderless Claude-Code-style multiline composer with generous breathing margins:
+//! Borderless Claude-Code/Codex multiline composer with:
 //! - Inset top & bottom hairline rules (`─`) and warm terracotta `❯` glyph
 //! - CJK/emoji-safe cursor math and readline shortcuts
 //! - Codex-style large-paste folding pills (`[Pasted #1 · 12 lines]`)
-//! - Charmbracelet/Lip-Gloss rounded popups for `/` commands and `@` repo file mentions
+//! - Codex-style borderless scrollable `/` command & `@` file mention palette
+//!   with full-width accent selection bar
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -15,21 +16,33 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::markdown::{
-    display_width, wrap_plain, ACCENT, ACCENT_PEAK, HAIRLINE, IVORY, MUTED, STONE, SURFACE_HI,
+    display_width, wrap_plain, ACCENT, ACCENT_PEAK, IVORY, MUTED, STONE, SURFACE_HI,
 };
 
+/// Codex & Claude Code parity slash command catalog.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/steer ", "Queue steering guidance for the active run"),
-    ("/cancel", "Interrupt active turn and child processes"),
-    ("/approve ", "Approve pending tool call by ID"),
-    ("/deny ", "Deny pending tool call by ID"),
-    ("/expand", "Toggle compact/expanded tool outputs (Ctrl+O)"),
-    ("/find ", "Search transcript history (Ctrl+F)"),
-    ("/copy", "Copy latest assistant code block (Alt+Y)"),
-    ("/editor", "Compose prompt in $EDITOR (Ctrl+G)"),
-    ("/clear", "Clear local transcript view"),
-    ("/help", "Show keyboard shortcuts (or press ?)"),
-    ("/quit", "Exit twig chat"),
+    ("/new", "start a new chat session"),
+    ("/resume", "browse and resume a previous session"),
+    ("/rename ", "rename the current session"),
+    ("/status", "show session telemetry, usage, and context"),
+    ("/diff", "show current git diff with line numbers"),
+    ("/review", "run independent read-only review on current changes"),
+    ("/skills", "list available playbooks and project skills"),
+    ("/model ", "view or switch the active model (or reset)"),
+    ("/compact", "compact conversation context now"),
+    ("/config", "show effective harness configuration"),
+    ("/steer ", "queue steering guidance for the active run"),
+    ("/cancel", "interrupt active turn and child processes"),
+    ("/approve ", "approve pending tool call by ID"),
+    ("/deny ", "deny pending tool call by ID"),
+    ("/expand", "toggle expanded/collapsed tool outputs (Ctrl+O)"),
+    ("/find ", "search transcript history (Ctrl+F)"),
+    ("/copy", "copy latest assistant code block (Alt+Y)"),
+    ("/editor", "compose prompt in $EDITOR (Ctrl+G)"),
+    ("/mouse", "toggle mouse capture for native text select (Alt+M)"),
+    ("/clear", "clear local transcript view"),
+    ("/help", "show keyboard shortcuts (?)"),
+    ("/quit", "exit twig chat"),
 ];
 
 pub enum PopupKind {
@@ -38,6 +51,12 @@ pub enum PopupKind {
         at_byte: usize,
         items: Vec<String>,
     },
+}
+
+pub enum PopupAccept {
+    None,
+    Filled,
+    Execute(String),
 }
 
 pub struct Composer {
@@ -221,18 +240,36 @@ impl Composer {
         true
     }
 
+    /// Tab completion: fills the highlighted slash command or file path into the composer.
     pub fn accept_popup(&mut self) -> bool {
+        matches!(self.accept_popup_inner(false), PopupAccept::Filled)
+    }
+
+    /// Codex-style Enter on popup: executes zero-argument slash commands immediately,
+    /// fills argument-taking commands or `@file` mentions into the composer.
+    pub fn accept_popup_on_enter(&mut self) -> PopupAccept {
+        self.accept_popup_inner(true)
+    }
+
+    fn accept_popup_inner(&mut self, execute_zero_arg: bool) -> PopupAccept {
         let Some(popup) = self.active_popup() else {
-            return false;
+            return PopupAccept::None;
         };
         match popup {
             PopupKind::Slash(items) => {
                 let idx = self.popup_sel.min(items.len().saturating_sub(1));
                 if let Some((cmd, _)) = items.get(idx) {
+                    if execute_zero_arg && !cmd.ends_with(' ') {
+                        let command = cmd.clone();
+                        self.text.clear();
+                        self.cursor = 0;
+                        self.popup_sel = 0;
+                        return PopupAccept::Execute(command);
+                    }
                     self.text = cmd.clone();
                     self.cursor = self.text.len();
                     self.popup_sel = 0;
-                    return true;
+                    return PopupAccept::Filled;
                 }
             }
             PopupKind::Mention { at_byte, items } => {
@@ -242,11 +279,11 @@ impl Composer {
                     self.text.replace_range(at_byte..self.cursor, &replacement);
                     self.cursor = at_byte + replacement.len();
                     self.popup_sel = 0;
-                    return true;
+                    return PopupAccept::Filled;
                 }
             }
         }
-        false
+        PopupAccept::None
     }
 
     pub fn history_up(&mut self) {
@@ -303,13 +340,25 @@ impl Composer {
 
     fn active_popup(&self) -> Option<PopupKind> {
         if self.text.starts_with('/') && !self.text.contains('\n') && !self.text.contains(' ') {
-            let matches: Vec<(String, String)> = SLASH_COMMANDS
+            let q = self.text.to_lowercase();
+            let mut matches: Vec<(usize, String, String)> = SLASH_COMMANDS
                 .iter()
-                .filter(|(cmd, _)| cmd.starts_with(self.text.as_str()))
-                .map(|(c, d)| ((*c).to_owned(), (*d).to_owned()))
+                .filter_map(|(cmd, desc)| {
+                    let low_cmd = cmd.trim_end().to_lowercase();
+                    if low_cmd.starts_with(&q) {
+                        Some((0, (*cmd).to_owned(), (*desc).to_owned()))
+                    } else if low_cmd.contains(&q[1..]) || desc.to_lowercase().contains(&q[1..]) {
+                        Some((1, (*cmd).to_owned(), (*desc).to_owned()))
+                    } else {
+                        None
+                    }
+                })
                 .collect();
-            if !matches.is_empty() {
-                return Some(PopupKind::Slash(matches));
+            matches.sort_by_key(|(rank, _, _)| *rank);
+            let out: Vec<(String, String)> =
+                matches.into_iter().map(|(_, c, d)| (c, d)).collect();
+            if !out.is_empty() {
+                return Some(PopupKind::Slash(out));
             }
         }
         let before = &self.text[..self.cursor];
@@ -338,7 +387,7 @@ impl Composer {
                 scored.sort_by_key(|(rank, p)| (*rank, p.len()));
                 let items: Vec<String> = scored
                     .into_iter()
-                    .take(8)
+                    .take(12)
                     .map(|(_, p)| p.clone())
                     .collect();
                 if !items.is_empty() {
@@ -353,10 +402,8 @@ impl Composer {
     }
 
     pub fn desired_height(&self, total_width: usize) -> u16 {
-        // 2-col left margin + `❯ ` (2 cols) + 2-col right margin = 6 cols chrome
         let text_w = total_width.saturating_sub(6).max(16);
         let lines = wrap_plain(&self.text, text_w);
-        // 1 top hairline + content lines (1..=6) + 1 bottom hairline
         (lines.len() as u16 + 2).clamp(3, 8)
     }
 
@@ -459,107 +506,124 @@ impl Composer {
         }
     }
 
-    /// Borderless minimal popup above the composer for `/` commands or `@` mentions.
+    /// Codex-style borderless scrollable command/file popup with full-width accent selection bar.
     pub fn render_popup(&self, frame: &mut Frame, composer_area: Rect, transcript_h: u16) {
         let Some(popup) = self.active_popup() else {
             return;
         };
-        if transcript_h < 4 || composer_area.width < 20 {
+        let max_rows = (transcript_h.saturating_sub(1) as usize).clamp(1, 8);
+        if composer_area.width < 20 {
             return;
         }
-        let popup_w = composer_area.width.saturating_sub(4).min(68);
-        let inner_w = popup_w as usize;
-        let (title, rows): (&str, Vec<Line<'static>>) = match popup {
+        let popup_w = composer_area.width.saturating_sub(2) as usize;
+        let sel_bg = ACCENT;
+        let sel_fg = Color::Rgb(22, 19, 17);
+
+        let rows: Vec<Line<'static>> = match popup {
             PopupKind::Slash(items) => {
                 let sel = self.popup_sel.min(items.len().saturating_sub(1));
-                let lines = items
-                    .into_iter()
+                let start = sel.saturating_sub(max_rows.saturating_sub(1));
+                let end = (start + max_rows).min(items.len());
+                items[start..end]
+                    .iter()
                     .enumerate()
-                    .map(|(i, (cmd, desc))| {
-                        let active = i == sel;
-                        let bg = if active { SURFACE_HI } else { Color::Reset };
-                        let marker = if active { " ▸ " } else { "   " };
-                        let cmd_col = format!("{cmd:<12}");
+                    .map(|(offset, (cmd, desc))| {
+                        let active = start + offset == sel;
+                        let bg = if active { sel_bg } else { Color::Reset };
+                        let marker = if active { " › " } else { "   " };
+                        let cmd_col = format!("{:<14}", cmd.trim_end());
                         let used = display_width(marker) + display_width(&cmd_col);
                         let desc_clipped: String = desc
                             .chars()
-                            .take(inner_w.saturating_sub(used + 1))
+                            .take(popup_w.saturating_sub(used + 1))
                             .collect();
-                        let pad = inner_w.saturating_sub(used + display_width(&desc_clipped));
-                        Line::from(vec![
-                            Span::styled(marker, Style::default().fg(ACCENT).bg(bg)),
-                            Span::styled(
-                                cmd_col,
-                                Style::default()
-                                    .fg(if active { ACCENT_PEAK } else { ACCENT })
-                                    .bg(bg)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                desc_clipped,
-                                Style::default()
-                                    .fg(if active { IVORY } else { STONE })
-                                    .bg(bg),
-                            ),
-                            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-                        ])
-                    })
-                    .collect();
-                (" Commands · ↑/↓ · Tab ", lines)
-            }
-            PopupKind::Mention { items, .. } => {
-                let sel = self.popup_sel.min(items.len().saturating_sub(1));
-                let lines = items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, path)| {
-                        let active = i == sel;
-                        let bg = if active { SURFACE_HI } else { Color::Reset };
-                        let marker = if active { " ▸ ◇ " } else { "   ◇ " };
-                        let used = display_width(marker);
-                        let clipped: String = path
-                            .chars()
-                            .take(inner_w.saturating_sub(used + 1))
-                            .collect();
-                        let pad = inner_w.saturating_sub(used + display_width(&clipped));
+                        let pad = popup_w.saturating_sub(used + display_width(&desc_clipped));
                         Line::from(vec![
                             Span::styled(
                                 marker,
                                 Style::default()
-                                    .fg(if active { ACCENT } else { MUTED })
-                                    .bg(bg),
+                                    .fg(if active { sel_fg } else { ACCENT })
+                                    .bg(bg)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                clipped,
+                                cmd_col,
                                 Style::default()
-                                    .fg(if active { IVORY } else { STONE })
+                                    .fg(if active { sel_fg } else { IVORY })
+                                    .bg(bg)
+                                    .add_modifier(if active {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                desc_clipped,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { STONE })
                                     .bg(bg),
                             ),
                             Span::styled(" ".repeat(pad), Style::default().bg(bg)),
                         ])
                     })
-                    .collect();
-                (" Files · ↑/↓ · Tab ", lines)
+                    .collect()
+            }
+            PopupKind::Mention { items, .. } => {
+                let sel = self.popup_sel.min(items.len().saturating_sub(1));
+                let start = sel.saturating_sub(max_rows.saturating_sub(1));
+                let end = (start + max_rows).min(items.len());
+                items[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, path)| {
+                        let active = start + offset == sel;
+                        let bg = if active { sel_bg } else { Color::Reset };
+                        let marker = if active { " › ◇ " } else { "   ◇ " };
+                        let used = display_width(marker);
+                        let clipped: String = path
+                            .chars()
+                            .take(popup_w.saturating_sub(used + 1))
+                            .collect();
+                        let pad = popup_w.saturating_sub(used + display_width(&clipped));
+                        Line::from(vec![
+                            Span::styled(
+                                marker,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { MUTED })
+                                    .bg(bg)
+                                    .add_modifier(if active {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                clipped,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { IVORY })
+                                    .bg(bg)
+                                    .add_modifier(if active {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+                        ])
+                    })
+                    .collect()
             }
         };
 
-        let popup_h = (rows.len() as u16 + 1).min(transcript_h);
+        let popup_h = rows.len() as u16;
         let popup_area = Rect {
-            x: composer_area.x + 2,
+            x: composer_area.x + 1,
             y: composer_area.y.saturating_sub(popup_h),
-            width: popup_w,
+            width: popup_w as u16,
             height: popup_h,
         };
-        let mut all = Vec::with_capacity(rows.len() + 1);
-        let top_fill = inner_w.saturating_sub(display_width(title) + 2);
-        all.push(Line::from(vec![
-            Span::styled("──", Style::default().fg(HAIRLINE)),
-            Span::styled(title, Style::default().fg(MUTED)),
-            Span::styled("─".repeat(top_fill), Style::default().fg(HAIRLINE)),
-        ]));
-        all.extend(rows);
         frame.render_widget(Clear, popup_area);
-        frame.render_widget(Paragraph::new(all), popup_area);
+        frame.render_widget(Paragraph::new(rows), popup_area);
     }
 }
 

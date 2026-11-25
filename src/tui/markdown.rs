@@ -429,11 +429,13 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
     spans
 }
 
-/// Render streaming assistant markdown into wrapped styled Ratatui lines with rounded code caps.
+/// Render streaming assistant markdown into wrapped styled Ratatui lines with
+/// lightweight zero-dependency syntax highlighting and unified diff gutters.
 pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let width = max_width.max(12);
     let mut out = Vec::new();
     let mut in_code = false;
+    let mut code_lang = String::new();
     let mut is_diff_block = false;
     let mut diff_gutter = DiffGutterState::default();
     let body = Style::default().fg(IVORY);
@@ -446,8 +448,8 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             in_code = !in_code;
             if in_code {
                 let lang = fence.trim();
-                is_diff_block =
-                    lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
+                code_lang = lang.to_ascii_lowercase();
+                is_diff_block = code_lang == "diff" || code_lang == "patch";
                 diff_gutter = DiffGutterState::default();
                 if !lang.is_empty() {
                     out.push(Line::from(Span::styled(
@@ -457,6 +459,7 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                 }
             } else {
                 is_diff_block = false;
+                code_lang.clear();
             }
             continue;
         }
@@ -469,12 +472,10 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                     out.push(Line::from(spans));
                 }
             } else {
-                let code_style = Style::default().fg(ACCENT_PEAK);
                 for wrapped in wrap_plain(line, width.saturating_sub(2)) {
-                    out.push(Line::from(vec![
-                        Span::styled("▎ ", Style::default().fg(HAIRLINE)),
-                        Span::styled(wrapped, code_style),
-                    ]));
+                    let mut spans = vec![Span::styled("▎ ", Style::default().fg(HAIRLINE))];
+                    spans.extend(highlight_code_line(&wrapped, &code_lang));
+                    out.push(Line::from(spans));
                 }
             }
             continue;
@@ -529,6 +530,176 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     }
 
     out
+}
+
+/// Zero-dependency warm syntax highlighter for Rust/Python/TS/JS/Go/Bash/JSON/TOML.
+fn highlight_code_line(line: &str, lang: &str) -> Vec<Span<'static>> {
+    let hash_comments = matches!(
+        lang,
+        "py" | "python" | "sh" | "bash" | "zsh" | "shell" | "toml" | "yaml" | "yml"
+    );
+    let slash_comments = !hash_comments && lang != "json";
+    let kw_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let str_style = Style::default().fg(SAGE);
+    let num_style = Style::default().fg(AMBER);
+    let cmt_style = Style::default().fg(MUTED);
+    let base_style = Style::default().fg(IVORY);
+    let type_style = Style::default().fg(ACCENT_PEAK);
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut plain = String::new();
+    let flush = |plain: &mut String, out: &mut Vec<Span<'static>>| {
+        if !plain.is_empty() {
+            out.push(Span::styled(std::mem::take(plain), base_style));
+        }
+    };
+
+    while i < chars.len() {
+        let ch = chars[i];
+        // Line comment (`//` or `#`)
+        if (slash_comments && ch == '/' && chars.get(i + 1) == Some(&'/'))
+            || (hash_comments && ch == '#')
+        {
+            flush(&mut plain, &mut out);
+            let rest: String = chars[i..].iter().collect();
+            out.push(Span::styled(rest, cmt_style));
+            break;
+        }
+        // Quoted string (`"..."` or `'...'`)
+        if ch == '"' || (ch == '\'' && lang != "rust" && lang != "rs") {
+            flush(&mut plain, &mut out);
+            let quote = ch;
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            let lit: String = chars[start..i].iter().collect();
+            out.push(Span::styled(lit, str_style));
+            continue;
+        }
+        // Number literal
+        if ch.is_ascii_digit()
+            && (i == 0 || !chars[i - 1].is_ascii_alphanumeric() && chars[i - 1] != '_')
+        {
+            flush(&mut plain, &mut out);
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '.' | '_'))
+            {
+                i += 1;
+            }
+            let num: String = chars[start..i].iter().collect();
+            out.push(Span::styled(num, num_style));
+            continue;
+        }
+        // Identifier / keyword / PascalCase type
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if is_keyword(&word) {
+                flush(&mut plain, &mut out);
+                out.push(Span::styled(word, kw_style));
+            } else if word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && word.chars().any(|c| c.is_ascii_lowercase())
+            {
+                flush(&mut plain, &mut out);
+                out.push(Span::styled(word, type_style));
+            } else {
+                plain.push_str(&word);
+            }
+            continue;
+        }
+        plain.push(ch);
+        i += 1;
+    }
+    flush(&mut plain, &mut out);
+    if out.is_empty() {
+        out.push(Span::styled(String::new(), base_style));
+    }
+    out
+}
+
+fn is_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "fn" | "let"
+            | "mut"
+            | "pub"
+            | "struct"
+            | "enum"
+            | "impl"
+            | "trait"
+            | "use"
+            | "mod"
+            | "match"
+            | "if"
+            | "else"
+            | "for"
+            | "while"
+            | "loop"
+            | "return"
+            | "break"
+            | "continue"
+            | "async"
+            | "await"
+            | "const"
+            | "static"
+            | "type"
+            | "where"
+            | "self"
+            | "Self"
+            | "true"
+            | "false"
+            | "None"
+            | "Some"
+            | "Ok"
+            | "Err"
+            | "def"
+            | "class"
+            | "import"
+            | "from"
+            | "as"
+            | "with"
+            | "try"
+            | "except"
+            | "raise"
+            | "lambda"
+            | "yield"
+            | "pass"
+            | "function"
+            | "export"
+            | "default"
+            | "interface"
+            | "var"
+            | "new"
+            | "null"
+            | "undefined"
+            | "func"
+            | "package"
+            | "defer"
+            | "go"
+            | "select"
+            | "case"
+            | "then"
+            | "fi"
+            | "do"
+            | "done"
+            | "local"
+    )
 }
 
 /// Extract all fenced code blocks from markdown text (used by `Alt+Y` copy shortcut).
@@ -691,32 +862,15 @@ impl SmoothScroll {
     }
 }
 
-/// Minimal borderless warm-terracotta welcome header (zero boxes, pure typography).
+/// Minimal borderless warm-terracotta welcome header — no boxes and no duplication
+/// with the bottom status line (model/repo/branch live exclusively in the footer).
 pub fn render_welcome_card(
-    model: &str,
-    repo_label: &str,
-    git_branch: Option<&str>,
+    _model: &str,
+    _repo_label: &str,
+    _git_branch: Option<&str>,
     repo_path: &str,
     _width: usize,
 ) -> Vec<Line<'static>> {
-    let mut meta = vec![
-        Span::raw("    "),
-        Span::styled(model.to_owned(), Style::default().fg(ACCENT_PEAK)),
-        Span::styled(" · ", Style::default().fg(MUTED)),
-        Span::styled(repo_label.to_owned(), Style::default().fg(STONE)),
-    ];
-    if let Some(branch) = git_branch {
-        meta.push(Span::styled(
-            format!(" ({branch})"),
-            Style::default().fg(MUTED),
-        ));
-    }
-    if repo_path != repo_label {
-        meta.push(Span::styled(
-            format!(" · {repo_path}"),
-            Style::default().fg(MUTED),
-        ));
-    }
     vec![
         Line::from(""),
         Line::from(vec![
@@ -733,7 +887,14 @@ pub fn render_welcome_card(
                 Style::default().fg(MUTED),
             ),
         ]),
-        Line::from(meta),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(repo_path.to_owned(), Style::default().fg(STONE)),
+            Span::styled(
+                "  ·  / commands  ·  @ files  ·  ! shell  ·  ? shortcuts",
+                Style::default().fg(MUTED),
+            ),
+        ]),
         Line::from(""),
     ]
 }
@@ -743,14 +904,14 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
     let row = |k1: &str, d1: &str, k2: &str, d2: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(
-                format!("  {k1:<13}"),
+                format!("  {k1:<14}"),
                 Style::default()
                     .fg(ACCENT_PEAK)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{d1:<24}"), Style::default().fg(STONE)),
+            Span::styled(format!("{d1:<25}"), Style::default().fg(STONE)),
             Span::styled(
-                format!("{k2:<13}"),
+                format!("{k2:<14}"),
                 Style::default()
                     .fg(ACCENT_PEAK)
                     .add_modifier(Modifier::BOLD),
@@ -768,8 +929,8 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
         row(
             "Esc",
             "interrupt / press×2 clear",
-            "@  /  Tab",
-            "file & slash completion",
+            "!cmd · @ · /",
+            "shell · file · commands",
         ),
         row(
             "Ctrl+O",
@@ -780,11 +941,11 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
         row(
             "Ctrl+G",
             "compose in $EDITOR",
-            "Alt+Y",
-            "copy latest code block",
+            "Alt+Y / +Shift",
+            "copy code / full reply",
         ),
         Line::from(Span::styled(
-            "  ? or Esc to close · PgUp/PgDn/wheel smooth scroll · Ctrl+C quit",
+            "  Alt+M toggle mouse select · ? or Esc close · PgUp/PgDn scroll · Ctrl+C quit",
             Style::default().fg(MUTED),
         )),
     ]

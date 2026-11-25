@@ -199,6 +199,7 @@ pub fn run_turn_live(
             }),
         )
         .map_err(|e| e.to_string())?;
+    emit(json!({"ev": "model.usage", "model": model, "usage": reply.usage}));
     let mut assistant = json!({
         "role": "assistant",
         "content": reply.text,
@@ -222,7 +223,7 @@ pub fn run_turn_live(
         record
             .append("turn.completed", json!({"reason": "final"}))
             .map_err(|e| e.to_string())?;
-        emit(json!({"ev": "turn.completed", "reason": "final", "text": reply.text}));
+        emit(json!({"ev": "turn.completed", "reason": "final", "text": reply.text, "usage": reply.usage}));
         return Ok(TurnResult {
             done: true,
             reason: "final",

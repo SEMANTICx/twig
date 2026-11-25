@@ -100,6 +100,14 @@ impl Context {
         }
     }
 
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    pub fn used_bytes(&self, messages: &[Value]) -> usize {
+        bytes(messages)
+    }
+
     /// Uses the existing chat representation. On failure the live context is unchanged.
     /// The first user request and every system message remain verbatim, alongside
     /// explicit constraints, a recent complete tool-group suffix and recovery refs.
@@ -109,16 +117,41 @@ impl Context {
         llm: &dyn Llm,
         model: &str,
     ) -> Result<Option<Compaction>, String> {
+        self.compact_with_force(messages, llm, model, false)
+    }
+
+    /// Manual compaction triggered by `/compact` regardless of byte threshold.
+    pub fn compact_now(
+        &self,
+        messages: &mut Vec<Value>,
+        llm: &dyn Llm,
+        model: &str,
+    ) -> Result<Option<Compaction>, String> {
+        self.compact_with_force(messages, llm, model, true)
+    }
+
+    fn compact_with_force(
+        &self,
+        messages: &mut Vec<Value>,
+        llm: &dyn Llm,
+        model: &str,
+        force: bool,
+    ) -> Result<Option<Compaction>, String> {
         let before_bytes = bytes(messages);
-        if before_bytes <= self.max_bytes {
+        if !force && before_bytes <= self.max_bytes {
             return Ok(None);
         }
         validate_tool_pairs(messages)?;
         let first_user = messages.iter().position(|m| m["role"] == "user");
         let pinned = |i: usize, m: &Value| m["role"] == "system" || Some(i) == first_user;
+        let keep_budget = if force {
+            (before_bytes / 3).min(self.max_bytes / 2)
+        } else {
+            self.max_bytes / 2
+        };
         let mut cutoff = messages.len();
         for candidate in (0..messages.len()).rev() {
-            if bytes(&messages[candidate..]) > self.max_bytes / 2 {
+            if bytes(&messages[candidate..]) > keep_budget {
                 break;
             }
             if validate_tool_pairs(&messages[candidate..]).is_ok() {
@@ -132,6 +165,9 @@ impl Context {
             .map(|(_, m)| m.clone())
             .collect();
         if removed.is_empty() {
+            if force {
+                return Ok(None);
+            }
             return Err(
                 "context budget cannot hold pinned constraints and recent tool pairs".into(),
             );

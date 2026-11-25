@@ -1,18 +1,20 @@
-//! Claude Code warm-terracotta minimalist TUI for `twig chat`:
-//! - Claude Code visual craft: rounded terracotta welcome card, `⏺`/`⎿` aligned tool trees,
-//!   organic breathing floral star (`· ✢ ✳ ✶ ✻ ✽`), 2-col breathing margins, hairline composer
-//! - Codex (`codex-rs/tui`) engine: cadenced column-width shimmer, unified diff line-number gutter,
-//!   paste pills, `FooterMode` + `?` shortcut overlay, 200ms onset delay, `TWIG_REDUCED_MOTION`
-//! - Charmbracelet/omp smoothness: 60fps exponential-eased scrolling, DEC 2026 sync updates,
-//!   event-batching frame loop, `Ctrl+F` search, `Ctrl+G` `$EDITOR`, `Alt+Y` OSC 52 code copy
+//! Borderless Claude-Code warm-terracotta TUI with full Codex-parity workflow:
+//! - Zero box borders: pure typography welcome header, inset hairline composer, Codex full-width
+//!   slash-command & `@file` selection bar, and hairline approval selector
+//! - Full Codex/Claude command suite: `/new`, `/resume` (with history replay), `/rename`,
+//!   `/status`, `/diff`, `/review`, `/skills`, `/model`, `/compact`, `/config`, `/mouse`, `!cmd`
+//! - Live token/cache/context telemetry footer, Kitty OSC 99 desktop notifications,
+//!   60fps exponential smooth scroll, cadenced shimmer, breathing floral star, and syntax highlighting
 
 mod client;
 mod composer;
 mod markdown;
+mod transcript;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -24,24 +26,27 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use serde_json::{json, Value};
 
 use self::client::{
-    chat_plain, copy_to_clipboard, detect_git_branch, edit_in_external_editor, shorten_home,
-    ServeClient, ServerMsg, TerminalGuard,
+    chat_plain, copy_to_clipboard, detect_git_branch, edit_in_external_editor, list_sessions,
+    notify_osc99, run_git_diff, run_independent_review, run_local_shell, shorten_home, ServeClient,
+    ServerMsg, SessionSummary, TerminalGuard,
 };
-use self::composer::Composer;
+use self::composer::{Composer, PopupAccept};
 use self::markdown::{
-    active_rule_color, breathing_star, display_width, extract_code_blocks, fmt_elapsed_compact,
-    highlight_search, render_markdown, render_welcome_card, shimmer_is_sweeping,
-    shortcut_overlay_lines, streaming_caret, style_output_line, summary_shimmer, tool_glyph,
-    wrap_plain, DiffGutterState, MotionMode, SmoothScroll, ACCENT, ACCENT_PEAK, AMBER, HAIRLINE,
+    active_rule_color, breathing_star, display_width, fmt_elapsed_compact, shimmer_is_sweeping,
+    shortcut_overlay_lines, summary_shimmer, MotionMode, ACCENT, ACCENT_PEAK, AMBER, HAIRLINE,
     HAIRLINE_FOCUS, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE, SURFACE_HI,
 };
+use self::transcript::{
+    clip_str, render_resume_picker, summarize_tool_args, title_tool_name, NoticeKind, RenderOpts,
+    Transcript,
+};
+use crate::config::HarnessConfig;
 
-/// Calm engineering activity verbs rotated gently during active turns.
 const ACTIVITY_VERBS: &[&str] = &[
     "Thinking",
     "Reasoning",
@@ -59,7 +64,6 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
     run_tui(repo, resume)
 }
 
-/// Ported from `codex-rs/tui/src/bottom_pane/footer.rs`: explicit footer state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FooterMode {
     Contextual,
@@ -76,35 +80,14 @@ struct PendingApproval {
     recovered: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ToolCell {
-    id: String,
-    name: String,
-    summary: String,
-    tier: String,
-    output: String,
-    started_at: Instant,
-    elapsed: Option<Duration>,
-    exit_code: Option<i32>,
-    finished: bool,
-}
-
-#[derive(Debug, Clone)]
-enum NoticeKind {
-    Playbook,
-    Info,
-    Warn,
-    Error,
-    Success,
-}
-
-#[derive(Debug, Clone)]
-enum Cell {
-    User(String),
-    Steering(String),
-    Assistant(String),
-    Tool(ToolCell),
-    Notice { kind: NoticeKind, text: String },
+enum LocalMsg {
+    ShellDone {
+        id: String,
+        output: String,
+        exit_code: Option<i32>,
+        elapsed: Duration,
+    },
+    ReviewDone(Result<String, String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,44 +97,59 @@ enum Action {
     SendSteer(String),
     Cancel,
     ResolveApproval { id: String, allow: bool },
+    NewSession,
+    SwitchSession(String),
+    RenameSession(String),
+    SetModel(String),
+    CompactNow,
+    RunLocalShell(String),
+    RunDiff,
+    RunReview,
+    ToggleMouse,
     OpenEditor,
     CopyCode(String),
     Quit,
 }
 
 struct App {
+    repo_raw: String,
     repo_path: String,
     repo_label: String,
     git_branch: Option<String>,
     sid: String,
+    title: Option<String>,
     model: String,
     playbook: Option<String>,
     guard_level: Option<String>,
+    playbooks_meta: Vec<String>,
+    skills_meta: String,
     turns_used: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    context_bytes: usize,
+    context_max: usize,
     running: bool,
     run_started: Option<Instant>,
     last_delta_at: Option<Instant>,
     status_header: String,
     status_header_started: Instant,
     active_turn_req: Option<u64>,
-    cells: Vec<Cell>,
+    history_req: Option<u64>,
+    transcript: Transcript,
     approvals: VecDeque<PendingApproval>,
     approval_sel: usize,
+    resume_picker: Option<(Vec<SessionSummary>, usize)>,
     composer: Composer,
-    expand_tools: bool,
+    mouse_enabled: bool,
     motion: MotionMode,
     footer_mode: FooterMode,
     footer_mode_at: Instant,
-    search_open: bool,
-    search_query: String,
-    search_match_idx: usize,
-    search_matches: Vec<usize>,
-    scroll: SmoothScroll,
     last_frame_at: Instant,
     last_ctrl_c: Option<Instant>,
-    copy_cycle: usize,
-    last_copy_at: Option<Instant>,
     status_flash: Option<(String, Instant)>,
+    next_local_id: u64,
+    pending_notify: Option<(String, String)>,
 }
 
 impl App {
@@ -166,39 +164,65 @@ impl App {
         let repo_path = shorten_home(&canonical.display().to_string());
         let now = Instant::now();
         Self {
+            repo_raw: repo.to_owned(),
             repo_path,
             repo_label,
             git_branch: detect_git_branch(repo),
             sid: String::new(),
+            title: None,
             model: std::env::var("TWIG_MODEL").unwrap_or_else(|_| "magpie".into()),
             playbook: None,
             guard_level: None,
+            playbooks_meta: Vec::new(),
+            skills_meta: String::new(),
             turns_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            context_bytes: 0,
+            context_max: 0,
             running: false,
             run_started: None,
             last_delta_at: None,
             status_header: String::from("Working"),
             status_header_started: now,
             active_turn_req: None,
-            cells: Vec::new(),
+            history_req: None,
+            transcript: Transcript::new(),
             approvals: VecDeque::new(),
             approval_sel: 0,
+            resume_picker: None,
             composer: Composer::new(repo),
-            expand_tools: false,
+            mouse_enabled: true,
             motion: MotionMode::from_env(),
             footer_mode: FooterMode::Contextual,
             footer_mode_at: now,
-            search_open: false,
-            search_query: String::new(),
-            search_match_idx: 0,
-            search_matches: Vec::new(),
-            scroll: SmoothScroll::new(),
             last_frame_at: now,
             last_ctrl_c: None,
-            copy_cycle: 0,
-            last_copy_at: None,
             status_flash: None,
+            next_local_id: 1,
+            pending_notify: None,
         }
+    }
+
+    fn reset_session_view(&mut self) {
+        self.sid.clear();
+        self.title = None;
+        self.playbook = None;
+        self.guard_level = None;
+        self.turns_used = 0;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.cached_tokens = 0;
+        self.context_bytes = 0;
+        self.running = false;
+        self.run_started = None;
+        self.last_delta_at = None;
+        self.active_turn_req = None;
+        self.transcript.clear();
+        self.approvals.clear();
+        self.approval_sel = 0;
+        self.resume_picker = None;
     }
 
     fn update_status_header(&mut self, next: String) {
@@ -217,26 +241,16 @@ impl App {
         self.status_flash = Some((msg.into(), Instant::now()));
     }
 
-    fn push_notice(&mut self, kind: NoticeKind, text: impl Into<String>) {
-        self.cells.push(Cell::Notice {
-            kind,
-            text: text.into(),
-        });
-    }
-
-    /// Adaptive 60fps / low-power pacing:
-    /// - 16ms (~60fps) during smooth-scroll easing, active 1s shimmer sweep, or live token deltas
-    /// - 45ms (~22fps) during active turns in shimmer rest (keeps floral star & rule breathing silky)
-    /// - 200ms when completely idle (near-0% CPU)
     fn next_poll_interval(&self) -> Duration {
-        if self.scroll.is_animating(self.motion) {
+        if self.transcript.is_scroll_animating(self.motion) {
             return Duration::from_millis(16);
         }
         if self.running && self.approvals.is_empty() && self.motion == MotionMode::Animated {
             let streaming_now = self
                 .last_delta_at
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(600));
-            if streaming_now || shimmer_is_sweeping(self.status_header_started.elapsed(), self.motion)
+            if streaming_now
+                || shimmer_is_sweeping(self.status_header_started.elapsed(), self.motion)
             {
                 return Duration::from_millis(16);
             }
@@ -249,18 +263,25 @@ impl App {
         if !self.running {
             return;
         }
-        if let Some(Cell::Tool(tool)) = self
-            .cells
-            .iter()
-            .rev()
-            .find(|c| matches!(c, Cell::Tool(t) if !t.finished))
-        {
-            self.update_status_header(format!("Running {}", title_tool_name(&tool.name)));
+        if let Some(tool_name) = self.transcript.active_tool_name() {
+            self.update_status_header(format!("Running {}", title_tool_name(tool_name)));
             return;
         }
         let secs = self.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let idx = ((secs / 8) as usize) % ACTIVITY_VERBS.len();
         self.update_status_header(ACTIVITY_VERBS[idx].to_owned());
+    }
+
+    fn absorb_usage(&mut self, usage: &Value) {
+        if let Some(i) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.input_tokens = self.input_tokens.saturating_add(i);
+        }
+        if let Some(o) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = self.output_tokens.saturating_add(o);
+        }
+        if let Some(c) = usage.get("cached_input_tokens").and_then(Value::as_u64) {
+            self.cached_tokens = self.cached_tokens.saturating_add(c);
+        }
     }
 
     fn apply_server_msg(&mut self, msg: ServerMsg) {
@@ -269,6 +290,44 @@ impl App {
             ServerMsg::Reply { id, result } => {
                 if let Some(sid) = result.get("sid").and_then(Value::as_str) {
                     self.sid = sid.to_owned();
+                }
+                if let Some(model) = result.get("model").and_then(Value::as_str) {
+                    self.model = model.to_owned();
+                }
+                if let Some(title) = result.get("title").and_then(Value::as_str) {
+                    self.title = Some(title.to_owned());
+                }
+                if let Some(cb) = result.get("context_bytes").and_then(Value::as_u64) {
+                    self.context_bytes = cb as usize;
+                }
+                if let Some(cm) = result.get("context_max").and_then(Value::as_u64) {
+                    self.context_max = cm as usize;
+                }
+                if let Some(turns) = result.get("turns").and_then(Value::as_u64) {
+                    self.turns_used = turns;
+                }
+                if let Some(books) = result.get("playbooks").and_then(Value::as_array) {
+                    self.playbooks_meta = books
+                        .iter()
+                        .filter_map(|b| b["name"].as_str().map(str::to_owned))
+                        .collect();
+                }
+                if let Some(skills) = result.get("skills").and_then(Value::as_str) {
+                    self.skills_meta = skills.to_owned();
+                }
+                if self.history_req == Some(id) {
+                    self.history_req = None;
+                    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+                        self.transcript.replay_history(messages);
+                    }
+                }
+                if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
+                    if !compacted {
+                        self.transcript.push_notice(
+                            NoticeKind::Info,
+                            "context is already compact; nothing archived",
+                        );
+                    }
                 }
                 if let Some(pending) = result.get("pending").and_then(Value::as_array) {
                     for p in pending {
@@ -291,7 +350,7 @@ impl App {
                     self.active_turn_req = None;
                     if let Some(reason) = result.get("reason").and_then(Value::as_str) {
                         if reason != "final" {
-                            self.push_notice(
+                            self.transcript.push_notice(
                                 if reason == "verify_failed" {
                                     NoticeKind::Error
                                 } else {
@@ -300,8 +359,13 @@ impl App {
                                 format!("turn ended: {reason}"),
                             );
                         } else if result["verified"] == true {
-                            self.push_notice(NoticeKind::Success, "verification passed");
+                            self.transcript
+                                .push_notice(NoticeKind::Success, "verification passed");
                         }
+                        self.pending_notify = Some((
+                            "twig".into(),
+                            format!("{} · turn {reason}", self.repo_label),
+                        ));
                     }
                 }
             }
@@ -312,7 +376,7 @@ impl App {
                     self.last_delta_at = None;
                     self.active_turn_req = None;
                 }
-                self.push_notice(NoticeKind::Error, message);
+                self.transcript.push_notice(NoticeKind::Error, message);
             }
             ServerMsg::Stderr(line) => {
                 if let Some(rest) = line.strip_prefix("twig: ") {
@@ -322,15 +386,41 @@ impl App {
                         self.sid = sid_part.to_owned();
                     }
                 } else {
-                    self.push_notice(NoticeKind::Warn, line);
+                    self.transcript.push_notice(NoticeKind::Warn, line);
                 }
             }
             ServerMsg::Exited => {
                 self.running = false;
                 self.run_started = None;
                 self.last_delta_at = None;
-                self.push_notice(NoticeKind::Error, "twig serve process exited");
+                self.transcript
+                    .push_notice(NoticeKind::Error, "twig serve process exited");
             }
+        }
+    }
+
+    fn apply_local_msg(&mut self, msg: LocalMsg) {
+        match msg {
+            LocalMsg::ShellDone {
+                id,
+                output,
+                exit_code,
+                elapsed,
+            } => {
+                self.transcript
+                    .finish_tool(&id, Some(output), exit_code, Some(elapsed));
+                self.transcript.follow_tail();
+            }
+            LocalMsg::ReviewDone(res) => match res {
+                Ok(text) => {
+                    self.transcript
+                        .push_notice(NoticeKind::Success, "independent review completed");
+                    self.transcript.push_assistant(text);
+                }
+                Err(e) => self
+                    .transcript
+                    .push_notice(NoticeKind::Error, format!("review: {e}")),
+            },
         }
     }
 
@@ -349,16 +439,20 @@ impl App {
                     self.turns_used = t;
                 }
             }
+            Some("model.usage") => self.absorb_usage(&ev["usage"]),
+            Some("context.usage") => {
+                if let Some(b) = ev["bytes"].as_u64() {
+                    self.context_bytes = b as usize;
+                }
+                if let Some(m) = ev["max_bytes"].as_u64() {
+                    self.context_max = m as usize;
+                }
+            }
             Some("model.delta") => {
                 let delta = ev["text"].as_str().unwrap_or("");
-                if delta.is_empty() {
-                    return;
-                }
-                self.last_delta_at = Some(Instant::now());
-                if let Some(Cell::Assistant(buf)) = self.cells.last_mut() {
-                    buf.push_str(delta);
-                } else {
-                    self.cells.push(Cell::Assistant(delta.to_owned()));
+                if !delta.is_empty() {
+                    self.last_delta_at = Some(Instant::now());
+                    self.transcript.append_assistant_delta(delta);
                 }
             }
             Some("tool.started") => {
@@ -367,56 +461,38 @@ impl App {
                 let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
                 let summary = summarize_tool_args(&name, &ev["args"]);
                 self.update_status_header(format!("Running {}", title_tool_name(&name)));
-                self.cells.push(Cell::Tool(ToolCell {
-                    id,
-                    name,
-                    summary,
-                    tier,
-                    output: String::new(),
-                    started_at: Instant::now(),
-                    elapsed: None,
-                    exit_code: None,
-                    finished: false,
-                }));
+                self.transcript.push_tool_started(id, name, summary, tier);
             }
             Some("tool.output") => {
-                let id = ev["id"].as_str().unwrap_or("");
-                let chunk = ev["text"].as_str().unwrap_or("");
-                if let Some(Cell::Tool(tool)) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|c| matches!(c, Cell::Tool(t) if t.id == id))
-                {
-                    if tool.output.len() < 262_144 {
-                        tool.output.push_str(chunk);
-                    }
-                }
+                self.transcript.append_tool_output(
+                    ev["id"].as_str().unwrap_or(""),
+                    ev["text"].as_str().unwrap_or(""),
+                );
             }
             Some("tool.completed") => {
-                let id = ev["id"].as_str().unwrap_or("");
-                let exit_code = ev["exit_code"].as_i64().map(|c| c as i32);
-                if let Some(Cell::Tool(tool)) = self
-                    .cells
-                    .iter_mut()
-                    .rev()
-                    .find(|c| matches!(c, Cell::Tool(t) if t.id == id))
-                {
-                    tool.finished = true;
-                    tool.elapsed = Some(tool.started_at.elapsed());
-                    tool.exit_code = exit_code;
-                }
+                self.transcript.finish_tool(
+                    ev["id"].as_str().unwrap_or(""),
+                    None,
+                    ev["exit_code"].as_i64().map(|c| c as i32),
+                    None,
+                );
             }
             Some("approval.requested") => {
                 let id = ev["id"].as_str().unwrap_or("").to_owned();
+                let name = ev["name"].as_str().unwrap_or("bash").to_owned();
+                let summary = summarize_tool_args(&name, &ev["args"]);
                 if !id.is_empty() && !self.approvals.iter().any(|a| a.id == id) {
                     self.approvals.push_back(PendingApproval {
                         id,
-                        name: ev["name"].as_str().unwrap_or("bash").to_owned(),
+                        name: name.clone(),
                         args: ev["args"].clone(),
                         recovered: ev["recovered"] == true,
                     });
                     self.approval_sel = 0;
+                    self.pending_notify = Some((
+                        "twig · approval needed".into(),
+                        format!("{name}: {summary}"),
+                    ));
                 }
             }
             Some("approval.resolved") => {
@@ -424,7 +500,7 @@ impl App {
                 let allow = ev["allow"] == true;
                 self.approvals.retain(|a| a.id != id);
                 self.approval_sel = 0;
-                self.push_notice(
+                self.transcript.push_notice(
                     if allow {
                         NoticeKind::Success
                     } else {
@@ -439,25 +515,27 @@ impl App {
             Some("playbook.selected") => {
                 if let Some(name) = ev["name"].as_str() {
                     self.playbook = Some(name.to_owned());
-                    self.push_notice(NoticeKind::Playbook, format!("playbook routed · {name}"));
+                    self.transcript
+                        .push_notice(NoticeKind::Playbook, format!("playbook routed · {name}"));
                 }
             }
             Some("guard.tripped") => {
                 if let Some(level) = ev["level"].as_str() {
                     self.guard_level = Some(level.to_owned());
-                    self.push_notice(NoticeKind::Warn, format!("guard tripped · {level}"));
+                    self.transcript
+                        .push_notice(NoticeKind::Warn, format!("guard tripped · {level}"));
                 }
             }
             Some("context.compacted") => {
                 let removed = ev["compaction"]["removed_messages"].as_u64().unwrap_or(0);
-                self.push_notice(
+                self.transcript.push_notice(
                     NoticeKind::Info,
                     format!("context compacted ({removed} older messages archived)"),
                 );
             }
             Some("verify.completed") => {
                 let passed = ev["verdict"]["passed"] == true;
-                self.push_notice(
+                self.transcript.push_notice(
                     if passed {
                         NoticeKind::Success
                     } else {
@@ -471,61 +549,25 @@ impl App {
                 );
             }
             Some("verify.passed") => {
-                self.push_notice(NoticeKind::Success, "differential verification passed");
+                self.transcript
+                    .push_notice(NoticeKind::Success, "differential verification passed");
             }
             Some("verify.failed") => {
-                self.push_notice(NoticeKind::Error, "differential verification failed");
+                self.transcript
+                    .push_notice(NoticeKind::Error, "differential verification failed");
             }
             Some("papercut.filed") => {
                 let comp = ev["report"]["component"].as_str().unwrap_or("harness");
-                self.push_notice(NoticeKind::Info, format!("papercut filed · {comp}"));
+                self.transcript
+                    .push_notice(NoticeKind::Info, format!("papercut filed · {comp}"));
             }
             _ => {}
         }
     }
 
-    fn copy_latest_code_block(&mut self) -> Action {
-        let mut all_blocks = Vec::new();
-        for cell in &self.cells {
-            if let Cell::Assistant(text) = cell {
-                all_blocks.extend(extract_code_blocks(text));
-            }
-        }
-        if all_blocks.is_empty() {
-            self.flash("No assistant code blocks to copy");
-            return Action::None;
-        }
-        let within_cycle = self
-            .last_copy_at
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(8));
-        if within_cycle {
-            self.copy_cycle = (self.copy_cycle + 1) % all_blocks.len();
-        } else {
-            self.copy_cycle = 0;
-        }
-        self.last_copy_at = Some(Instant::now());
-        let idx = all_blocks.len() - 1 - self.copy_cycle;
-        let block = all_blocks[idx].clone();
-        let line_n = block.lines().count();
-        self.flash(format!(
-            "Copied code block #{}/{} ({line_n} lines)",
-            self.copy_cycle + 1,
-            all_blocks.len()
-        ));
-        Action::CopyCode(block)
-    }
-
-    fn jump_to_search_match(&mut self) {
-        if let Some(&line_no) = self.search_matches.get(self.search_match_idx) {
-            self.scroll.jump_to(line_no.saturating_sub(3));
-        }
-    }
-
     fn handle_paste(&mut self, pasted: &str) {
-        if self.search_open {
-            let clean = pasted.replace(['\r', '\n'], " ");
-            self.search_query.push_str(&clean);
-            self.search_match_idx = 0;
+        if self.transcript.search_is_open() {
+            self.transcript.search_paste(pasted);
             return;
         }
         if let Some(pill) = self.composer.handle_paste(pasted) {
@@ -538,16 +580,58 @@ impl App {
             return Action::None;
         }
 
-        if key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Char('y' | 'Y'))
-        {
-            return self.copy_latest_code_block();
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('Y') => {
+                    return match self.transcript.copy_latest_reply() {
+                        Ok((text, msg)) => {
+                            self.flash(msg);
+                            Action::CopyCode(text)
+                        }
+                        Err(e) => {
+                            self.flash(e);
+                            Action::None
+                        }
+                    };
+                }
+                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    return match self.transcript.copy_latest_reply() {
+                        Ok((text, msg)) => {
+                            self.flash(msg);
+                            Action::CopyCode(text)
+                        }
+                        Err(e) => {
+                            self.flash(e);
+                            Action::None
+                        }
+                    };
+                }
+                KeyCode::Char('y') => {
+                    return match self.transcript.copy_latest_code_block() {
+                        Ok((text, msg)) => {
+                            self.flash(msg);
+                            Action::CopyCode(text)
+                        }
+                        Err(e) => {
+                            self.flash(e);
+                            Action::None
+                        }
+                    };
+                }
+                KeyCode::Char('m' | 'M') => return Action::ToggleMouse,
+                _ => {}
+            }
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    if self.search_open {
-                        self.search_open = false;
+                    if self.resume_picker.is_some() {
+                        self.resume_picker = None;
+                        return Action::None;
+                    }
+                    if self.transcript.search_is_open() {
+                        self.transcript.search_close();
                         return Action::None;
                     }
                     if self.running {
@@ -569,8 +653,8 @@ impl App {
                 }
                 KeyCode::Char('d') if self.composer.is_empty() => return Action::Quit,
                 KeyCode::Char('o') => {
-                    self.expand_tools = !self.expand_tools;
-                    self.flash(if self.expand_tools {
+                    let expanded = self.transcript.toggle_expand();
+                    self.flash(if expanded {
                         "Tool outputs: expanded"
                     } else {
                         "Tool outputs: compact"
@@ -578,18 +662,12 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('f') => {
-                    self.search_open = !self.search_open;
-                    self.search_match_idx = 0;
-                    if !self.search_open {
-                        self.search_query.clear();
-                        self.search_matches.clear();
-                    }
+                    self.transcript.search_toggle();
                     return Action::None;
                 }
                 KeyCode::Char('g') => return Action::OpenEditor,
                 KeyCode::Char('l') => {
-                    self.cells.clear();
-                    self.scroll.reset();
+                    self.transcript.clear();
                     return Action::None;
                 }
                 KeyCode::Char('a') => {
@@ -616,38 +694,29 @@ impl App {
             }
         }
 
-        if self.search_open {
+        if let Some((sessions, sel)) = self.resume_picker.as_mut() {
             match key.code {
-                KeyCode::Esc => {
-                    self.search_open = false;
-                    self.search_query.clear();
-                    self.search_matches.clear();
+                KeyCode::Esc | KeyCode::Char('q') => self.resume_picker = None,
+                KeyCode::Up | KeyCode::Char('k') if !sessions.is_empty() => {
+                    *sel = sel.saturating_sub(1);
                 }
-                KeyCode::Backspace => {
-                    self.search_query.pop();
-                    self.search_match_idx = 0;
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    if !self.search_matches.is_empty() {
-                        self.search_match_idx = (self.search_match_idx + self.search_matches.len()
-                            - 1)
-                            % self.search_matches.len();
-                        self.jump_to_search_match();
-                    }
+                KeyCode::Down | KeyCode::Char('j') if !sessions.is_empty() => {
+                    *sel = (*sel + 1).min(sessions.len() - 1);
                 }
                 KeyCode::Enter => {
-                    if !self.search_matches.is_empty() {
-                        self.search_match_idx =
-                            (self.search_match_idx + 1) % self.search_matches.len();
-                        self.jump_to_search_match();
+                    if let Some(chosen) = sessions.get(*sel).cloned() {
+                        self.resume_picker = None;
+                        return Action::SwitchSession(chosen.sid);
                     }
-                }
-                KeyCode::Char(c) => {
-                    self.search_query.push(c);
-                    self.search_match_idx = 0;
+                    self.resume_picker = None;
                 }
                 _ => {}
             }
+            return Action::None;
+        }
+
+        if self.transcript.search_is_open() {
+            self.transcript.search_handle_key(key);
             return Action::None;
         }
 
@@ -699,17 +768,17 @@ impl App {
 
         match key.code {
             KeyCode::PageUp => {
-                self.scroll.scroll_by(-12);
+                self.transcript.scroll_by(-12);
                 return Action::None;
             }
             KeyCode::PageDown => {
-                self.scroll.scroll_by(12);
+                self.transcript.scroll_by(12);
                 return Action::None;
             }
             KeyCode::End
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
-                self.scroll.follow_tail();
+                self.transcript.follow_tail();
                 return Action::None;
             }
             KeyCode::Esc => {
@@ -750,6 +819,13 @@ impl App {
                     self.composer.accept_popup();
                     return Action::None;
                 }
+                KeyCode::Enter if key.modifiers.is_empty() => {
+                    match self.composer.accept_popup_on_enter() {
+                        PopupAccept::Execute(cmd) => return self.dispatch_input(&cmd),
+                        PopupAccept::Filled => return Action::None,
+                        PopupAccept::None => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -762,7 +838,10 @@ impl App {
                 self.composer.insert_char('\n');
                 Action::None
             }
-            KeyCode::Enter => self.submit_composer(),
+            KeyCode::Enter => {
+                let raw = self.composer.take_submitted();
+                self.dispatch_input(&raw)
+            }
             KeyCode::Tab => {
                 self.composer.accept_popup();
                 Action::None
@@ -792,11 +871,11 @@ impl App {
                 Action::None
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll.scroll_by(-3);
+                self.transcript.scroll_by(-3);
                 Action::None
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll.scroll_by(3);
+                self.transcript.scroll_by(3);
                 Action::None
             }
             KeyCode::Up => {
@@ -817,59 +896,179 @@ impl App {
 
     fn handle_mouse(&mut self, kind: MouseEventKind) {
         match kind {
-            MouseEventKind::ScrollUp => self.scroll.scroll_by(-4),
-            MouseEventKind::ScrollDown => self.scroll.scroll_by(4),
+            MouseEventKind::ScrollUp => self.transcript.scroll_by(-4),
+            MouseEventKind::ScrollDown => self.transcript.scroll_by(4),
             _ => {}
         }
     }
 
-    fn submit_composer(&mut self) -> Action {
-        let raw = self.composer.take_submitted();
+    fn dispatch_input(&mut self, raw: &str) -> Action {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Action::None;
         }
         self.set_footer_mode(FooterMode::Contextual);
-        if trimmed == "/quit" || trimmed == "/exit" {
-            return Action::Quit;
-        }
-        if trimmed == "/cancel" {
-            return Action::Cancel;
-        }
-        if trimmed == "/clear" {
-            self.cells.clear();
-            self.scroll.reset();
+
+        if let Some(cmd) = trimmed.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                return Action::RunLocalShell(cmd.to_owned());
+            }
             return Action::None;
         }
-        if trimmed == "/expand" {
-            self.expand_tools = !self.expand_tools;
+
+        match trimmed {
+            "/quit" | "/exit" => return Action::Quit,
+            "/new" => return Action::NewSession,
+            "/cancel" => return Action::Cancel,
+            "/clear" => {
+                self.transcript.clear();
+                return Action::None;
+            }
+            "/expand" => {
+                self.transcript.toggle_expand();
+                return Action::None;
+            }
+            "/copy" => {
+                return match self.transcript.copy_latest_code_block() {
+                    Ok((text, msg)) => {
+                        self.flash(msg);
+                        Action::CopyCode(text)
+                    }
+                    Err(e) => {
+                        self.flash(e);
+                        Action::None
+                    }
+                };
+            }
+            "/editor" => return Action::OpenEditor,
+            "/mouse" => return Action::ToggleMouse,
+            "/diff" => return Action::RunDiff,
+            "/review" => return Action::RunReview,
+            "/compact" => return Action::CompactNow,
+            "/help" => {
+                self.set_footer_mode(FooterMode::ShortcutOverlay);
+                return Action::None;
+            }
+            "/resume" => {
+                let sessions = list_sessions();
+                if sessions.is_empty() {
+                    self.transcript
+                        .push_notice(NoticeKind::Info, "no saved sessions found");
+                } else {
+                    self.resume_picker = Some((sessions, 0));
+                }
+                return Action::None;
+            }
+            "/status" => {
+                let ctx_pct = self
+                    .context_pct()
+                    .map(|p| format!("{p}%"))
+                    .unwrap_or_else(|| "—".into());
+                let total_tok = self.input_tokens + self.output_tokens;
+                let cache_pct = (self.cached_tokens * 100)
+                    .checked_div(self.input_tokens)
+                    .map(|p| format!(" · cache {p}%"))
+                    .unwrap_or_default();
+                let title = self
+                    .title
+                    .as_deref()
+                    .map(|t| format!(" · title:{t}"))
+                    .unwrap_or_default();
+                self.transcript.push_notice(
+                    NoticeKind::Info,
+                    format!(
+                        "sid:{} · model:{} · turns:{} · ctx:{ctx_pct} ({}/{}B) · {}{cache_pct}{title}",
+                        if self.sid.is_empty() { "—" } else { &self.sid },
+                        self.model,
+                        self.turns_used,
+                        self.context_bytes,
+                        self.context_max,
+                        fmt_tokens_compact(total_tok)
+                    ),
+                );
+                return Action::None;
+            }
+            "/skills" | "/playbooks" => {
+                let books = if self.playbooks_meta.is_empty() {
+                    "bug-fix, feature, port".to_owned()
+                } else {
+                    self.playbooks_meta.join(", ")
+                };
+                let skills = if self.skills_meta.trim().is_empty() {
+                    "none in .twig/skills".to_owned()
+                } else {
+                    self.skills_meta.clone()
+                };
+                self.transcript.push_notice(
+                    NoticeKind::Playbook,
+                    format!("playbooks: {books} · project skills: {skills}"),
+                );
+                return Action::None;
+            }
+            "/config" => match HarnessConfig::resolve() {
+                Ok((cfg, src)) => self.transcript.push_notice(
+                    NoticeKind::Info,
+                    format!(
+                        "config:{src} · max_turns:{} · stall_turns:{} · context_max:{}KB · timeout:{}s · isolation:{}",
+                        cfg.max_turns,
+                        cfg.stall_turns,
+                        cfg.context_max_bytes / 1024,
+                        cfg.bash_timeout_secs,
+                        cfg.isolation
+                    ),
+                ),
+                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+            },
+            "/model" => {
+                self.transcript.push_notice(
+                    NoticeKind::Info,
+                    format!(
+                        "active model: {} (use `/model <name>` or `/model reset`)",
+                        self.model
+                    ),
+                );
+                return Action::None;
+            }
+            "/find" => {
+                self.transcript.search_open_with("");
+                return Action::None;
+            }
+            _ => {}
+        }
+        if trimmed == "/config" {
             return Action::None;
         }
-        if trimmed == "/copy" {
-            return self.copy_latest_code_block();
+
+        if let Some(sid) = trimmed.strip_prefix("/resume ") {
+            let sid = sid.trim();
+            if !sid.is_empty() {
+                return Action::SwitchSession(sid.to_owned());
+            }
+            return Action::None;
         }
-        if trimmed == "/editor" {
-            return Action::OpenEditor;
+        if let Some(title) = trimmed.strip_prefix("/rename ") {
+            let title = title.trim();
+            if !title.is_empty() {
+                return Action::RenameSession(title.to_owned());
+            }
+            return Action::None;
         }
-        if trimmed == "/find" {
-            self.search_open = true;
+        if let Some(model) = trimmed.strip_prefix("/model ") {
+            let model = model.trim();
+            if !model.is_empty() {
+                return Action::SetModel(model.to_owned());
+            }
             return Action::None;
         }
         if let Some(q) = trimmed.strip_prefix("/find ") {
-            self.search_open = true;
-            self.search_query = q.trim().to_owned();
-            self.search_match_idx = 0;
-            return Action::None;
-        }
-        if trimmed == "/help" {
-            self.set_footer_mode(FooterMode::ShortcutOverlay);
+            self.transcript.search_open_with(q.trim());
             return Action::None;
         }
         if let Some(rest) = trimmed.strip_prefix("/steer ") {
             let text = rest.trim().to_owned();
             if !text.is_empty() {
-                self.cells.push(Cell::Steering(text.clone()));
-                self.scroll.follow_tail();
+                self.transcript.push_steering(text.clone());
                 return Action::SendSteer(text);
             }
             return Action::None;
@@ -891,237 +1090,20 @@ impl App {
 
         if self.running {
             let text = trimmed.to_owned();
-            self.cells.push(Cell::Steering(text.clone()));
-            self.scroll.follow_tail();
+            self.transcript.push_steering(text.clone());
             return Action::SendSteer(text);
         }
 
         let text = trimmed.to_owned();
-        self.cells.push(Cell::User(text.clone()));
+        self.transcript.push_user(text.clone());
         self.running = true;
         self.run_started = Some(Instant::now());
         self.update_status_header(String::from("Thinking"));
-        self.scroll.follow_tail();
         Action::SendTurn(text)
     }
 
-    fn build_transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
-        if self.cells.is_empty() {
-            return render_welcome_card(
-                &self.model,
-                &self.repo_label,
-                self.git_branch.as_deref(),
-                &self.repo_path,
-                width,
-            );
-        }
-        let mut lines = Vec::new();
-        // Consistent 2-col left + 2-col right page gutter for comfortable reading rhythm.
-        let inner = width.saturating_sub(4).max(16);
-        let last_idx = self.cells.len().saturating_sub(1);
-        let live_streaming = self.running
-            && self
-                .last_delta_at
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(600));
-
-        for (cell_idx, cell) in self.cells.iter().enumerate() {
-            let prev_is_tool = cell_idx > 0 && matches!(self.cells[cell_idx - 1], Cell::Tool(_));
-            match cell {
-                Cell::User(text) => {
-                    lines.push(Line::from(""));
-                    let content_w = inner.saturating_sub(4);
-                    for (idx, wrapped) in wrap_plain(text, content_w).into_iter().enumerate() {
-                        let prefix = if idx == 0 { " ❯ " } else { "   " };
-                        let pad = inner
-                            .saturating_sub(display_width(prefix) + display_width(&wrapped));
-                        lines.push(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled(
-                                prefix,
-                                Style::default()
-                                    .fg(ACCENT)
-                                    .bg(SURFACE)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(wrapped, Style::default().fg(IVORY).bg(SURFACE)),
-                            Span::styled(" ".repeat(pad), Style::default().bg(SURFACE)),
-                        ]));
-                    }
-                    lines.push(Line::from(""));
-                }
-                Cell::Steering(text) => {
-                    for (idx, wrapped) in wrap_plain(text, inner.saturating_sub(11))
-                        .into_iter()
-                        .enumerate()
-                    {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                if idx == 0 {
-                                    "  ↳ steer  "
-                                } else {
-                                    "           "
-                                },
-                                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(wrapped, Style::default().fg(AMBER)),
-                        ]));
-                    }
-                    lines.push(Line::from(""));
-                }
-                Cell::Assistant(text) => {
-                    if prev_is_tool {
-                        lines.push(Line::from(""));
-                    }
-                    let mut md_lines = render_markdown(text, inner.saturating_sub(3));
-                    if cell_idx == last_idx && live_streaming {
-                        let caret = streaming_caret(
-                            self.run_started.map(|t| t.elapsed()).unwrap_or_default(),
-                            self.motion,
-                        );
-                        if let Some(last) = md_lines.last_mut() {
-                            last.spans.push(caret);
-                        }
-                    }
-                    for (idx, line) in md_lines.into_iter().enumerate() {
-                        let mut spans = vec![if idx == 0 {
-                            Span::styled("  ⏺ ", Style::default().fg(IVORY))
-                        } else {
-                            Span::raw("    ")
-                        }];
-                        spans.extend(line.spans);
-                        lines.push(Line::from(spans));
-                    }
-                    lines.push(Line::from(""));
-                }
-                Cell::Tool(tool) => {
-                    let elapsed_dur = tool.elapsed.unwrap_or_else(|| tool.started_at.elapsed());
-                    let icon_span = if !tool.finished {
-                        breathing_star(elapsed_dur, self.motion, true)
-                    } else if tool.exit_code.is_none() || tool.exit_code == Some(0) {
-                        Span::styled("⏺", Style::default().fg(SAGE))
-                    } else {
-                        Span::styled("⏺", Style::default().fg(ROSE))
-                    };
-
-                    let mut header = vec![
-                        Span::raw("  "),
-                        icon_span,
-                        Span::raw(" "),
-                        Span::styled(
-                            format!("{} ", tool_glyph(&tool.name)),
-                            Style::default().fg(MUTED),
-                        ),
-                        Span::styled(
-                            title_tool_name(&tool.name),
-                            Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
-                        ),
-                    ];
-                    if !tool.summary.is_empty() {
-                        header.push(Span::styled("(", Style::default().fg(MUTED)));
-                        header.push(Span::styled(
-                            tool.summary.clone(),
-                            Style::default().fg(STONE),
-                        ));
-                        header.push(Span::styled(")", Style::default().fg(MUTED)));
-                    }
-                    if tool.tier != "auto" {
-                        header.push(Span::styled(
-                            format!(" · {}", tool.tier),
-                            Style::default().fg(AMBER),
-                        ));
-                    }
-                    let mut meta = format!("  {}", fmt_elapsed_compact(elapsed_dur.as_secs()));
-                    if let Some(code) = tool.exit_code.filter(|&c| c != 0) {
-                        meta.push_str(&format!(" · exit {code}"));
-                    }
-                    header.push(Span::styled(meta, Style::default().fg(MUTED)));
-                    lines.push(Line::from(header));
-
-                    // Claude-style `    ⎿  ` hanging child output aligned under tool label.
-                    let out_lines: Vec<&str> = tool.output.lines().collect();
-                    if !out_lines.is_empty() {
-                        let show_lines = if self.expand_tools {
-                            200
-                        } else if !tool.finished {
-                            5
-                        } else if tool.exit_code.is_some_and(|c| c != 0) {
-                            6
-                        } else {
-                            1
-                        };
-                        let total = out_lines.len();
-                        let skip = total.saturating_sub(show_lines);
-                        let is_compact_summary =
-                            !self.expand_tools && tool.finished && tool.exit_code.unwrap_or(0) == 0;
-
-                        if is_compact_summary {
-                            let first_preview = out_lines
-                                .iter()
-                                .find(|l| !l.trim().is_empty())
-                                .copied()
-                                .unwrap_or("");
-                            let clipped = clip_str(first_preview.trim(), inner.saturating_sub(34));
-                            let mut spans = vec![
-                                Span::styled("    ⎿  ", Style::default().fg(MUTED)),
-                                Span::styled(clipped, style_output_line(first_preview)),
-                            ];
-                            if total > 1 {
-                                spans.push(Span::styled(
-                                    format!("  … +{total} lines (^O expand)"),
-                                    Style::default().fg(MUTED),
-                                ));
-                            }
-                            lines.push(Line::from(spans));
-                        } else {
-                            let mut first_row = true;
-                            let mut gutter = DiffGutterState::default();
-                            if skip > 0 {
-                                lines.push(Line::from(vec![
-                                    Span::styled("    ⎿  ", Style::default().fg(MUTED)),
-                                    Span::styled(
-                                        format!("… ({skip} earlier lines hidden · ^O to expand)"),
-                                        Style::default().fg(MUTED),
-                                    ),
-                                ]));
-                                first_row = false;
-                            }
-                            for raw in &out_lines[skip..] {
-                                for row_spans in gutter.render_line(raw, inner.saturating_sub(8)) {
-                                    let branch = if first_row { "    ⎿  " } else { "       " };
-                                    first_row = false;
-                                    let mut spans =
-                                        vec![Span::styled(branch, Style::default().fg(MUTED))];
-                                    spans.extend(row_spans);
-                                    lines.push(Line::from(spans));
-                                }
-                            }
-                        }
-                    }
-                }
-                Cell::Notice { kind, text } => {
-                    let (prefix, color) = match kind {
-                        NoticeKind::Playbook => ("  ✦ ", ACCENT),
-                        NoticeKind::Info => ("  ◈ ", MUTED),
-                        NoticeKind::Warn => ("  ▲ ", AMBER),
-                        NoticeKind::Error => ("  ✕ ", ROSE),
-                        NoticeKind::Success => ("  ✓ ", SAGE),
-                    };
-                    for (idx, wrapped) in wrap_plain(text, inner.saturating_sub(4))
-                        .into_iter()
-                        .enumerate()
-                    {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                if idx == 0 { prefix } else { "    " },
-                                Style::default().fg(color),
-                            ),
-                            Span::styled(wrapped, Style::default().fg(color)),
-                        ]));
-                    }
-                }
-            }
-        }
-        lines
+    fn context_pct(&self) -> Option<usize> {
+        (self.context_max > 0).then(|| ((self.context_bytes * 100) / self.context_max).min(100))
     }
 
     fn footer_height(&self) -> u16 {
@@ -1147,9 +1129,22 @@ impl App {
 
         let area = frame.area();
         let has_approval = !self.approvals.is_empty();
-        let activity_h: u16 = if self.running && !has_approval { 1 } else { 0 };
-        let search_h: u16 = if self.search_open { 1 } else { 0 };
-        let bottom_panel_h: u16 = if has_approval {
+        let has_resume = self.resume_picker.is_some();
+        let search_open = self.transcript.search_is_open();
+        let activity_h: u16 = if self.running && !has_approval && !has_resume {
+            1
+        } else {
+            0
+        };
+        let search_h: u16 = if search_open { 1 } else { 0 };
+        let bottom_panel_h: u16 = if has_resume {
+            let count = self
+                .resume_picker
+                .as_ref()
+                .map(|(v, _)| v.len().clamp(1, 8) as u16)
+                .unwrap_or(1);
+            count + 3
+        } else if has_approval {
             7
         } else {
             self.composer.desired_height(area.width as usize)
@@ -1167,68 +1162,24 @@ impl App {
             ])
             .split(area);
 
-        // 1. Borderless transcript viewport with smooth eased scroll
-        let transcript_area = chunks[0];
-        let mut lines = self.build_transcript_lines(transcript_area.width as usize);
-
-        if self.search_open && !self.search_query.is_empty() {
-            let needle = self.search_query.to_lowercase();
-            self.search_matches = lines
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, line)| {
-                    line.to_string()
-                        .to_lowercase()
-                        .contains(&needle)
-                        .then_some(idx)
-                })
-                .collect();
-            if !self.search_matches.is_empty() {
-                self.search_match_idx = self.search_match_idx.min(self.search_matches.len() - 1);
-                let active_line = self.search_matches[self.search_match_idx];
-                lines = lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, l)| highlight_search(l, &self.search_query, i == active_line))
-                    .collect();
-            }
-        } else {
-            self.search_matches.clear();
-        }
-
-        let max_scroll = lines.len().saturating_sub(transcript_area.height as usize) as u16;
-        self.scroll.sync_bounds(max_scroll, self.motion);
-        self.scroll.step(dt, self.motion);
-
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.scroll.current_u16(), 0)),
-            transcript_area,
+        let run_elapsed = self.run_started.map(|t| t.elapsed()).unwrap_or_default();
+        let live_streaming = self.running
+            && self
+                .last_delta_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(600));
+        self.transcript.render(
+            frame,
+            chunks[0],
+            RenderOpts {
+                repo_path: &self.repo_path,
+                live_streaming,
+                run_elapsed,
+                dt,
+                motion: self.motion,
+            },
         );
 
-        if self.scroll.show_tail_badge() && transcript_area.width > 24 {
-            let badge = " ↓ live tail (End) ";
-            let badge_w = display_width(badge) as u16;
-            let badge_area = Rect {
-                x: transcript_area.x + transcript_area.width.saturating_sub(badge_w + 2),
-                y: transcript_area.y + transcript_area.height.saturating_sub(1),
-                width: badge_w,
-                height: 1,
-            };
-            frame.render_widget(Clear, badge_area);
-            frame.render_widget(
-                Paragraph::new(badge).style(
-                    Style::default()
-                        .fg(Color::Rgb(24, 20, 18))
-                        .bg(ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                badge_area,
-            );
-        }
-
-        // 2. Breathing Claude star + Codex cadenced column-width shimmer row
         if activity_h > 0 {
-            let run_elapsed = self.run_started.map(|t| t.elapsed()).unwrap_or_default();
             let pretty_elapsed = fmt_elapsed_compact(run_elapsed.as_secs());
             let mut spans = vec![
                 Span::raw("  "),
@@ -1247,42 +1198,16 @@ impl App {
             frame.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
         }
 
-        // 3. Inline transcript search bar (`Ctrl+F`)
-        if self.search_open {
-            let count_str = if self.search_query.is_empty() {
-                "type to search".to_owned()
-            } else if self.search_matches.is_empty() {
-                "0 matches".to_owned()
-            } else {
-                format!("{}/{}", self.search_match_idx + 1, self.search_matches.len())
-            };
-            let bar = Line::from(vec![
-                Span::styled(
-                    "  Find: ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(self.search_query.clone(), Style::default().fg(IVORY)),
-                Span::styled(
-                    format!("  [{count_str} · Enter next · Shift+Enter prev · Esc close]"),
-                    Style::default().fg(MUTED),
-                ),
-            ]);
-            frame.render_widget(
-                Paragraph::new(bar).style(Style::default().bg(SURFACE)),
-                chunks[2],
-            );
-            let cur_x = chunks[2].x + 8 + display_width(&self.search_query) as u16;
-            if cur_x < chunks[2].x + chunks[2].width {
-                frame.set_cursor_position((cur_x, chunks[2].y));
-            }
+        if search_open {
+            self.transcript.render_search_bar(frame, chunks[2]);
         }
 
-        // 4. Bottom pane: rounded approval card OR hairline borderless composer
-        if let Some(pending) = self.approvals.front() {
+        if let Some((sessions, sel)) = &self.resume_picker {
+            render_resume_picker(frame, chunks[3], sessions, *sel);
+        } else if let Some(pending) = self.approvals.front() {
             self.render_approval_panel(frame, chunks[3], pending);
         } else {
             let (rule_color, prompt_color, placeholder) = if self.running {
-                let run_elapsed = self.run_started.map(|t| t.elapsed()).unwrap_or_default();
                 (
                     active_rule_color(run_elapsed, self.motion),
                     AMBER,
@@ -1294,7 +1219,7 @@ impl App {
                 (
                     HAIRLINE,
                     ACCENT,
-                    "Ask twig to edit, debug, or inspect… (@ file · / command)",
+                    "Ask twig anything… (/ command · @ file · ! shell)",
                 )
             };
             self.composer.render(
@@ -1303,15 +1228,14 @@ impl App {
                 rule_color,
                 prompt_color,
                 placeholder,
-                !self.search_open,
+                !search_open,
             );
-            if !self.search_open {
+            if !search_open {
                 self.composer
-                    .render_popup(frame, chunks[3], transcript_area.height);
+                    .render_popup(frame, chunks[3], chunks[0].height);
             }
         }
 
-        // 5. Codex `FooterMode` bottom bar / `?` 2-column shortcut overlay
         self.render_footer(frame, chunks[4]);
     }
 
@@ -1437,6 +1361,40 @@ impl App {
                 format!(" · {}", self.model),
                 Style::default().fg(ACCENT_PEAK),
             ));
+            if let Some(title) = &self.title {
+                spans.push(Span::styled(
+                    format!(" · {}", clip_str(title, 20)),
+                    Style::default().fg(IVORY),
+                ));
+            }
+            if let Some(pct) = self.context_pct() {
+                let color = if pct >= 85 {
+                    ROSE
+                } else if pct >= 65 {
+                    AMBER
+                } else {
+                    MUTED
+                };
+                spans.push(Span::styled(
+                    format!(" · ctx {pct}%"),
+                    Style::default().fg(color),
+                ));
+            }
+            let total_tok = self.input_tokens + self.output_tokens;
+            if total_tok > 0 {
+                spans.push(Span::styled(
+                    format!(" · {}", fmt_tokens_compact(total_tok)),
+                    Style::default().fg(MUTED),
+                ));
+                if self.cached_tokens > 0 {
+                    if let Some(hit) = (self.cached_tokens * 100).checked_div(self.input_tokens) {
+                        spans.push(Span::styled(
+                            format!(" · cache {hit}%"),
+                            Style::default().fg(SAGE),
+                        ));
+                    }
+                }
+            }
             if let Some(book) = &self.playbook {
                 spans.push(Span::styled(
                     format!(" · ✦ {book}"),
@@ -1449,31 +1407,30 @@ impl App {
                     Style::default().fg(ROSE),
                 ));
             }
-            if !self.sid.is_empty() {
+            if !self.mouse_enabled {
+                spans.push(Span::styled(" · select", Style::default().fg(AMBER)));
+            }
+            if !self.sid.is_empty() && self.title.is_none() {
                 let short: String = self.sid.chars().take(10).collect();
                 spans.push(Span::styled(
                     format!(" · {short}"),
                     Style::default().fg(MUTED),
                 ));
             }
-            if self.turns_used > 0 {
-                spans.push(Span::styled(
-                    format!(" · t{}", self.turns_used),
-                    Style::default().fg(MUTED),
-                ));
-            }
             Line::from(spans)
         };
 
-        let right_hint = if !self.approvals.is_empty() {
+        let right_hint = if self.resume_picker.is_some() {
+            "↑/↓ select · Enter open · Esc close  "
+        } else if !self.approvals.is_empty() {
             "↑/↓ select · Enter confirm · Esc deny  "
-        } else if self.search_open {
+        } else if self.transcript.search_is_open() {
             "Enter next · Esc close  "
         } else if !self.composer.is_empty() && self.running {
             "Enter steer · Shift+Enter newline  "
         } else if !self.composer.is_empty() {
             "Enter send · Shift+Enter newline · ^G edit  "
-        } else if self.expand_tools {
+        } else if self.transcript.is_expanded() {
             "tools:expanded · ^O compact · ? shortcuts  "
         } else {
             "? shortcuts · ^O tools · ^F find  "
@@ -1490,23 +1447,43 @@ impl App {
         );
     }
 
+    fn connect_session(
+        &mut self,
+        repo: &str,
+        resume: Option<&str>,
+    ) -> Result<ServeClient, String> {
+        let mut client = ServeClient::spawn(repo, resume)?;
+        let _ = client.send("ping", json!({}));
+        let _ = client.send("approval.list", json!({}));
+        if let Ok(req_id) = client.send("session.history", json!({})) {
+            self.history_req = Some(req_id);
+        }
+        Ok(client)
+    }
+
     fn run_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         client: &mut ServeClient,
+        local_tx: &Sender<LocalMsg>,
+        local_rx: &Receiver<LocalMsg>,
     ) -> Result<bool, String> {
         loop {
             while let Some(msg) = client.try_recv() {
                 self.apply_server_msg(msg);
             }
+            while let Ok(msg) = local_rx.try_recv() {
+                self.apply_local_msg(msg);
+            }
+            if let Some((title, body)) = self.pending_notify.take() {
+                notify_osc99(&title, &body);
+            }
 
-            // DEC Mode 2026 synchronized update renders each frame atomically with zero tearing.
             let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
             let draw_res = terminal.draw(|f| self.draw(f)).map(|_| ());
             let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
             draw_res.map_err(|e| format!("draw tui: {e}"))?;
 
-            // Wait up to adaptive frame budget, then batch-drain all queued events into one frame.
             if event::poll(self.next_poll_interval()).map_err(|e| e.to_string())? {
                 loop {
                     match event::read().map_err(|e| e.to_string())? {
@@ -1518,13 +1495,13 @@ impl App {
                                     Ok(id) => self.active_turn_req = Some(id),
                                     Err(e) => {
                                         self.running = false;
-                                        self.push_notice(NoticeKind::Error, e);
+                                        self.transcript.push_notice(NoticeKind::Error, e);
                                     }
                                 }
                             }
                             Action::SendSteer(text) => {
                                 if let Err(e) = client.send("steer", json!({"input": text})) {
-                                    self.push_notice(NoticeKind::Error, e);
+                                    self.transcript.push_notice(NoticeKind::Error, e);
                                 }
                             }
                             Action::Cancel => {
@@ -1535,14 +1512,125 @@ impl App {
                                     "approval.resolve",
                                     json!({"id": id, "allow": allow}),
                                 ) {
-                                    self.push_notice(NoticeKind::Error, e);
+                                    self.transcript.push_notice(NoticeKind::Error, e);
                                 }
+                            }
+                            Action::NewSession => {
+                                let cancel = self.running;
+                                self.reset_session_view();
+                                let repo = self.repo_raw.clone();
+                                match self.connect_session(&repo, None) {
+                                    Ok(new_client) => {
+                                        let old = std::mem::replace(client, new_client);
+                                        old.shutdown(cancel);
+                                        self.flash("Started new session");
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::SwitchSession(sid) => {
+                                let cancel = self.running;
+                                self.reset_session_view();
+                                let repo = self.repo_raw.clone();
+                                match self.connect_session(&repo, Some(&sid)) {
+                                    Ok(new_client) => {
+                                        let old = std::mem::replace(client, new_client);
+                                        old.shutdown(cancel);
+                                        self.flash(format!("Resumed session {sid}"));
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::RenameSession(title) => {
+                                match client.send("session.rename", json!({"title": title})) {
+                                    Ok(_) => {
+                                        self.title = Some(title.clone());
+                                        self.flash(format!("Renamed session → {title}"));
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::SetModel(model) => {
+                                match client.send("model.set", json!({"model": model})) {
+                                    Ok(_) => self.flash(format!("Switching model → {model}")),
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::CompactNow => {
+                                match client.send("session.compact", json!({})) {
+                                    Ok(_) => self.flash("Compacting context…"),
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::RunLocalShell(cmd) => {
+                                let id = format!("local-{}", self.next_local_id);
+                                self.next_local_id += 1;
+                                self.transcript.push_tool_started(
+                                    id.clone(),
+                                    "bash".into(),
+                                    format!("! {cmd}"),
+                                    "local".into(),
+                                );
+                                let tx = local_tx.clone();
+                                let repo = self.repo_raw.clone();
+                                std::thread::spawn(move || {
+                                    let (output, exit_code, elapsed) = run_local_shell(&repo, &cmd);
+                                    let _ = tx.send(LocalMsg::ShellDone {
+                                        id,
+                                        output,
+                                        exit_code,
+                                        elapsed,
+                                    });
+                                });
+                            }
+                            Action::RunDiff => match run_git_diff(&self.repo_raw) {
+                                Ok(diff) if diff.trim().is_empty() => {
+                                    self.transcript.push_notice(
+                                        NoticeKind::Info,
+                                        "working tree clean — no diff",
+                                    );
+                                }
+                                Ok(diff) => {
+                                    let id = format!("diff-{}", self.next_local_id);
+                                    self.next_local_id += 1;
+                                    self.transcript.push_tool_snapshot(
+                                        id,
+                                        "diff".into(),
+                                        "git diff".into(),
+                                        "local".into(),
+                                        diff,
+                                        Some(0),
+                                    );
+                                }
+                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                            },
+                            Action::RunReview => {
+                                self.transcript.push_notice(
+                                    NoticeKind::Playbook,
+                                    "starting independent read-only review on current git diff…",
+                                );
+                                self.transcript.follow_tail();
+                                let tx = local_tx.clone();
+                                let repo = self.repo_raw.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx
+                                        .send(LocalMsg::ReviewDone(run_independent_review(&repo)));
+                                });
+                            }
+                            Action::ToggleMouse => {
+                                self.mouse_enabled = !self.mouse_enabled;
+                                TerminalGuard::set_mouse(self.mouse_enabled);
+                                self.flash(if self.mouse_enabled {
+                                    "Mouse scroll: on"
+                                } else {
+                                    "Mouse capture off — drag to select text freely (Alt+M to restore)"
+                                });
                             }
                             Action::OpenEditor => {
                                 let draft = self.composer.draft_expanded();
                                 TerminalGuard::suspend();
                                 let edited = edit_in_external_editor(&draft);
-                                TerminalGuard::resume()?;
+                                TerminalGuard::resume(self.mouse_enabled)?;
                                 terminal.clear().map_err(|e| e.to_string())?;
                                 match edited {
                                     Ok(text) => {
@@ -1568,47 +1656,26 @@ impl App {
     }
 }
 
-fn title_tool_name(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => "Tool".into(),
-    }
-}
-
-fn clip_str(s: &str, max_chars: usize) -> String {
-    let limit = max_chars.max(8);
-    let clipped: String = s.chars().take(limit).collect();
-    if s.chars().count() > limit {
-        format!("{clipped}…")
+fn fmt_tokens_compact(n: u64) -> String {
+    if n < 1_000 {
+        format!("{n} tok")
+    } else if n < 1_000_000 {
+        format!("{:.1}k tok", n as f64 / 1_000.0)
     } else {
-        clipped
+        format!("{:.2}M tok", n as f64 / 1_000_000.0)
     }
-}
-
-fn summarize_tool_args(name: &str, args: &Value) -> String {
-    let raw = match name {
-        "bash" => args["command"].as_str().unwrap_or(""),
-        "read" => args["path"].as_str().unwrap_or(""),
-        "skill" => args["name"].as_str().unwrap_or("list"),
-        "subagent" => args["task"].as_str().unwrap_or(""),
-        "papercut" => args["component"].as_str().unwrap_or(""),
-        _ => "",
-    };
-    clip_str(&raw.replace('\n', " "), 92)
 }
 
 fn run_tui(repo: &str, resume: Option<&str>) -> Result<(), String> {
-    let mut client = ServeClient::spawn(repo, resume)?;
-    let _ = client.send("ping", json!({}));
-    let _ = client.send("approval.list", json!({}));
+    let mut app = App::new(repo);
+    let mut client = app.connect_session(repo, resume)?;
+    let (local_tx, local_rx) = mpsc::channel();
 
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(|e| format!("init terminal: {e}"))?;
-    let mut app = App::new(repo);
 
-    let cancel_on_exit = app.run_loop(&mut terminal, &mut client)?;
+    let cancel_on_exit = app.run_loop(&mut terminal, &mut client, &local_tx, &local_rx)?;
 
     drop(terminal);
     drop(_guard);
@@ -1646,6 +1713,60 @@ mod tests {
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
             Action::SendSteer("不要改接口".into())
         );
+    }
+
+    #[test]
+    fn codex_slash_commands_bang_shell_mouse_and_history_replay_work() {
+        let mut app = App::new(".");
+        for ch in "!git status".chars() {
+            app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RunLocalShell("git status".into())
+        );
+
+        for ch in "/new".chars() {
+            app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::NewSession
+        );
+
+        assert_eq!(
+            app.handle_key(press(KeyCode::Char('m'), KeyModifiers::ALT)),
+            Action::ToggleMouse
+        );
+
+        app.history_req = Some(9);
+        app.apply_server_msg(ServerMsg::Reply {
+            id: 9,
+            result: json!({
+                "sid": "sess-123",
+                "title": "refactor tui",
+                "model": "qwen3",
+                "turns": 1,
+                "context_bytes": 4096,
+                "context_max": 10000,
+                "messages": [
+                    {"role": "user", "content": "check build"},
+                    {
+                        "role": "assistant",
+                        "content": "Running build now.",
+                        "tool_calls": [{
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": "{\"command\":\"cargo check\"}"}
+                        }]
+                    },
+                    {"role": "tool", "tool_call_id": "c1", "content": "Finished"}
+                ]
+            }),
+        });
+        assert_eq!(app.transcript.len(), 3);
+        assert_eq!(app.title.as_deref(), Some("refactor tui"));
+        assert_eq!(app.context_pct(), Some(40));
     }
 
     #[test]
@@ -1712,11 +1833,11 @@ mod tests {
     }
 
     #[test]
-    fn alt_y_cycles_assistant_code_blocks_and_ctrl_f_searches() {
+    fn alt_y_and_alt_shift_y_copy_code_and_full_reply_and_ctrl_f_searches() {
         let mut app = App::new(".");
-        app.cells.push(Cell::Assistant(
+        app.transcript.push_assistant(
             "First:\n```rust\nlet a = 1;\n```\nSecond:\n```rust\nlet b = 2;\n```".into(),
-        ));
+        );
         assert_eq!(
             app.handle_key(press(KeyCode::Char('y'), KeyModifiers::ALT)),
             Action::CopyCode("let b = 2;".into())
@@ -1724,6 +1845,15 @@ mod tests {
         assert_eq!(
             app.handle_key(press(KeyCode::Char('y'), KeyModifiers::ALT)),
             Action::CopyCode("let a = 1;".into())
+        );
+        assert_eq!(
+            app.handle_key(press(
+                KeyCode::Char('Y'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Action::CopyCode(
+                "First:\n```rust\nlet a = 1;\n```\nSecond:\n```rust\nlet b = 2;\n```".into()
+            )
         );
 
         app.handle_key(press(KeyCode::Char('f'), KeyModifiers::CONTROL));
@@ -1733,16 +1863,15 @@ mod tests {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
-        assert_eq!(app.search_matches.len(), 1);
+        assert_eq!(app.transcript.search_match_count(), 1);
     }
 
     #[test]
-    fn renders_claude_welcome_card_tools_shimmer_and_rounded_approval() {
+    fn renders_deduplicated_welcome_telemetry_tools_and_approval() {
         let mut app = App::new("/tmp/demo");
-        let backend = TestBackend::new(92, 28);
+        let backend = TestBackend::new(100, 28);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Empty state renders borderless minimal welcome header
         terminal.draw(|f| app.draw(f)).unwrap();
         let welcome: String = terminal
             .backend()
@@ -1754,12 +1883,21 @@ mod tests {
         assert!(welcome.contains("✻ twig"));
         assert!(!welcome.contains("╭─"));
 
-        // Active conversation renders ⏺ / ⎿ tool trees + shimmer status
         app.apply_server_msg(ServerMsg::Reply {
             id: 1,
-            result: json!({"pong": true, "sid": "abc123456789"}),
+            result: json!({
+                "pong": true,
+                "sid": "abc123456789",
+                "model": "demo-model",
+                "context_bytes": 3400,
+                "context_max": 10000
+            }),
         });
-        app.cells.push(Cell::User("Check diff".into()));
+        app.apply_event(&json!({
+            "ev": "model.usage",
+            "usage": {"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 800}
+        }));
+        app.transcript.push_user("Check diff".into());
         app.apply_event(&json!({"ev": "turn.started", "model": "demo-model", "turns_used": 1}));
         app.apply_event(&json!({"ev": "model.delta", "text": "Checking **git** diff."}));
         app.apply_event(&json!({
@@ -1780,10 +1918,11 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
+        assert!(active_frame.contains("ctx 34%"));
+        assert!(active_frame.contains("cache 80%"));
         assert!(active_frame.contains("⏺"));
         assert!(active_frame.contains("⎿"));
         assert!(active_frame.contains("$ Bash"));
-        assert!(active_frame.contains("esc to interrupt"));
 
         app.apply_event(&json!({
             "ev": "approval.requested",
@@ -1801,6 +1940,5 @@ mod tests {
             .collect();
         assert!(approval_frame.contains("Approve Bash?"));
         assert!(approval_frame.contains("1. Yes, allow once"));
-        assert!(approval_frame.contains("rm -rf /"));
     }
 }
