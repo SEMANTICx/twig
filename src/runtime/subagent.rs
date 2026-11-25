@@ -3,6 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,6 +66,7 @@ pub struct SubagentResult {
 pub struct SubagentPool {
     config: Arc<SubagentConfig>,
     slots: Arc<Mutex<usize>>,
+    seq: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -93,6 +95,7 @@ impl SubagentPool {
         Ok(Self {
             slots: Arc::new(Mutex::new(config.concurrency)),
             config: Arc::new(config),
+            seq: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -112,7 +115,17 @@ impl SubagentPool {
     }
 
     pub fn run(&self, role: Role, task: &str) -> io::Result<SubagentResult> {
-        self.prepare_and_run(role, "twig-agent", task, None)
+        self.prepare_and_run(role, "twig-agent", task, None, None, None)
+    }
+
+    pub fn run_with_options(
+        &self,
+        role: Role,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> io::Result<SubagentResult> {
+        self.prepare_and_run(role, "twig-agent", task, None, model, effort)
     }
 
     pub fn fresh_review(&self, diff: &str, evidence: &str) -> io::Result<SubagentResult> {
@@ -125,7 +138,7 @@ impl SubagentPool {
         let task = format!(
             "Independently review the actual proposed diff in /runs/review.diff and verification evidence below. Do not edit. Return only JSON: {{\"approved\": boolean, \"summary\": string}}. Any correctness or security defect means approved=false.\nEvidence:\n{evidence}"
         );
-        self.prepare_and_run(Role::Reviewer, "twig-review", &task, Some(diff))
+        self.prepare_and_run(Role::Reviewer, "twig-review", &task, Some(diff), None, None)
     }
 
     fn prepare_and_run(
@@ -134,6 +147,8 @@ impl SubagentPool {
         prefix: &str,
         task: &str,
         review_diff: Option<&str>,
+        model_override: Option<&str>,
+        effort_override: Option<&str>,
     ) -> io::Result<SubagentResult> {
         if task.trim().is_empty() {
             return Err(io::Error::new(
@@ -152,8 +167,9 @@ impl SubagentPool {
         }
         std::fs::create_dir_all(&self.config.runs_root)?;
         let root = self.config.runs_root.canonicalize()?;
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let name = format!(
-            "{prefix}-{}-{}",
+            "{prefix}-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -178,7 +194,8 @@ impl SubagentPool {
                 String::from_utf8_lossy(&add.stderr).into_owned(),
             ));
         }
-        let result = self.run_in_worktree(role, task, &worktree, &run_dir);
+        let result =
+            self.run_in_worktree(role, task, &worktree, &run_dir, model_override, effort_override);
         if result.is_err() {
             let _ = Command::new("git")
                 .args(["worktree", "remove", "--force"])
@@ -197,6 +214,8 @@ impl SubagentPool {
         task: &str,
         worktree: &Path,
         run_dir: &Path,
+        model_override: Option<&str>,
+        effort_override: Option<&str>,
     ) -> io::Result<SubagentResult> {
         let host_worktree = worktree.canonicalize()?;
         let host_runs = run_dir.canonicalize()?;
@@ -278,10 +297,22 @@ impl SubagentPool {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/tmp")
             .env("TWIG_SUBAGENT", "1");
-        for key in ["TWIG_MODEL", "TWIG_ROLES", "TWIG_BASE_URL", "TWIG_API_KEY"] {
+        for key in [
+            "TWIG_MODEL",
+            "TWIG_ROLES",
+            "TWIG_EFFORT",
+            "TWIG_BASE_URL",
+            "TWIG_API_KEY",
+        ] {
             if let Ok(value) = std::env::var(key) {
                 command.env(key, value);
             }
+        }
+        if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
+            command.env("TWIG_MODEL", m);
+        }
+        if let Some(e) = effort_override.map(str::trim).filter(|s| !s.is_empty()) {
+            command.env("TWIG_EFFORT", e);
         }
         let request = format!(
             "{}\n",

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use super::guidance::SkillIndex;
 use super::mcp::McpRegistry;
 use super::subagent::{Role, SubagentConfig, SubagentPool};
+use super::tasks::TaskManager;
 use crate::config::{paths, HarnessConfig};
 use crate::control::Control;
 use crate::exec::{isolation, run_live as exec_run_live, Owner};
@@ -55,6 +56,8 @@ pub struct Tools {
     mcp: Option<McpRegistry>,
     agent_pool: Option<SubagentPool>,
     agent_concurrency: usize,
+    artifacts_dir: Option<PathBuf>,
+    tasks: TaskManager,
     undo_stack: Vec<FileSnapshot>,
 }
 
@@ -67,6 +70,7 @@ impl Tools {
         let worktree: PathBuf = worktree.into();
         let skills = SkillIndex::discover_default(&worktree);
         let mcp = McpRegistry::discover(&worktree);
+        let tasks = TaskManager::new(worktree.clone(), cfg.isolation, cfg.network);
         Self {
             worktree,
             read_only_mask: 0,
@@ -83,8 +87,15 @@ impl Tools {
             mcp,
             agent_pool: None,
             agent_concurrency: cfg.subagent_concurrency,
+            artifacts_dir: None,
+            tasks,
             undo_stack: Vec::new(),
         }
+    }
+
+    pub fn with_artifacts_dir(mut self, dir: PathBuf) -> Self {
+        self.artifacts_dir = Some(dir);
+        self
     }
 
     pub fn worktree(&self) -> &Path {
@@ -122,7 +133,7 @@ impl Tools {
         }
         if let Some(mcp) = &self.mcp {
             out.push_str(&format!(
-                "\nConfigured MCP servers (use mcp tool to list or invoke tools): {}",
+                "\nConfigured MCP servers (use mcp tool for tools, prompts/skills, and resources): {}",
                 mcp.server_names_summary()
             ));
         }
@@ -222,20 +233,25 @@ impl Tools {
                     "required":["component","attempted","expected","actual","recovery"]}}}),
             json!({"type":"function","function":{"name":"skill","description":"List project/global skill metadata, or load one named skill only when needed.",
                 "parameters":{"type":"object","properties":{"name":{"type":"string"}}}}}),
-            json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in a fresh isolated Git worktree; reviewer/scout are OS read-only. Returned worktree changes are not automatically applied.",
-                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","reviewer"]},"task":{"type":"string"}},"required":["role","task"]}}}),
+            json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in a fresh isolated Git worktree; reviewer/scout are OS read-only. Multiple subagent calls in one turn run in parallel up to concurrency limit. Optional model/effort override per role.",
+                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","reviewer"]},"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
+            json!({"type":"function","function":{"name":"task","description":"Manage asynchronous background shell tasks (start a long-running build/test/server, poll status, wait for completion, cancel, or list active tasks).",
+                "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","status","wait","cancel","list"]},"command":{"type":"string"},"id":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["action"]}}}),
         ];
         if self.mcp.is_some() {
             list.push(json!({
                 "type": "function",
                 "function": {
                     "name": "mcp",
-                    "description": "List tools on a configured MCP server (omit tool) or invoke a tool on that MCP server.",
+                    "description": "Interact with a configured MCP server: call a tool, or list/load prompts (skills over MCP) and resources via action=tools|call|prompts|get_prompt|resources|read_resource.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "server": {"type": "string"},
+                            "action": {"type": "string", "enum": ["call", "tools", "prompts", "get_prompt", "resources", "read_resource"]},
                             "tool": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "uri": {"type": "string"},
                             "arguments": {"type": "object"}
                         },
                         "required": ["server"]
@@ -253,17 +269,55 @@ impl Tools {
         }
     }
 
+    pub fn list_tasks(&self) -> Value {
+        self.tasks.list()
+    }
+
+    pub fn running_tasks_count(&self) -> usize {
+        self.tasks.running_count()
+    }
+
     /// Clip at the tool boundary: head and tail survive, the middle is elided.
     pub fn clip(&self, text: &str) -> String {
+        self.clip_for_call("", text)
+    }
+
+    /// Clip oversized tool output while saving the full text to an artifact side-channel
+    /// readable via `read(path="artifact:<file>", start_line=...)`.
+    pub fn clip_for_call(&self, call_id: &str, text: &str) -> String {
         if text.len() <= self.max_output {
             return text.to_string();
         }
+        let saved_hint = if !call_id.is_empty() {
+            if let Some(dir) = &self.artifacts_dir {
+                let safe_id: String = call_id
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                    .take(48)
+                    .collect();
+                let fname = format!("tool-{safe_id}.txt");
+                if std::fs::create_dir_all(dir).is_ok()
+                    && std::fs::write(dir.join(&fname), text).is_ok()
+                {
+                    let total_lines = text.lines().count();
+                    format!(
+                        "; full output ({total_lines} lines) saved to artifact:{fname} — inspect via read(path=\"artifact:{fname}\", start_line=...)"
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
         let half = self.max_output / 2;
         let head: String = text.chars().take(half).collect();
         let tail: Vec<char> = text.chars().rev().take(half).collect();
         let tail: String = tail.into_iter().rev().collect();
         format!(
-            "{head}\n... [{} bytes clipped] ...\n{tail}",
+            "{head}\n... [{} bytes clipped{saved_hint}] ...\n{tail}",
             text.len() - self.max_output
         )
     }
@@ -377,9 +431,24 @@ impl Tools {
             "mcp" => match &mut self.mcp {
                 Some(reg) => {
                     let server = call.args["server"].as_str().unwrap_or("");
-                    let tool = call.args["tool"].as_str().unwrap_or("");
-                    let args = call.args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                    match reg.call(server, tool, args) {
+                    let action = call.args["action"].as_str().unwrap_or("call");
+                    let target = match action {
+                        "get_prompt" => call.args["prompt"]
+                            .as_str()
+                            .or_else(|| call.args["tool"].as_str())
+                            .unwrap_or(""),
+                        "read_resource" => call.args["uri"]
+                            .as_str()
+                            .or_else(|| call.args["tool"].as_str())
+                            .unwrap_or(""),
+                        _ => call.args["tool"].as_str().unwrap_or(""),
+                    };
+                    let args = call
+                        .args
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    match reg.invoke(server, action, target, args) {
                         Ok(out) => {
                             self.last_exit_code = Some(0);
                             out
@@ -390,6 +459,7 @@ impl Tools {
                 None => "no MCP servers configured in .twig/mcp.json or ~/.config/twig/mcp.json".into(),
             },
             "subagent" => self.delegate(&call.args, emit),
+            "task" => self.run_task(&call.args, emit),
             other => format!("no such tool {other:?}"),
         }
     }
@@ -469,26 +539,79 @@ impl Tools {
         format!("todo updated ({completed}/{} completed)", normalized.len())
     }
 
-    fn delegate(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
-        if std::env::var_os("TWIG_SUBAGENT").is_some() {
-            return "subagent recursion is disabled; return a result to the parent".into();
-        }
-        let role_name = args["role"].as_str().unwrap_or("code");
-        let role = match role_name {
-            "code" => Role::Code,
-            "test" => Role::Test,
-            "scout" => Role::Scout,
-            "reviewer" => Role::Reviewer,
-            _ => return "invalid subagent role".into(),
+    fn run_task(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
+        let action = args["action"].as_str().unwrap_or("list");
+        let res = match action {
+            "start" => {
+                let cmd = args["command"].as_str().unwrap_or("");
+                let r = self.tasks.start(cmd, self.is_read_only());
+                if let Ok(ref snap) = r {
+                    emit(json!({
+                        "ev": "task.started",
+                        "id": snap["id"],
+                        "command": snap["command"],
+                        "running": self.tasks.running_count()
+                    }));
+                }
+                r
+            }
+            "status" => {
+                let id = args["id"].as_str().unwrap_or("");
+                self.tasks.status(id)
+            }
+            "wait" => {
+                let id = args["id"].as_str().unwrap_or("");
+                let secs = args["timeout_secs"].as_u64().unwrap_or(30);
+                let r = self.tasks.wait(id, secs);
+                if let Ok(ref snap) = r {
+                    if snap["status"] != "running" {
+                        emit(json!({
+                            "ev": "task.completed",
+                            "id": snap["id"],
+                            "status": snap["status"],
+                            "exit_code": snap["exit_code"],
+                            "elapsed_secs": snap["elapsed_secs"],
+                            "running": self.tasks.running_count()
+                        }));
+                    }
+                }
+                r
+            }
+            "cancel" => {
+                let id = args["id"].as_str().unwrap_or("");
+                let r = self.tasks.cancel(id);
+                if let Ok(ref snap) = r {
+                    emit(json!({
+                        "ev": "task.completed",
+                        "id": snap["id"],
+                        "status": "cancelled",
+                        "exit_code": snap["exit_code"],
+                        "elapsed_secs": snap["elapsed_secs"],
+                        "running": self.tasks.running_count()
+                    }));
+                }
+                r
+            }
+            "list" => Ok(self.tasks.list()),
+            other => Err(format!(
+                "invalid task action {other:?}; expected start, status, wait, cancel, or list"
+            )),
         };
-        if self.is_read_only() && matches!(role, Role::Code | Role::Test) {
-            return "refused: read-only mode only permits scout or reviewer subagents".into();
+        match res {
+            Ok(val) => {
+                self.last_exit_code = Some(0);
+                serde_json::to_string_pretty(&val).unwrap_or_default()
+            }
+            Err(e) => {
+                self.last_exit_code = Some(1);
+                format!("task error: {e}")
+            }
         }
+    }
+
+    fn ensure_agent_pool(&mut self) -> Result<SubagentPool, String> {
         if self.agent_pool.is_none() {
-            let executable = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => return e.to_string(),
-            };
+            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let cfg = SubagentConfig {
                 twig: executable,
                 repository: self.worktree.clone(),
@@ -499,38 +622,169 @@ impl Tools {
                 max_output_bytes: 64_000,
                 network: self.network,
             };
-            match SubagentPool::new(cfg) {
-                Ok(p) => self.agent_pool = Some(p),
-                Err(e) => return format!("subagent setup: {e}"),
-            }
+            self.agent_pool = Some(
+                SubagentPool::new(cfg).map_err(|e| format!("subagent setup: {e}"))?,
+            );
         }
-        let task = args["task"].as_str().unwrap_or("");
-        let started = std::time::Instant::now();
-        emit(json!({"ev": "subagent.started", "role": role_name, "task": task}));
-        let res = self.agent_pool.as_ref().unwrap().run(role, task);
-        let elapsed_secs = started.elapsed().as_secs();
-        match res {
-            Ok(r) => {
-                emit(json!({
-                    "ev": "subagent.completed",
-                    "role": role_name,
-                    "ok": true,
-                    "elapsed_secs": elapsed_secs
-                }));
-                self.last_exit_code = Some(0);
-                serde_json::to_string(&r).unwrap_or_default()
-            }
-            Err(e) => {
-                emit(json!({
-                    "ev": "subagent.completed",
-                    "role": role_name,
-                    "ok": false,
-                    "elapsed_secs": elapsed_secs
-                }));
-                format!("subagent error: {e}")
-            }
-        }
+        Ok(self.agent_pool.as_ref().unwrap().clone())
     }
+}
+
+struct SubagentSpec<'a> {
+    role: Role,
+    role_name: &'a str,
+    task: &'a str,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+}
+
+struct SubagentOutcome<'a> {
+    text: String,
+    ok: bool,
+    elapsed_secs: u64,
+    role_name: &'a str,
+}
+
+impl Tools {
+    fn parse_subagent_args<'a>(&self, args: &'a Value) -> Result<SubagentSpec<'a>, String> {
+        if std::env::var_os("TWIG_SUBAGENT").is_some() {
+            return Err("subagent recursion is disabled; return a result to the parent".into());
+        }
+        let role_name = args["role"].as_str().unwrap_or("code");
+        let role = match role_name {
+            "code" => Role::Code,
+            "test" => Role::Test,
+            "scout" => Role::Scout,
+            "reviewer" => Role::Reviewer,
+            _ => return Err("invalid subagent role".into()),
+        };
+        if self.is_read_only() && matches!(role, Role::Code | Role::Test) {
+            return Err("refused: read-only mode only permits scout or reviewer subagents".into());
+        }
+        Ok(SubagentSpec {
+            role,
+            role_name,
+            task: args["task"].as_str().unwrap_or(""),
+            model: args.get("model").and_then(Value::as_str),
+            effort: args.get("effort").and_then(Value::as_str),
+        })
+    }
+
+    /// Execute a batch of `subagent` tool calls concurrently via `SubagentPool`
+    /// while preserving original call order and emitting lifecycle events.
+    pub fn run_subagents_batch(
+        &mut self,
+        calls: &[&ToolCall],
+        emit: &mut dyn FnMut(Value),
+    ) -> Vec<(String, Option<i32>)> {
+        let mut parsed = Vec::with_capacity(calls.len());
+        let mut any_valid = false;
+        for call in calls {
+            let p = self.parse_subagent_args(&call.args);
+            if let Ok(spec) = &p {
+                any_valid = true;
+                emit(json!({
+                    "ev": "subagent.started",
+                    "role": spec.role_name,
+                    "task": spec.task,
+                    "model": spec.model,
+                    "effort": spec.effort,
+                    "parallel": calls.len() > 1
+                }));
+            }
+            parsed.push(p);
+        }
+        if !any_valid {
+            return parsed
+                .into_iter()
+                .map(|r| (r.err().unwrap_or_default(), None))
+                .collect();
+        }
+        let pool = match self.ensure_agent_pool() {
+            Ok(p) => p,
+            Err(e) => {
+                return calls.iter().map(|_| (e.clone(), None)).collect();
+            }
+        };
+
+        let results: Vec<Result<SubagentOutcome<'_>, String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = parsed
+                .into_iter()
+                .map(|item| {
+                    let pool = pool.clone();
+                    s.spawn(move || {
+                        let spec = item?;
+                        let started = std::time::Instant::now();
+                        let run = pool.run_with_options(
+                            spec.role,
+                            spec.task,
+                            spec.model,
+                            spec.effort,
+                        );
+                        let elapsed_secs = started.elapsed().as_secs();
+                        match run {
+                            Ok(r) => Ok(SubagentOutcome {
+                                text: serde_json::to_string(&r).unwrap_or_default(),
+                                ok: true,
+                                elapsed_secs,
+                                role_name: spec.role_name,
+                            }),
+                            Err(e) => Ok(SubagentOutcome {
+                                text: format!("subagent error: {e}"),
+                                ok: false,
+                                elapsed_secs,
+                                role_name: spec.role_name,
+                            }),
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err("subagent worker panicked".into()))
+                })
+                .collect()
+        });
+
+        let mut out = Vec::with_capacity(results.len());
+        for res in results {
+            match res {
+                Ok(done) => {
+                    emit(json!({
+                        "ev": "subagent.completed",
+                        "role": done.role_name,
+                        "ok": done.ok,
+                        "elapsed_secs": done.elapsed_secs
+                    }));
+                    out.push((done.text, done.ok.then_some(0)));
+                }
+                Err(msg) => out.push((msg, None)),
+            }
+        }
+        if let Some((_, code)) = out.last() {
+            self.last_exit_code = *code;
+        }
+        out
+    }
+
+    fn delegate(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
+        let dummy = ToolCall {
+            id: String::new(),
+            name: "subagent".into(),
+            args: args.clone(),
+        };
+        let mut results = self.run_subagents_batch(&[&dummy], emit);
+        let (text, code) = results
+            .pop()
+            .unwrap_or_else(|| ("subagent failed".into(), None));
+        self.last_exit_code = code;
+        text
+    }
+}
+
+impl Tools {
 
     /// Revert the most recent `edit` or `write` tool change in this session.
     pub fn undo_last_edit(&mut self) -> Result<String, String> {
@@ -627,9 +881,28 @@ impl Tools {
     }
 
     fn read(&mut self, path: &str, start_line: Option<usize>, limit: Option<usize>) -> String {
-        let (_, target) = match self.resolve_existing_in_worktree(path) {
-            Ok(v) => v,
-            Err(e) => return e,
+        let target = if let Some(fname) = path.strip_prefix("artifact:") {
+            let Some(dir) = &self.artifacts_dir else {
+                return "artifact storage is not configured".into();
+            };
+            if fname.is_empty() || fname.contains('/') || fname.contains('\\') || fname.contains("..") {
+                return format!("refused: invalid artifact name {fname:?}");
+            }
+            let Ok(root) = dir.canonicalize() else {
+                return format!("artifact:{fname}: not found");
+            };
+            let Ok(real) = root.join(fname).canonicalize() else {
+                return format!("artifact:{fname}: not found");
+            };
+            if !real.starts_with(&root) {
+                return format!("refused: {path} resolves outside artifacts");
+            }
+            real
+        } else {
+            match self.resolve_existing_in_worktree(path) {
+                Ok((_, p)) => p,
+                Err(e) => return e,
+            }
         };
         match std::fs::read_to_string(&target) {
             Ok(text) => {
@@ -1044,7 +1317,8 @@ mod tests {
             read_max_lines: 1,
             ..HarnessConfig::default()
         };
-        let mut t = Tools::with_config(dir(), &cfg);
+        let d = dir();
+        let mut t = Tools::with_config(&d, &cfg);
         let read = t.run(&call("read", json!({"path": "note.txt"})));
         assert!(read.starts_with("hello\n[truncated after 1 lines"), "{read}");
         assert!(t.schema()[1]["function"]["description"]
@@ -1053,6 +1327,17 @@ mod tests {
             .contains("at most 1 lines"));
         let clipped = t.clip(&"A".repeat(3000));
         assert!(clipped.contains("clipped") && clipped.starts_with('A') && clipped.ends_with('A'));
+
+        let art_dir = d.join(".art");
+        let mut t2 = Tools::with_config(&d, &cfg).with_artifacts_dir(art_dir);
+        let big = (1..=400).map(|i| format!("line-{i}")).collect::<Vec<_>>().join("\n");
+        let saved = t2.clip_for_call("c99", &big);
+        assert!(saved.contains("artifact:tool-c99.txt"));
+        let page = t2.run(&call(
+            "read",
+            json!({"path": "artifact:tool-c99.txt", "start_line": 200, "limit": 1}),
+        ));
+        assert!(page.starts_with("line-200"), "{page}");
     }
 
     #[test]

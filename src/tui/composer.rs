@@ -28,14 +28,16 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new chat session"),
     ("/resume", "browse and resume a previous session"),
     ("/fork", "fork current session into a new branch"),
-    ("/rewind ", "rewind conversation context by N turns (default 1)"),
+    ("/rewind", "pick a previous turn to rewind & edit (or Esc×2)"),
     ("/rename ", "rename the current session"),
     ("/archive", "archive current session and start a new one"),
     ("/undo", "revert the last edit or write tool change"),
     ("/diff", "show current git diff with line numbers"),
     ("/review", "run independent read-only review on current changes"),
-    ("/image ", "attach image file or paste clipboard image"),
-    ("/mcp", "list configured MCP servers and tools"),
+    ("/image ", "attach image file or paste clipboard image (Alt+V)"),
+    ("/tasks", "list asynchronous background shell tasks"),
+    ("/mcp", "list configured MCP servers, prompts, and resources"),
+    ("/evolve", "propose human-reviewed .twig/preferences or skill upgrade"),
     ("/skills", "list available playbooks and project/global skills"),
     ("/memory", "edit .twig/preferences.md project memory in $EDITOR"),
     ("/init", "initialize .twig/preferences.md and .twig/project.json"),
@@ -71,6 +73,7 @@ pub enum SlashCommand {
     OpenResume,
     SwitchSession(String),
     ForkSession,
+    OpenRewindPicker,
     RewindSession(usize),
     RenameSession(String),
     ArchiveSession,
@@ -79,7 +82,9 @@ pub enum SlashCommand {
     RunReview,
     AttachImage(Option<String>),
     ClearImages,
+    ListTasks,
     ListMcp,
+    EvolveSession,
     ShowSkills,
     EditMemory,
     ShowMemory,
@@ -114,14 +119,16 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/new" => Some(SlashCommand::NewSession),
         "/resume" => Some(SlashCommand::OpenResume),
         "/fork" => Some(SlashCommand::ForkSession),
-        "/rewind" => Some(SlashCommand::RewindSession(1)),
+        "/rewind" => Some(SlashCommand::OpenRewindPicker),
         "/archive" => Some(SlashCommand::ArchiveSession),
         "/undo" => Some(SlashCommand::UndoEdit),
         "/diff" => Some(SlashCommand::RunDiff),
         "/review" => Some(SlashCommand::RunReview),
         "/image" => Some(SlashCommand::AttachImage(None)),
         "/image clear" => Some(SlashCommand::ClearImages),
+        "/tasks" => Some(SlashCommand::ListTasks),
         "/mcp" => Some(SlashCommand::ListMcp),
+        "/evolve" => Some(SlashCommand::EvolveSession),
         "/skills" | "/playbooks" => Some(SlashCommand::ShowSkills),
         "/memory" => Some(SlashCommand::EditMemory),
         "/memory show" => Some(SlashCommand::ShowMemory),
@@ -246,7 +253,7 @@ impl Composer {
         Self {
             text: String::new(),
             cursor: 0,
-            history: Vec::new(),
+            history: super::client::load_input_history(),
             history_idx: None,
             draft: String::new(),
             pastes: HashMap::new(),
@@ -254,6 +261,10 @@ impl Composer {
             repo_files: list_repo_files(repo),
             popup_sel: 0,
         }
+    }
+
+    pub fn history(&self) -> &[String] {
+        &self.history
     }
 
     pub fn is_empty(&self) -> bool {
@@ -585,6 +596,9 @@ impl Composer {
         self.popup_sel = 0;
         if !expanded.trim().is_empty() && self.history.last() != Some(&expanded) {
             self.history.push(expanded.clone());
+            if !cfg!(test) {
+                super::client::append_input_history(&expanded);
+            }
         }
         expanded
     }

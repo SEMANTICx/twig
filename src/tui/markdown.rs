@@ -955,7 +955,7 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
             "copy code / full reply",
         ),
         Line::from(Span::styled(
-            "  Esc interrupt / ×2 clear · Alt+M mouse select · ? close · PgUp/PgDn scroll · ^C quit",
+            "  Esc interrupt / ×2 clear or rewind · ^R history · Alt+V paste img · Alt+M mouse · ^C quit",
             Style::default().fg(MUTED),
         )),
     ]
@@ -967,6 +967,7 @@ pub enum FooterMode {
     ShortcutOverlay,
     QuitReminder,
     EscHint,
+    RewindHint,
 }
 
 pub struct FooterView<'a> {
@@ -974,12 +975,14 @@ pub struct FooterView<'a> {
     pub flash: Option<&'a str>,
     pub repo_label: &'a str,
     pub git_branch: Option<&'a str>,
+    pub git_stat: Option<(usize, usize)>,
     pub model: &'a str,
     pub effort: Option<&'a str>,
     pub title: Option<&'a str>,
     pub sid: &'a str,
     pub plan_mode: bool,
     pub pending_images: usize,
+    pub running_tasks: usize,
     pub context_pct: Option<usize>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1061,6 +1064,16 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
             );
             return;
         }
+        FooterMode::RewindHint => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  Press Esc again to rewind a previous turn",
+                    Style::default().fg(AMBER),
+                )),
+                area,
+            );
+            return;
+        }
         FooterMode::Contextual => {}
     }
 
@@ -1082,6 +1095,14 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
                 Style::default().fg(MUTED),
             ));
         }
+        if let Some((ins, del)) = view.git_stat {
+            if ins > 0 {
+                spans.push(Span::styled(format!(" +{ins}"), Style::default().fg(SAGE)));
+            }
+            if del > 0 {
+                spans.push(Span::styled(format!(" -{del}"), Style::default().fg(ROSE)));
+            }
+        }
         spans.push(Span::styled(
             format!(" · {}", view.model),
             Style::default().fg(ACCENT_PEAK),
@@ -1100,6 +1121,12 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
             spans.push(Span::styled(
                 " · ◈ plan",
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if view.running_tasks > 0 {
+            spans.push(Span::styled(
+                format!(" · ⚙ {} task{}", view.running_tasks, if view.running_tasks == 1 { "" } else { "s" }),
+                Style::default().fg(AMBER),
             ));
         }
         if view.pending_images > 0 {

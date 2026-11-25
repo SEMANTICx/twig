@@ -242,6 +242,17 @@ impl Transcript {
         self.scroll.is_animating(motion)
     }
 
+    /// Chronological list of user turn prompts in the current transcript (for `/rewind` picker).
+    pub fn user_turns(&self) -> Vec<String> {
+        self.cells
+            .iter()
+            .filter_map(|c| match c {
+                Cell::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn replay_history(&mut self, messages: &[Value]) {
         if !self.cells.is_empty() || messages.is_empty() {
             return;
@@ -1120,9 +1131,12 @@ pub enum PickerOutcome {
     SelectSession(String),
     SelectModel(String),
     SelectEffort(String),
+    RewindTo { turns_back: usize, prompt: String },
+    ForkSession,
+    FillComposer(String),
 }
 
-/// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, and `/effort`.
+/// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, `/effort`, `/rewind`, and `Ctrl+R`.
 pub enum OverlayPicker {
     Resume {
         sessions: Vec<super::client::SessionSummary>,
@@ -1136,6 +1150,15 @@ pub enum OverlayPicker {
     },
     Effort {
         active: Option<String>,
+        sel: usize,
+    },
+    Rewind {
+        turns: Vec<String>,
+        sel: usize,
+    },
+    History {
+        all: Vec<String>,
+        filter: String,
         sel: usize,
     },
 }
@@ -1164,11 +1187,28 @@ impl OverlayPicker {
         Self::Effort { active, sel }
     }
 
+    pub fn rewind(turns: Vec<String>) -> Self {
+        let sel = turns.len().saturating_sub(1);
+        Self::Rewind { turns, sel }
+    }
+
+    pub fn history(entries: &[String]) -> Self {
+        let mut rev: Vec<String> = entries.iter().rev().cloned().collect();
+        rev.truncate(200);
+        Self::History {
+            all: rev,
+            filter: String::new(),
+            sel: 0,
+        }
+    }
+
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Resume { .. } => "↑/↓ select · Enter open · Esc close  ",
             Self::Model { .. } => "type to filter · ↑/↓ select · Enter apply · Esc close  ",
             Self::Effort { .. } => "↑/↓ select · Enter apply · Esc close  ",
+            Self::Rewind { .. } => "↑/↓ select · Enter rewind & edit · f fork · Esc close  ",
+            Self::History { .. } => "type to filter · ↑/↓ select · Enter fill · Esc close  ",
         }
     }
 
@@ -1177,6 +1217,8 @@ impl OverlayPicker {
             Self::Resume { sessions, .. } => sessions.len(),
             Self::Model { all, filter, .. } => filtered_models(all, filter).len(),
             Self::Effort { .. } => EFFORT_LEVELS.len(),
+            Self::Rewind { turns, .. } => turns.len(),
+            Self::History { all, filter, .. } => filtered_models(all, filter).len(),
         };
         (count.clamp(1, 8) as u16) + 3
     }
@@ -1212,6 +1254,26 @@ impl OverlayPicker {
                 KeyCode::Enter => PickerOutcome::SelectEffort(EFFORT_LEVELS[*sel].0.to_owned()),
                 _ => PickerOutcome::None,
             },
+            Self::Rewind { turns, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => PickerOutcome::Close,
+                KeyCode::Char('f') => PickerOutcome::ForkSession,
+                KeyCode::Up | KeyCode::Char('k') if !turns.is_empty() => {
+                    *sel = sel.saturating_sub(1);
+                    PickerOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') if !turns.is_empty() => {
+                    *sel = (*sel + 1).min(turns.len() - 1);
+                    PickerOutcome::None
+                }
+                KeyCode::Enter => turns
+                    .get(*sel)
+                    .map(|prompt| PickerOutcome::RewindTo {
+                        turns_back: turns.len() - *sel,
+                        prompt: prompt.clone(),
+                    })
+                    .unwrap_or(PickerOutcome::Close),
+                _ => PickerOutcome::None,
+            },
             Self::Model {
                 all, filter, sel, ..
             } => {
@@ -1243,6 +1305,35 @@ impl OverlayPicker {
                     _ => PickerOutcome::None,
                 }
             }
+            Self::History { all, filter, sel } => {
+                let items = filtered_models(all, filter);
+                match key.code {
+                    KeyCode::Esc => PickerOutcome::Close,
+                    KeyCode::Up if !items.is_empty() => {
+                        *sel = sel.saturating_sub(1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Down if !items.is_empty() => {
+                        *sel = (*sel + 1).min(items.len() - 1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Enter => items
+                        .get(*sel)
+                        .map(|entry| PickerOutcome::FillComposer((*entry).to_owned()))
+                        .unwrap_or(PickerOutcome::Close),
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        *sel = 0;
+                        PickerOutcome::None
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        filter.push(c);
+                        *sel = 0;
+                        PickerOutcome::None
+                    }
+                    _ => PickerOutcome::None,
+                }
+            }
         }
     }
 
@@ -1257,6 +1348,10 @@ impl OverlayPicker {
             } => render_model_picker(frame, area, all, filter, active, *sel),
             Self::Effort { active, sel } => {
                 render_effort_picker(frame, area, active.as_deref(), *sel);
+            }
+            Self::Rewind { turns, sel } => render_rewind_picker(frame, area, turns, *sel),
+            Self::History { all, filter, sel } => {
+                render_history_picker(frame, area, all, filter, *sel);
             }
         }
     }
@@ -1500,6 +1595,146 @@ fn render_resume_picker(
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+fn render_rewind_picker(frame: &mut Frame, area: Rect, turns: &[String], sel: usize) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
+    let sel = sel.min(turns.len().saturating_sub(1));
+    let start = sel.saturating_sub(max_rows.saturating_sub(1));
+    let end = (start + max_rows).min(turns.len());
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+
+    let mut rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            "  Rewind to turn  (Enter rewind & edit prompt · f fork · Esc cancel)",
+            Style::default()
+                .fg(ACCENT_PEAK)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for (offset, prompt) in turns[start..end].iter().enumerate() {
+        let idx = start + offset;
+        let is_sel = idx == sel;
+        let bg = if is_sel { ACCENT } else { Color::Reset };
+        let marker = if is_sel { " › " } else { "   " };
+        let num = format!("#{:<3}", idx + 1);
+        let one_line = prompt.replace('\n', " ");
+        let used = display_width(marker) + display_width(&num);
+        let label = clip_str(&one_line, row_w.saturating_sub(used + 2));
+        let pad = row_w.saturating_sub(used + display_width(&label));
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { ACCENT })
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                num,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { MUTED })
+                    .bg(bg),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { IVORY })
+                    .bg(bg)
+                    .add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]));
+    }
+    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_history_picker(
+    frame: &mut Frame,
+    area: Rect,
+    all: &[String],
+    filter: &str,
+    sel: usize,
+) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let items = filtered_models(all, filter);
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
+    let sel = sel.min(items.len().saturating_sub(1));
+    let start = sel.saturating_sub(max_rows.saturating_sub(1));
+    let end = (start + max_rows).min(items.len());
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+
+    let header = if filter.is_empty() {
+        format!("  Prompt history ({} saved · type to search · Enter fill)", all.len())
+    } else {
+        format!("  Prompt history  query: {filter}  ({} matches)", items.len())
+    };
+    let mut rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            header,
+            Style::default()
+                .fg(ACCENT_PEAK)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if items.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "   (no matching prompts)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for (offset, entry) in items[start..end].iter().enumerate() {
+            let is_sel = start + offset == sel;
+            let bg = if is_sel { ACCENT } else { Color::Reset };
+            let marker = if is_sel { " › " } else { "   " };
+            let one_line = entry.replace('\n', " ↵ ");
+            let label = clip_str(&one_line, row_w.saturating_sub(display_width(marker) + 2));
+            let pad = row_w.saturating_sub(display_width(marker) + display_width(&label));
+            rows.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { ACCENT })
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { IVORY })
+                        .bg(bg)
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+            ]));
+        }
+    }
+    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
 pub fn title_tool_name(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {
@@ -1515,8 +1750,26 @@ pub fn summarize_tool_args(name: &str, args: &Value) -> String {
     }
     if name == "mcp" {
         let srv = args["server"].as_str().unwrap_or("");
-        let tool = args["tool"].as_str().unwrap_or("list");
-        return clip_str(&format!("{srv}/{tool}"), 92);
+        let action = args["action"].as_str().unwrap_or("call");
+        let target = args["prompt"]
+            .as_str()
+            .or_else(|| args["uri"].as_str())
+            .or_else(|| args["tool"].as_str())
+            .unwrap_or(action);
+        return clip_str(&format!("{srv}/{target}"), 92);
+    }
+    if name == "task" {
+        let action = args["action"].as_str().unwrap_or("list");
+        let detail = args["command"]
+            .as_str()
+            .or_else(|| args["id"].as_str())
+            .unwrap_or("");
+        let summary = if detail.is_empty() {
+            action.to_owned()
+        } else {
+            format!("{action} {detail}")
+        };
+        return clip_str(&summary.replace('\n', " "), 92);
     }
     let raw = match name {
         "bash" => args["command"].as_str().unwrap_or(""),

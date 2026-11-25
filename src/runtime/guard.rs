@@ -44,6 +44,7 @@ pub struct Guard {
     digest: Option<String>,
     stall: u32,
     samples: u32,
+    last_failed_call: Option<(String, u32)>,
 }
 
 impl Guard {
@@ -62,7 +63,44 @@ impl Guard {
             digest: None,
             stall: 0,
             samples: 0,
+            last_failed_call: None,
         }
+    }
+
+    /// Immediate anti-repetition loop breaker (SWE-bench generalizable guard):
+    /// flags when the exact same tool invocation fails or returns empty twice in a row.
+    pub fn observe_tool_call(
+        &mut self,
+        name: &str,
+        args: &serde_json::Value,
+        output: &str,
+        exit_code: Option<i32>,
+    ) -> Option<&'static str> {
+        let trimmed = output.trim();
+        let failed_or_empty = exit_code.is_some_and(|c| c != 0)
+            || trimmed.is_empty()
+            || trimmed.starts_with("(exit ")
+            || trimmed.starts_with("edit failed:")
+            || trimmed.starts_with("refused:")
+            || trimmed.starts_with("no matches for")
+            || trimmed.starts_with("no files matched");
+        if !failed_or_empty {
+            self.last_failed_call = None;
+            return None;
+        }
+        let sig = format!("{name}:{args}");
+        match &mut self.last_failed_call {
+            Some((prev, count)) if *prev == sig => {
+                *count += 1;
+                if *count >= 2 {
+                    return Some(
+                        "[loop-breaker] This exact tool call failed or returned no useful output twice in a row. Inspect the relevant file or try a different approach instead of repeating it.",
+                    );
+                }
+            }
+            slot => *slot = Some((sig, 1)),
+        }
+        None
     }
 
     pub fn ignoring(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
@@ -234,5 +272,18 @@ mod tests {
         g.tick(2);
         std::fs::write(dir.join("a.txt"), b"changed").unwrap();
         assert_ne!(g.tick(3), Level::Narrow);
+    }
+
+    #[test]
+    fn repetition_breaker_flags_second_identical_empty_or_failed_call() {
+        let dir = tmpdir();
+        let mut g = Guard::new(&dir, 20, 6, 3);
+        let args = serde_json::json!({"command": "grep nope a.txt"});
+        assert!(g.observe_tool_call("bash", &args, "(exit 1, no output)", Some(1)).is_none());
+        assert!(g
+            .observe_tool_call("bash", &args, "(exit 1, no output)", Some(1))
+            .is_some());
+        assert!(g.observe_tool_call("bash", &args, "found it", Some(0)).is_none());
+        assert!(g.observe_tool_call("bash", &args, "", Some(0)).is_none());
     }
 }

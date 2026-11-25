@@ -509,7 +509,13 @@ pub fn extract_inline_images(repo: &str, text: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Format an `mcp.list` RPC reply cleanly for the transcript.
+/// Prompt sent by `/evolve` for human-reviewed session self-improvement.
+pub const EVOLVE_PROMPT: &str = "\
+Reflect on this session's friction, repeated errors, tool papercuts, or repo-specific conventions you discovered. \
+Propose ONE concise, high-leverage improvement to `.twig/preferences.md` or a project skill under `.twig/skills/<name>/SKILL.md`. \
+Do NOT edit Rust source code or locked harness files, and do NOT modify files yet—present the proposed change as a clear unified diff with a brief rationale so I can review and approve applying it.";
+
+/// Format an `mcp.list` RPC reply cleanly for the transcript (tools, prompts/skills, and resources).
 pub fn format_mcp_report(result: &Value) -> String {
     let servers = result["servers"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if servers.is_empty() {
@@ -525,16 +531,60 @@ pub fn format_mcp_report(result: &Value) -> String {
                 .flatten()
                 .filter_map(|t| t["name"].as_str())
                 .collect();
-            let list = if tools.is_empty() {
-                "0 tools".to_owned()
+            let prompts: Vec<&str> = s["prompts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["name"].as_str())
+                .collect();
+            let resources: Vec<&str> = s["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["name"].as_str().or_else(|| r["uri"].as_str()))
+                .collect();
+            let mut parts = Vec::new();
+            if tools.is_empty() {
+                parts.push("0 tools".to_owned());
             } else {
-                format!("{} tools: {}", tools.len(), tools.join(", "))
-            };
-            lines.push(format!("- **{name}** ({list})"));
+                parts.push(format!("{} tools: {}", tools.len(), tools.join(", ")));
+            }
+            if !prompts.is_empty() {
+                parts.push(format!("{} prompts: {}", prompts.len(), prompts.join(", ")));
+            }
+            if !resources.is_empty() {
+                parts.push(format!(
+                    "{} resources: {}",
+                    resources.len(),
+                    resources.join(", ")
+                ));
+            }
+            lines.push(format!("- **{name}** ({})", parts.join(" · ")));
         } else {
             let err = s["error"].as_str().unwrap_or("error");
             lines.push(format!("- **{name}** — error: `{err}`"));
         }
+    }
+    lines.join("\n")
+}
+
+/// Format a `tasks.list` RPC reply cleanly for `/tasks`.
+pub fn format_tasks_report(result: &Value) -> String {
+    let tasks = result["tasks"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if tasks.is_empty() {
+        return "no background tasks started in this session".into();
+    }
+    let mut lines = Vec::new();
+    for t in tasks {
+        let id = t["id"].as_str().unwrap_or("?");
+        let status = t["status"].as_str().unwrap_or("?");
+        let secs = t["elapsed_secs"].as_u64().unwrap_or(0);
+        let cmd = t["command"].as_str().unwrap_or("");
+        let exit = t["exit_code"]
+            .as_i64()
+            .map(|c| format!(" · exit {c}"))
+            .unwrap_or_default();
+        lines.push(format!("- **{id}** `{status}` ({secs}s{exit}) — `{cmd}`"));
     }
     lines.join("\n")
 }
@@ -584,6 +634,112 @@ pub fn detect_git_branch(repo: &str) -> Option<String> {
     }
     let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     (!name.is_empty()).then_some(name)
+}
+
+/// Parse `git diff --shortstat` output into `(insertions, deletions)`.
+pub fn parse_git_shortstat(text: &str) -> Option<(usize, usize)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    for part in trimmed.split(',') {
+        let p = part.trim();
+        let n = p
+            .split_whitespace()
+            .next()
+            .and_then(|tok| tok.parse::<usize>().ok());
+        if let Some(count) = n {
+            if p.contains("insertion") {
+                ins = count;
+            } else if p.contains("deletion") {
+                del = count;
+            }
+        }
+    }
+    (ins > 0 || del > 0).then_some((ins, del))
+}
+
+/// Compute live working-tree `+N -M` line diff stat against `HEAD` (falls back to unstaged diff).
+pub fn detect_git_diff_stat(repo: &str) -> Option<(usize, usize)> {
+    let head = Command::new("git")
+        .args(["-C", repo, "diff", "HEAD", "--shortstat"])
+        .output()
+        .ok();
+    if let Some(out) = head {
+        if out.status.success() {
+            return parse_git_shortstat(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    let plain = Command::new("git")
+        .args(["-C", repo, "diff", "--shortstat"])
+        .output()
+        .ok()?;
+    plain
+        .status
+        .success()
+        .then(|| parse_git_shortstat(&String::from_utf8_lossy(&plain.stdout)))
+        .flatten()
+}
+
+const MAX_INPUT_HISTORY: usize = 200;
+
+fn history_file_path() -> PathBuf {
+    paths::state_dir().join("history.txt")
+}
+
+/// Load persistent cross-session prompt history (JSON-encoded one entry per line).
+pub fn load_input_history() -> Vec<String> {
+    load_input_history_from(&history_file_path())
+}
+
+fn load_input_history_from(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let item = serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_owned());
+        if !item.trim().is_empty() {
+            out.push(item);
+        }
+    }
+    if out.len() > MAX_INPUT_HISTORY {
+        out.drain(..out.len() - MAX_INPUT_HISTORY);
+    }
+    out
+}
+
+/// Append a submitted prompt to persistent cross-session history (deduped tail, capped at 200).
+pub fn append_input_history(entry: &str) {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    append_input_history_at(&history_file_path(), trimmed);
+}
+
+fn append_input_history_at(path: &Path, entry: &str) {
+    let mut items = load_input_history_from(path);
+    items.retain(|x| x != entry);
+    items.push(entry.to_owned());
+    if items.len() > MAX_INPUT_HISTORY {
+        items.drain(..items.len() - MAX_INPUT_HISTORY);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body: String = items
+        .iter()
+        .filter_map(|s| serde_json::to_string(s).ok())
+        .map(|j| format!("{j}\n"))
+        .collect();
+    let _ = std::fs::write(path, body);
 }
 
 pub fn shorten_home(path: &str) -> String {
@@ -672,6 +828,111 @@ fn encode_base64(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Asynchronous host-side job results delivered back to the TUI event loop.
+pub enum LocalMsg {
+    Shell {
+        id: String,
+        output: String,
+        exit_code: Option<i32>,
+        elapsed: Duration,
+    },
+    Review(Result<String, String>),
+    Doctor(Result<(String, bool), String>),
+    Models(Result<Vec<String>, String>),
+    GitStat(Option<(usize, usize)>),
+}
+
+/// Non-blocking worker pool for host-side commands (`!cmd`, `/doctor`, `/review`, `/model`, git stat).
+pub struct LocalWorkers {
+    tx: mpsc::Sender<LocalMsg>,
+    rx: Receiver<LocalMsg>,
+}
+
+impl LocalWorkers {
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { tx, rx }
+    }
+
+    pub fn try_recv(&self) -> Option<LocalMsg> {
+        self.rx.try_recv().ok()
+    }
+
+    pub fn spawn_models(&self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::Models(fetch_magpie_models()));
+        });
+    }
+
+    pub fn spawn_doctor(&self, repo: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::Doctor(run_doctor(&repo)));
+        });
+    }
+
+    pub fn spawn_review(&self, repo: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::Review(run_independent_review(&repo)));
+        });
+    }
+
+    pub fn spawn_shell(&self, repo: String, id: String, cmd: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let (output, exit_code, elapsed) = run_local_shell(&repo, &cmd);
+            let _ = tx.send(LocalMsg::Shell {
+                id,
+                output,
+                exit_code,
+                elapsed,
+            });
+        });
+    }
+
+    pub fn spawn_git_stat(&self, repo: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::GitStat(detect_git_diff_stat(&repo)));
+        });
+    }
+}
+
+/// Format turn RPC parameters including any pending or inline `@image` attachments.
+pub fn build_turn_params(
+    repo: &str,
+    text: String,
+    mut images: Vec<(String, String)>,
+) -> (Value, Vec<String>) {
+    images.extend(extract_inline_images(repo, &text));
+    if images.is_empty() {
+        return (json!({"input": text}), Vec::new());
+    }
+    let labels: Vec<String> = images.iter().map(|(l, _)| l.clone()).collect();
+    let payload: Vec<Value> = images
+        .into_iter()
+        .map(|(label, url)| json!({"label": label, "url": url}))
+        .collect();
+    (json!({"input": text, "images": payload}), labels)
+}
+
+/// Format `/skills` overview combining playbooks and project/global skills.
+pub fn format_skills_notice(playbooks: &[String], skills_meta: &str) -> String {
+    let books = if playbooks.is_empty() {
+        "bug-fix, feature, autonomous-run".to_owned()
+    } else {
+        playbooks.join(", ")
+    };
+    let skills = if skills_meta.trim().is_empty() {
+        "none in .twig/skills or ~/.config/twig/skills".to_owned()
+    } else {
+        skills_meta.to_owned()
+    };
+    format!("playbooks: {books} · skills: {skills}")
 }
 
 #[derive(Debug)]
@@ -933,5 +1194,44 @@ mod tests {
         assert!(!dir.join("s1.lock").exists());
         assert!(dir.join("archive/s1.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_shortstat_tasks_mcp_and_persistent_history_helpers_work() {
+        assert_eq!(
+            parse_git_shortstat(" 3 files changed, 42 insertions(+), 8 deletions(-)\n"),
+            Some((42, 8))
+        );
+        assert_eq!(parse_git_shortstat(" 1 file changed, 5 insertions(+)"), Some((5, 0)));
+        assert_eq!(parse_git_shortstat(""), None);
+
+        let mcp = format_mcp_report(&json!({
+            "servers": [{
+                "server": "s1",
+                "ok": true,
+                "tools": [{"name": "search"}],
+                "prompts": [{"name": "audit-skill"}],
+                "resources": [{"uri": "mem://doc", "name": "Doc"}]
+            }]
+        }));
+        assert!(mcp.contains("1 tools: search"));
+        assert!(mcp.contains("1 prompts: audit-skill"));
+        assert!(mcp.contains("1 resources: Doc"));
+
+        let tasks = format_tasks_report(&json!({
+            "tasks": [{"id": "bg-1", "status": "running", "elapsed_secs": 4, "command": "cargo test"}]
+        }));
+        assert!(tasks.contains("bg-1") && tasks.contains("running") && tasks.contains("cargo test"));
+
+        let hist_path = std::env::temp_dir().join(format!("twig-hist-test-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&hist_path);
+        append_input_history_at(&hist_path, "first\nmultiline");
+        append_input_history_at(&hist_path, "second");
+        append_input_history_at(&hist_path, "first\nmultiline");
+        assert_eq!(
+            load_input_history_from(&hist_path),
+            vec!["second".to_owned(), "first\nmultiline".to_owned()]
+        );
+        let _ = std::fs::remove_file(&hist_path);
     }
 }

@@ -22,7 +22,7 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub fn kill_group(id: u32) {
+fn kill_group(id: u32) {
     unsafe {
         libc::kill(-(id as i32), libc::SIGKILL);
     }

@@ -7,6 +7,7 @@ pub mod guidance;
 pub mod mcp;
 pub mod policy;
 pub mod subagent;
+pub mod tasks;
 pub mod tools;
 pub mod turn;
 
@@ -32,6 +33,28 @@ use crate::verify::{gate, Candidate};
 
 const UNKNOWN_OUTCOME_MSG: &str = "PREVIOUS EXECUTION OUTCOME UNKNOWN. Command was NOT replayed after restart. Inspect the workspace manually before taking further action.";
 const RESOLVED_UNKNOWN_MSG: &str = "Previous execution outcome is unknown. The command was NOT replayed. Inspect the workspace manually before issuing any new side effect.";
+const MAX_REPO_INSTRUCTIONS_BYTES: usize = 32_768;
+
+/// Load repository instructions in precedence order: `AGENTS.md` -> `CLAUDE.md` -> `.twig/preferences.md`.
+fn append_repo_instructions(worktree: &std::path::Path, system: &mut String) {
+    let mut budget = MAX_REPO_INSTRUCTIONS_BYTES;
+    for rel in ["AGENTS.md", "CLAUDE.md", ".twig/preferences.md"] {
+        if budget == 0 {
+            break;
+        }
+        let path = worktree.join(rel);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let clipped: String = trimmed.chars().take(budget).collect();
+        budget = budget.saturating_sub(clipped.len());
+        system.push_str(&format!("\n\n## {rel}\n{clipped}"));
+    }
+}
 
 struct RecoveredState {
     messages: Vec<Value>,
@@ -307,8 +330,16 @@ impl<'a> Daemon<'a> {
                 }
             }
         }
-        let mut tools = Tools::with_config(&worktree, cfg);
+        let mut tools =
+            Tools::with_config(&worktree, cfg).with_artifacts_dir(runs_dir.join("artifacts"));
         tools.apply_plan_mode(plan_mode);
+        let initial_effort = std::env::var("TWIG_EFFORT")
+            .ok()
+            .and_then(|v| crate::llm::normalize_effort(&v).ok())
+            .unwrap_or_else(|| llm.effort());
+        if initial_effort != llm.effort() {
+            llm.set_effort(initial_effort.as_deref());
+        }
 
         Ok(Self {
             llm,
@@ -316,7 +347,7 @@ impl<'a> Daemon<'a> {
             context,
             check: recovered.check,
             model_override: None,
-            effort: llm.effort(),
+            effort: initial_effort,
             title,
             plan_mode,
             todos,
@@ -382,6 +413,7 @@ impl<'a> Daemon<'a> {
             execute_recorded_call(
                 ExecEnv {
                     tools: &mut self.tools,
+                    guard: &mut self.guard,
                     record: &mut self.record,
                     messages: &mut self.messages,
                     control: &self.control,
@@ -417,6 +449,7 @@ impl<'a> Daemon<'a> {
                     "read_only": self.tools.is_read_only(),
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
+                    "running_tasks": self.tools.running_tasks_count(),
                 }))
             }
 
@@ -586,10 +619,12 @@ impl<'a> Daemon<'a> {
                     "messages": self.messages,
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
+                    "running_tasks": self.tools.running_tasks_count(),
                 }))
             }
 
             "mcp.list" => Ok(self.tools.list_mcp()),
+            "tasks.list" => Ok(self.tools.list_tasks()),
 
             "mode.set" => {
                 let next = params
@@ -709,12 +744,7 @@ impl<'a> Daemon<'a> {
                     inject_playbook(&mut system, book, "");
                     emit(json!({"ev": "playbook.selected", "name": book.name, "steps": book.steps}));
                 }
-                let preferences = self.worktree.join(".twig/preferences.md");
-                if preferences.exists() {
-                    system.push_str(
-                        &std::fs::read_to_string(preferences).map_err(|e| e.to_string())?,
-                    );
-                }
+                append_repo_instructions(&self.worktree, &mut system);
                 system.push_str(&self.tools.system_addendum());
 
                 let mut verify_rounds = 0u32;
@@ -984,6 +1014,7 @@ impl<'a> Daemon<'a> {
                     execute_recorded_call(
                         ExecEnv {
                             tools: &mut self.tools,
+                            guard: &mut self.guard,
                             record: &mut self.record,
                             messages: &mut self.messages,
                             control: &self.control,
@@ -1179,6 +1210,7 @@ mod tests {
     fn approving_recovered_call_never_replays_unknown_side_effect() {
         let dir =
             std::env::temp_dir().join(format!("twig-daemon-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let runs = dir.join("runs");
         {
@@ -1222,6 +1254,7 @@ mod tests {
     #[test]
     fn recovered_approval_acknowledgement_survives_restart_once() {
         let dir = std::env::temp_dir().join(format!("twig-daemon-ack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let runs = dir.join("runs");
         {
@@ -1270,6 +1303,7 @@ mod tests {
             "twig-daemon-approved-started-{}",
             std::process::id()
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let runs = dir.join("runs");
         {
@@ -1321,6 +1355,7 @@ mod tests {
     fn active_noninteractive_approval_resolves_and_drains_deferred_calls() {
         let dir =
             std::env::temp_dir().join(format!("twig-daemon-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
         let runs = dir.join("runs");

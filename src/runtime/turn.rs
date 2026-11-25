@@ -36,38 +36,22 @@ pub struct TurnCtx<'a> {
 
 pub struct ExecEnv<'a> {
     pub tools: &'a mut Tools,
+    pub guard: &'a mut Guard,
     pub record: &'a mut Record,
     pub messages: &'a mut Vec<Value>,
     pub control: &'a Control,
 }
 
-pub fn execute_recorded_call(
-    env: ExecEnv<'_>,
+fn record_tool_outcome(
+    env: &mut ExecEnv<'_>,
     call: &ToolCall,
     tier: Tier,
+    output: String,
+    exit_code: Option<i32>,
     audit_sink: &mut dyn FnMut(&ToolCall, &str),
     emit: &mut dyn FnMut(Value),
 ) -> Result<String, String> {
-    let ExecEnv {
-        tools,
-        record,
-        messages,
-        control,
-    } = env;
-    record
-        .append(
-            "tool.started",
-            json!({"id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}),
-        )
-        .map_err(|e| e.to_string())?;
-    emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
-    let output = if control.cancelled() {
-        "cancelled before execution".into()
-    } else {
-        tools.run_live(call, control, emit)
-    };
-    let exit_code = tools.last_exit_code();
-    record
+    env.record
         .append(
             "tool.result",
             json!({
@@ -81,14 +65,14 @@ pub fn execute_recorded_call(
         )
         .map_err(|e| e.to_string())?;
     if call.name == "papercut" && output == "papercut recorded" {
-        record
+        env.record
             .append("papercut", json!({"report": call.args, "call_id": call.id}))
             .map_err(|e| e.to_string())?;
         emit(json!({"ev": "papercut.filed", "report": call.args}));
     }
     if call.name == "todo" && output.starts_with("todo updated") {
         if let Some(items) = call.args.get("items") {
-            record
+            env.record
                 .append("todo.updated", json!({"items": items}))
                 .map_err(|e| e.to_string())?;
         }
@@ -97,13 +81,47 @@ pub fn execute_recorded_call(
     if tier == Tier::Audit {
         audit_sink(call, &output);
     }
-    let clipped = tools.clip(&output);
+    let mut clipped = env.tools.clip_for_call(&call.id, &output);
+    if let Some(nudge) = env
+        .guard
+        .observe_tool_call(&call.name, &call.args, &output, exit_code)
+    {
+        env.record
+            .append("guard.repetition", json!({"id": call.id, "tool": call.name}))
+            .map_err(|e| e.to_string())?;
+        emit(json!({"ev": "guard.repetition", "id": call.id, "tool": call.name}));
+        clipped.push_str("\n\n");
+        clipped.push_str(nudge);
+    }
     let message = json!({"role": "tool", "tool_call_id": call.id, "content": clipped});
-    messages.push(message.clone());
-    record
+    env.messages.push(message.clone());
+    env.record
         .append("message", json!({"message": message}))
         .map_err(|e| e.to_string())?;
     Ok(clipped)
+}
+
+pub fn execute_recorded_call(
+    mut env: ExecEnv<'_>,
+    call: &ToolCall,
+    tier: Tier,
+    audit_sink: &mut dyn FnMut(&ToolCall, &str),
+    emit: &mut dyn FnMut(Value),
+) -> Result<String, String> {
+    env.record
+        .append(
+            "tool.started",
+            json!({"id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}),
+        )
+        .map_err(|e| e.to_string())?;
+    emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
+    let output = if env.control.cancelled() {
+        "cancelled before execution".into()
+    } else {
+        env.tools.run_live(call, env.control, emit)
+    };
+    let exit_code = env.tools.last_exit_code();
+    record_tool_outcome(&mut env, call, tier, output, exit_code, audit_sink, emit)
 }
 
 pub fn run_turn(
@@ -243,7 +261,9 @@ pub fn run_turn_live(
     let mut risk = serde_json::Map::new();
     let mut planned = Vec::with_capacity(reply.calls.len());
     for call in reply.calls {
-        let tier = if call.name == "bash" {
+        let tier = if call.name == "bash"
+            || (call.name == "task" && call.args["action"].as_str() == Some("start"))
+        {
             policy.classify(
                 call.args
                     .get("command")
@@ -265,8 +285,53 @@ pub fn run_turn_live(
         "policy": {"hits": hits, "misses": misses, "size": size}
     }));
 
-    let mut iter = planned.into_iter();
-    while let Some((call, tier)) = iter.next() {
+    let mut idx = 0;
+    while idx < planned.len() {
+        // Fan out consecutive Auto subagent calls in parallel while preserving
+        // exact record & message ordering.
+        if !control.cancelled()
+            && planned[idx].0.name == "subagent"
+            && planned[idx].1 == Tier::Auto
+        {
+            let mut end = idx + 1;
+            while end < planned.len()
+                && planned[end].0.name == "subagent"
+                && planned[end].1 == Tier::Auto
+            {
+                end += 1;
+            }
+            if end - idx >= 2 {
+                let slice = &planned[idx..end];
+                for (call, tier) in slice {
+                    record
+                        .append(
+                            "tool.started",
+                            json!({"id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
+                }
+                let refs: Vec<&ToolCall> = slice.iter().map(|(c, _)| c).collect();
+                let outcomes = tools.run_subagents_batch(&refs, emit);
+                let mut env = ExecEnv {
+                    tools,
+                    guard,
+                    record,
+                    messages,
+                    control,
+                };
+                for ((call, tier), (output, exit_code)) in slice.iter().zip(outcomes) {
+                    record_tool_outcome(
+                        &mut env, call, *tier, output, exit_code, audit_sink, emit,
+                    )?;
+                }
+                idx = end;
+                continue;
+            }
+        }
+
+        let (call, tier) = planned[idx].clone();
+        idx += 1;
         if tier == Tier::Deny {
             if interactive {
                 control.begin_approval(&call.id);
@@ -295,10 +360,10 @@ pub fn run_turn_live(
                     reason: "awaiting_approval",
                     text: String::new(),
                     applied_steering,
-                    deferred_calls: iter.collect(),
+                    deferred_calls: planned[idx..].to_vec(),
                 });
             };
-            if allow && remember && call.name == "bash" {
+            if allow && remember && matches!(call.name.as_str(), "bash" | "task") {
                 let cmd = call
                     .args
                     .get("command")
@@ -337,6 +402,7 @@ pub fn run_turn_live(
         execute_recorded_call(
             ExecEnv {
                 tools,
+                guard,
                 record,
                 messages,
                 control,

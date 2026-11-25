@@ -2,7 +2,8 @@
 //!
 //! Discovers `mcpServers` from `<worktree>/.twig/mcp.json` and
 //! `~/.config/twig/mcp.json` (project overrides global), spawns servers lazily
-//! on first inspection or call, and cleans up child processes on drop.
+//! on first inspection or call, supports tools, prompts (Skills over MCP), and
+//! resources, and cleans up child processes on drop.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -37,6 +38,17 @@ struct McpProcess {
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     tools: Vec<Value>,
+    prompts: Vec<Value>,
+    resources: Vec<Value>,
+}
+
+fn clip_mcp_text(text: String) -> String {
+    if text.len() > MAX_MCP_OUTPUT_BYTES {
+        let clipped: String = text.chars().take(MAX_MCP_OUTPUT_BYTES).collect();
+        format!("{clipped}\n... [mcp output truncated]")
+    } else {
+        text
+    }
 }
 
 impl McpProcess {
@@ -58,6 +70,8 @@ impl McpProcess {
             stdout,
             next_id: 0,
             tools: Vec::new(),
+            prompts: Vec::new(),
+            resources: Vec::new(),
         };
         let _ = proc.request(
             "initialize",
@@ -68,8 +82,21 @@ impl McpProcess {
             }),
         )?;
         proc.notify("notifications/initialized", json!({}))?;
-        let listed = proc.request("tools/list", json!({}))?;
-        proc.tools = listed["tools"].as_array().cloned().unwrap_or_default();
+        proc.tools = proc
+            .request("tools/list", json!({}))
+            .ok()
+            .and_then(|v| v["tools"].as_array().cloned())
+            .unwrap_or_default();
+        proc.prompts = proc
+            .request("prompts/list", json!({}))
+            .ok()
+            .and_then(|v| v["prompts"].as_array().cloned())
+            .unwrap_or_default();
+        proc.resources = proc
+            .request("resources/list", json!({}))
+            .ok()
+            .and_then(|v| v["resources"].as_array().cloned())
+            .unwrap_or_default();
         Ok(proc)
     }
 
@@ -124,6 +151,33 @@ impl McpProcess {
             .collect()
     }
 
+    fn prompt_summaries(&self) -> Vec<Value> {
+        self.prompts
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p["name"].as_str().unwrap_or(""),
+                    "description": p["description"].as_str().unwrap_or(""),
+                    "arguments": p["arguments"]
+                })
+            })
+            .collect()
+    }
+
+    fn resource_summaries(&self) -> Vec<Value> {
+        self.resources
+            .iter()
+            .map(|r| {
+                json!({
+                    "uri": r["uri"].as_str().unwrap_or(""),
+                    "name": r["name"].as_str().unwrap_or(""),
+                    "description": r["description"].as_str().unwrap_or(""),
+                    "mimeType": r["mimeType"]
+                })
+            })
+            .collect()
+    }
+
     fn tool_schemas_json(&self) -> String {
         let summary: Vec<Value> = self
             .tools
@@ -137,6 +191,87 @@ impl McpProcess {
             })
             .collect();
         serde_json::to_string_pretty(&summary).unwrap_or_default()
+    }
+
+    fn prompts_json(&self) -> String {
+        serde_json::to_string_pretty(&self.prompt_summaries()).unwrap_or_default()
+    }
+
+    fn resources_json(&self) -> String {
+        serde_json::to_string_pretty(&self.resource_summaries()).unwrap_or_default()
+    }
+
+    fn call_tool(&mut self, tool: &str, arguments: Value) -> Result<String, String> {
+        let res = self.request("tools/call", json!({"name": tool, "arguments": arguments}))?;
+        let text = if let Some(items) = res["content"].as_array() {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|c| c["text"].as_str().map(str::to_owned))
+                .collect();
+            if parts.is_empty() {
+                res.to_string()
+            } else {
+                parts.join("\n")
+            }
+        } else {
+            res.to_string()
+        };
+        Ok(clip_mcp_text(text))
+    }
+
+    fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<String, String> {
+        if name.trim().is_empty() {
+            return Err("get_prompt requires a prompt name".into());
+        }
+        let res = self.request("prompts/get", json!({"name": name, "arguments": arguments}))?;
+        let mut out = String::new();
+        if let Some(desc) = res["description"].as_str().filter(|s| !s.is_empty()) {
+            out.push_str(desc);
+            out.push_str("\n\n");
+        }
+        if let Some(msgs) = res["messages"].as_array() {
+            for m in msgs {
+                let role = m["role"].as_str().unwrap_or("user");
+                let text = m["content"]["text"]
+                    .as_str()
+                    .or_else(|| m["content"].as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| m["content"].to_string());
+                out.push_str(&format!("[{role}]\n{text}\n\n"));
+            }
+        }
+        let body = if out.trim().is_empty() {
+            res.to_string()
+        } else {
+            out.trim_end().to_owned()
+        };
+        Ok(clip_mcp_text(body))
+    }
+
+    fn read_resource(&mut self, uri: &str) -> Result<String, String> {
+        if uri.trim().is_empty() {
+            return Err("read_resource requires a resource uri".into());
+        }
+        let res = self.request("resources/read", json!({"uri": uri}))?;
+        let text = if let Some(items) = res["contents"].as_array() {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|c| {
+                    c["text"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| c["blob"].as_str().map(|b| format!("[base64 blob, {} bytes]", b.len())))
+                })
+                .collect();
+            if parts.is_empty() {
+                res.to_string()
+            } else {
+                parts.join("\n")
+            }
+        } else {
+            res.to_string()
+        };
+        Ok(clip_mcp_text(text))
     }
 }
 
@@ -206,7 +341,15 @@ impl McpRegistry {
             match self.ensure_live(&name) {
                 Ok(proc) => {
                     let tools = proc.tool_summaries();
-                    out.push(json!({"server": name, "ok": true, "tools": tools}));
+                    let prompts = proc.prompt_summaries();
+                    let resources = proc.resource_summaries();
+                    out.push(json!({
+                        "server": name,
+                        "ok": true,
+                        "tools": tools,
+                        "prompts": prompts,
+                        "resources": resources
+                    }));
                 }
                 Err(e) => out.push(json!({"server": name, "ok": false, "error": e})),
             }
@@ -214,31 +357,30 @@ impl McpRegistry {
         json!({"servers": out})
     }
 
-    pub fn call(&mut self, server: &str, tool: &str, arguments: Value) -> Result<String, String> {
-        if tool.trim().is_empty() {
-            let proc = self.ensure_live(server)?;
-            return Ok(proc.tool_schemas_json());
-        }
+    pub fn invoke(
+        &mut self,
+        server: &str,
+        action: &str,
+        target: &str,
+        arguments: Value,
+    ) -> Result<String, String> {
         let proc = self.ensure_live(server)?;
-        let res = proc.request("tools/call", json!({"name": tool, "arguments": arguments}))?;
-        let text = if let Some(items) = res["content"].as_array() {
-            let parts: Vec<String> = items
-                .iter()
-                .filter_map(|c| c["text"].as_str().map(str::to_owned))
-                .collect();
-            if parts.is_empty() {
-                res.to_string()
-            } else {
-                parts.join("\n")
+        match action {
+            "tools" => Ok(proc.tool_schemas_json()),
+            "prompts" => Ok(proc.prompts_json()),
+            "get_prompt" => proc.get_prompt(target, arguments),
+            "resources" => Ok(proc.resources_json()),
+            "read_resource" => proc.read_resource(target),
+            "call" | "" => {
+                if target.trim().is_empty() {
+                    Ok(proc.tool_schemas_json())
+                } else {
+                    proc.call_tool(target, arguments)
+                }
             }
-        } else {
-            res.to_string()
-        };
-        if text.len() > MAX_MCP_OUTPUT_BYTES {
-            let clipped: String = text.chars().take(MAX_MCP_OUTPUT_BYTES).collect();
-            Ok(format!("{clipped}\n... [mcp output truncated]"))
-        } else {
-            Ok(text)
+            other => Err(format!(
+                "unknown mcp action {other:?}; expected call, tools, prompts, get_prompt, resources, or read_resource"
+            )),
         }
     }
 }
@@ -248,17 +390,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_project_mcp_json_servers() {
+    fn discovers_project_mcp_json_servers_and_handles_tools_prompts_resources() {
         let dir = std::env::temp_dir().join(format!("twig-mcp-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".twig")).unwrap();
-        std::fs::write(
-            dir.join(".twig/mcp.json"),
-            r#"{"mcpServers":{"demo":{"command":"echo","args":["hi"]}}}"#,
-        )
-        .unwrap();
-        let reg = McpRegistry::discover(&dir).unwrap();
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{}}}\n' ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo text","inputSchema":{"type":"object"}}]}}\n' ;;
+    *'"method":"prompts/list"'*)
+      printf '{"jsonrpc":"2.0","id":3,"result":{"prompts":[{"name":"review-skill","description":"Review checklist"}]}}\n' ;;
+    *'"method":"resources/list"'*)
+      printf '{"jsonrpc":"2.0","id":4,"result":{"resources":[{"uri":"mem://guide","name":"Guide","mimeType":"text/plain"}]}}\n' ;;
+    *'"method":"prompts/get"'*)
+      printf '{"jsonrpc":"2.0","id":5,"result":{"description":"Skill body","messages":[{"role":"user","content":{"type":"text","text":"Check edge cases"}}]}}\n' ;;
+    *'"method":"resources/read"'*)
+      printf '{"jsonrpc":"2.0","id":6,"result":{"contents":[{"uri":"mem://guide","text":"Always verify tests."}]}}\n' ;;
+  esac
+done
+"#;
+        let cfg = json!({
+            "mcpServers": {
+                "demo": {"command": "sh", "args": ["-c", script]}
+            }
+        });
+        std::fs::write(dir.join(".twig/mcp.json"), cfg.to_string()).unwrap();
+
+        let mut reg = McpRegistry::discover(&dir).unwrap();
         assert!(reg.server_names_summary().contains("demo"));
+        let report = reg.list_report();
+        let srv = &report["servers"][0];
+        assert_eq!(srv["ok"], true);
+        assert_eq!(srv["tools"][0]["name"], "echo");
+        assert_eq!(srv["prompts"][0]["name"], "review-skill");
+        assert_eq!(srv["resources"][0]["uri"], "mem://guide");
+
+        let prompt = reg
+            .invoke("demo", "get_prompt", "review-skill", json!({}))
+            .unwrap();
+        assert!(prompt.contains("Check edge cases"), "{prompt}");
+
+        let res = reg
+            .invoke("demo", "read_resource", "mem://guide", json!({}))
+            .unwrap();
+        assert!(res.contains("Always verify tests."), "{res}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,7 +14,6 @@ mod transcript;
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -31,13 +30,13 @@ use ratatui::{Frame, Terminal};
 use serde_json::{json, Value};
 
 use self::client::{
-    archive_session_file, chat_plain, copy_to_clipboard, detect_git_branch,
+    archive_session_file, build_turn_params, chat_plain, copy_to_clipboard, detect_git_branch,
     edit_file_in_external_editor, edit_in_external_editor, ensure_memory_file,
-    extract_inline_images, fetch_magpie_models, format_config_report, format_init_report,
-    format_mcp_report, format_verify_report, init_project_files, list_sessions,
-    load_image_data_url, notify_osc99, paste_clipboard_image, read_memory_preview, run_doctor,
-    run_git_diff, run_independent_review, run_local_shell, shorten_home, write_export_file,
-    ServeClient, ServerMsg, TerminalGuard,
+    format_config_report, format_init_report, format_mcp_report, format_skills_notice,
+    format_tasks_report, format_verify_report, init_project_files, list_sessions,
+    load_image_data_url, notify_osc99, paste_clipboard_image, read_memory_preview, run_git_diff,
+    shorten_home, write_export_file, LocalMsg, LocalWorkers, ServeClient, ServerMsg,
+    TerminalGuard, EVOLVE_PROMPT,
 };
 use self::composer::{parse_slash, Composer, SlashCommand};
 use self::markdown::{
@@ -69,18 +68,6 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
     run_tui(repo, resume)
 }
 
-enum LocalMsg {
-    Shell {
-        id: String,
-        output: String,
-        exit_code: Option<i32>,
-        elapsed: Duration,
-    },
-    Review(Result<String, String>),
-    Doctor(Result<(String, bool), String>),
-    Models(Result<Vec<String>, String>),
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
@@ -109,6 +96,8 @@ struct App {
     repo_path: String,
     repo_label: String,
     git_branch: Option<String>,
+    git_stat: Option<(usize, usize)>,
+    git_stat_dirty: bool,
     sid: String,
     title: Option<String>,
     model: String,
@@ -135,7 +124,10 @@ struct App {
     undo_req: Option<u64>,
     fork_req: Option<u64>,
     rewind_req: Option<u64>,
+    rewind_prefill: Option<String>,
     mcp_req: Option<u64>,
+    tasks_req: Option<u64>,
+    running_tasks: usize,
     todos: Vec<TodoEntry>,
     pending_images: Vec<(String, String)>,
     transcript: Transcript,
@@ -169,6 +161,8 @@ impl App {
             repo_path,
             repo_label,
             git_branch: detect_git_branch(repo),
+            git_stat: None,
+            git_stat_dirty: true,
             sid: String::new(),
             title: None,
             model: std::env::var("TWIG_MODEL")
@@ -198,7 +192,10 @@ impl App {
             undo_req: None,
             fork_req: None,
             rewind_req: None,
+            rewind_prefill: None,
             mcp_req: None,
+            tasks_req: None,
+            running_tasks: 0,
             todos: Vec::new(),
             pending_images: Vec::new(),
             transcript: Transcript::new(),
@@ -236,7 +233,10 @@ impl App {
         self.undo_req = None;
         self.fork_req = None;
         self.rewind_req = None;
+        self.rewind_prefill = None;
         self.mcp_req = None;
+        self.tasks_req = None;
+        self.running_tasks = 0;
         self.todos.clear();
         self.pending_images.clear();
         self.transcript.clear();
@@ -325,6 +325,9 @@ impl App {
                 if let Some(items) = result.get("todos").and_then(Value::as_array) {
                     self.todos = parse_todos(items);
                 }
+                if let Some(rt) = result.get("running_tasks").and_then(Value::as_u64) {
+                    self.running_tasks = rt as usize;
+                }
                 if let Some(cb) = result.get("context_bytes").and_then(Value::as_u64) {
                     self.context_bytes = cb as usize;
                 }
@@ -363,6 +366,7 @@ impl App {
                 }
                 if self.undo_req == Some(id) {
                     self.undo_req = None;
+                    self.git_stat_dirty = true;
                     if let Some(summary) = result.get("summary").and_then(Value::as_str) {
                         self.flash(summary);
                         self.transcript
@@ -377,6 +381,9 @@ impl App {
                         self.transcript.replay_history(messages);
                     }
                     self.approvals.clear();
+                    if let Some(prefill) = self.rewind_prefill.take() {
+                        self.composer.set(&prefill);
+                    }
                     self.flash(format!("Rewound {n} turn(s)"));
                     self.transcript.push_notice(
                         NoticeKind::Success,
@@ -391,6 +398,20 @@ impl App {
                     } else {
                         self.transcript
                             .push_notice(NoticeKind::Playbook, "configured MCP servers");
+                        self.transcript.push_assistant(report);
+                    }
+                }
+                if self.tasks_req == Some(id) {
+                    self.tasks_req = None;
+                    if let Some(r) = result.get("running").and_then(Value::as_u64) {
+                        self.running_tasks = r as usize;
+                    }
+                    let report = format_tasks_report(&result);
+                    if report.starts_with("no background") {
+                        self.transcript.push_notice(NoticeKind::Info, report);
+                    } else {
+                        self.transcript
+                            .push_notice(NoticeKind::Playbook, "background tasks");
                         self.transcript.push_assistant(report);
                     }
                 }
@@ -412,6 +433,7 @@ impl App {
                     self.run_started = None;
                     self.last_delta_at = None;
                     self.active_turn_req = None;
+                    self.git_stat_dirty = true;
                     if let Some(reason) = result.get("reason").and_then(Value::as_str) {
                         if reason != "final" {
                             self.transcript.push_notice(
@@ -465,68 +487,38 @@ impl App {
 
     fn apply_local_msg(&mut self, msg: LocalMsg) {
         match msg {
-            LocalMsg::Shell {
-                id,
-                output,
-                exit_code,
-                elapsed,
-            } => {
-                self.transcript
-                    .finish_tool(&id, Some(output), exit_code, Some(elapsed));
+            LocalMsg::Shell { id, output, exit_code, elapsed } => {
+                self.transcript.finish_tool(&id, Some(output), exit_code, Some(elapsed));
                 self.transcript.follow_tail();
+                self.git_stat_dirty = true;
             }
-            LocalMsg::Review(res) => match res {
-                Ok(text) => {
-                    self.transcript
-                        .push_notice(NoticeKind::Success, "independent review completed");
-                    self.transcript.push_assistant(text);
+            LocalMsg::Review(Ok(text)) => {
+                self.transcript.push_notice(NoticeKind::Success, "independent review completed");
+                self.transcript.push_assistant(text);
+            }
+            LocalMsg::Review(Err(e)) => self.transcript.push_notice(NoticeKind::Error, format!("review: {e}")),
+            LocalMsg::Doctor(Ok((output, ok))) => {
+                self.transcript.push_notice(
+                    if ok { NoticeKind::Success } else { NoticeKind::Warn },
+                    if ok { "twig doctor: all checks passed" } else { "twig doctor reported issues" },
+                );
+                if !output.is_empty() {
+                    self.transcript.push_assistant(format!("```text\n{output}\n```"));
                 }
-                Err(e) => self
-                    .transcript
-                    .push_notice(NoticeKind::Error, format!("review: {e}")),
-            },
-            LocalMsg::Doctor(res) => match res {
-                Ok((output, ok)) => {
-                    self.transcript.push_notice(
-                        if ok {
-                            NoticeKind::Success
-                        } else {
-                            NoticeKind::Warn
-                        },
-                        if ok {
-                            "twig doctor: all checks passed"
-                        } else {
-                            "twig doctor reported issues"
-                        },
-                    );
-                    if !output.is_empty() {
-                        self.transcript
-                            .push_assistant(format!("```text\n{output}\n```"));
-                    }
-                }
-                Err(e) => self
-                    .transcript
-                    .push_notice(NoticeKind::Error, format!("doctor: {e}")),
-            },
-            LocalMsg::Models(res) => match res {
-                Ok(models) if !models.is_empty() => {
-                    self.overlay_picker = Some(OverlayPicker::model(models, self.model.clone()));
-                }
-                Ok(_) => self.transcript.push_notice(
-                    NoticeKind::Info,
-                    format!(
-                        "active model: {} (magpie returned no model list; use `/model <name>` or `/model reset`)",
-                        self.model
-                    ),
-                ),
-                Err(e) => self.transcript.push_notice(
-                    NoticeKind::Warn,
-                    format!(
-                        "active model: {} (could not fetch magpie models: {e}; use `/model <name>`)",
-                        self.model
-                    ),
-                ),
-            },
+            }
+            LocalMsg::Doctor(Err(e)) => self.transcript.push_notice(NoticeKind::Error, format!("doctor: {e}")),
+            LocalMsg::Models(Ok(models)) if !models.is_empty() => {
+                self.overlay_picker = Some(OverlayPicker::model(models, self.model.clone()));
+            }
+            LocalMsg::Models(Ok(_)) => self.transcript.push_notice(
+                NoticeKind::Info,
+                format!("active model: {} (magpie returned no model list; use `/model <name>` or `/model reset`)", self.model),
+            ),
+            LocalMsg::Models(Err(e)) => self.transcript.push_notice(
+                NoticeKind::Warn,
+                format!("active model: {} (could not fetch magpie models: {e}; use `/model <name>`)", self.model),
+            ),
+            LocalMsg::GitStat(stat) => self.git_stat = stat,
         }
     }
 
@@ -611,30 +603,25 @@ impl App {
                 let allow = ev["allow"] == true;
                 self.approvals.resolve_id(id);
                 self.transcript.push_notice(
-                    if allow {
-                        NoticeKind::Success
-                    } else {
-                        NoticeKind::Warn
-                    },
-                    format!(
-                        "approval {id}: {}",
-                        if allow { "approved" } else { "denied" }
-                    ),
+                    if allow { NoticeKind::Success } else { NoticeKind::Warn },
+                    format!("approval {id}: {}", if allow { "approved" } else { "denied" }),
                 );
             }
             Some("playbook.selected") => {
                 if let Some(name) = ev["name"].as_str() {
                     self.playbook = Some(name.to_owned());
-                    self.transcript
-                        .push_notice(NoticeKind::Playbook, format!("playbook routed · {name}"));
+                    self.transcript.push_notice(NoticeKind::Playbook, format!("playbook routed · {name}"));
                 }
             }
             Some("guard.tripped") => {
                 if let Some(level) = ev["level"].as_str() {
                     self.guard_level = Some(level.to_owned());
-                    self.transcript
-                        .push_notice(NoticeKind::Warn, format!("guard tripped · {level}"));
+                    self.transcript.push_notice(NoticeKind::Warn, format!("guard tripped · {level}"));
                 }
+            }
+            Some("guard.repetition") => {
+                let tool = ev["tool"].as_str().unwrap_or("tool");
+                self.transcript.push_notice(NoticeKind::Warn, format!("loop-breaker: nudged agent after repeated failing `{tool}` call"));
             }
             Some("mode.changed") => {
                 if let Some(plan) = ev["plan"].as_bool() {
@@ -648,19 +635,20 @@ impl App {
             }
             Some("policy.allowed") => {
                 if let Some(pat) = ev["pattern"].as_str() {
-                    self.transcript.push_notice(
-                        NoticeKind::Success,
-                        format!("session rule added: always allow `{pat}`"),
-                    );
+                    self.transcript.push_notice(NoticeKind::Success, format!("session rule added: always allow `{pat}`"));
                 }
             }
             Some("subagent.started") => {
                 let role = ev["role"].as_str().unwrap_or("subagent");
                 let task = ev["task"].as_str().unwrap_or("");
+                let parallel = if ev["parallel"] == true { " parallel" } else { "" };
                 self.update_status_header(format!("Subagent [{role}]"));
                 self.transcript.push_notice(
                     NoticeKind::Playbook,
-                    format!("subagent[{role}] started · {}", task.chars().take(68).collect::<String>()),
+                    format!(
+                        "subagent[{role}{parallel}] started · {}",
+                        task.chars().take(64).collect::<String>()
+                    ),
                 );
             }
             Some("subagent.completed") => {
@@ -676,6 +664,24 @@ impl App {
                     ),
                 );
             }
+            Some("task.started") => {
+                let id = ev["id"].as_str().unwrap_or("bg");
+                let cmd = ev["command"].as_str().unwrap_or("");
+                self.running_tasks = ev["running"].as_u64().unwrap_or(1) as usize;
+                self.transcript.push_notice(
+                    NoticeKind::Info,
+                    format!("task {id} started · {}", cmd.chars().take(60).collect::<String>()),
+                );
+            }
+            Some("task.completed") => {
+                let id = ev["id"].as_str().unwrap_or("bg");
+                let status = ev["status"].as_str().unwrap_or("done");
+                self.running_tasks = ev["running"].as_u64().unwrap_or(0) as usize;
+                self.transcript.push_notice(
+                    if status == "completed" { NoticeKind::Success } else { NoticeKind::Warn },
+                    format!("task {id} {status}"),
+                );
+            }
             Some("context.compacted") => {
                 let removed = ev["compaction"]["removed_messages"].as_u64().unwrap_or(0);
                 self.transcript.push_notice(
@@ -686,30 +692,15 @@ impl App {
             Some("verify.completed") => {
                 let passed = ev["verdict"]["passed"] == true;
                 self.transcript.push_notice(
-                    if passed {
-                        NoticeKind::Success
-                    } else {
-                        NoticeKind::Error
-                    },
-                    if passed {
-                        "external check passed"
-                    } else {
-                        "external check failed — returning evidence to agent"
-                    },
+                    if passed { NoticeKind::Success } else { NoticeKind::Error },
+                    if passed { "external check passed" } else { "external check failed — returning evidence to agent" },
                 );
             }
-            Some("verify.passed") => {
-                self.transcript
-                    .push_notice(NoticeKind::Success, "differential verification passed");
-            }
-            Some("verify.failed") => {
-                self.transcript
-                    .push_notice(NoticeKind::Error, "differential verification failed");
-            }
+            Some("verify.passed") => self.transcript.push_notice(NoticeKind::Success, "differential verification passed"),
+            Some("verify.failed") => self.transcript.push_notice(NoticeKind::Error, "differential verification failed"),
             Some("papercut.filed") => {
                 let comp = ev["report"]["component"].as_str().unwrap_or("harness");
-                self.transcript
-                    .push_notice(NoticeKind::Info, format!("papercut filed · {comp}"));
+                self.transcript.push_notice(NoticeKind::Info, format!("papercut filed · {comp}"));
             }
             _ => {}
         }
@@ -761,6 +752,10 @@ impl App {
                     };
                 }
                 KeyCode::Char('m' | 'M') => return Action::ToggleMouse,
+                KeyCode::Char('v' | 'V') => {
+                    self.attach_image(None);
+                    return Action::None;
+                }
                 _ => {}
             }
         }
@@ -807,6 +802,15 @@ impl App {
                     self.transcript.search_toggle();
                     return Action::None;
                 }
+                KeyCode::Char('r') => {
+                    let hist = self.composer.history();
+                    if hist.is_empty() {
+                        self.flash("Prompt history is empty");
+                    } else {
+                        self.overlay_picker = Some(OverlayPicker::history(hist));
+                    }
+                    return Action::None;
+                }
                 KeyCode::Char('g') => return Action::OpenEditor,
                 KeyCode::Char('l') => {
                     self.transcript.clear();
@@ -838,6 +842,20 @@ impl App {
                 PickerOutcome::SelectEffort(level) => {
                     self.overlay_picker = None;
                     Action::SetEffort(level)
+                }
+                PickerOutcome::RewindTo { turns_back, prompt } => {
+                    self.overlay_picker = None;
+                    self.rewind_prefill = Some(prompt);
+                    Action::Slash(SlashCommand::RewindSession(turns_back))
+                }
+                PickerOutcome::ForkSession => {
+                    self.overlay_picker = None;
+                    Action::Slash(SlashCommand::ForkSession)
+                }
+                PickerOutcome::FillComposer(entry) => {
+                    self.overlay_picker = None;
+                    self.composer.set(&entry);
+                    Action::None
                 }
             };
         }
@@ -921,6 +939,18 @@ impl App {
                     } else {
                         self.set_footer_mode(FooterMode::EscHint);
                     }
+                } else {
+                    let turns = self.transcript.user_turns();
+                    if !turns.is_empty() {
+                        if self.footer_mode == FooterMode::RewindHint
+                            && self.footer_mode_at.elapsed() < Duration::from_secs(2)
+                        {
+                            self.set_footer_mode(FooterMode::Contextual);
+                            self.overlay_picker = Some(OverlayPicker::rewind(turns));
+                        } else {
+                            self.set_footer_mode(FooterMode::RewindHint);
+                        }
+                    }
                 }
                 return Action::None;
             }
@@ -951,6 +981,38 @@ impl App {
             MouseEventKind::ScrollUp => self.transcript.scroll_by(-4),
             MouseEventKind::ScrollDown => self.transcript.scroll_by(4),
             _ => {}
+        }
+    }
+
+    fn attach_image(&mut self, opt_path: Option<&str>) {
+        let loaded = match opt_path {
+            Some(p) => load_image_data_url(&self.repo_raw, p).map(Some),
+            None => paste_clipboard_image(),
+        };
+        match loaded {
+            Ok(Some((label, url))) => {
+                self.pending_images.push((label.clone(), url));
+                self.flash(format!("Attached image: {label}"));
+                self.transcript.push_notice(
+                    NoticeKind::Success,
+                    format!("attached image `{label}` (will send with next message)"),
+                );
+            }
+            Ok(None) => self.transcript.push_notice(
+                NoticeKind::Info,
+                "no image in clipboard — pass `/image path/to/file.png` or `@file.png`",
+            ),
+            Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+        }
+    }
+
+    fn open_rewind_picker(&mut self) {
+        let turns = self.transcript.user_turns();
+        if turns.is_empty() {
+            self.transcript
+                .push_notice(NoticeKind::Info, "no user turns in this session to rewind");
+        } else {
+            self.overlay_picker = Some(OverlayPicker::rewind(turns));
         }
     }
 
@@ -1002,27 +1064,28 @@ impl App {
                     }
                     Action::None
                 }
-                SlashCommand::AttachImage(opt_path) => {
-                    let loaded = match opt_path {
-                        Some(p) => load_image_data_url(&self.repo_raw, &p).map(Some),
-                        None => paste_clipboard_image(),
-                    };
-                    match loaded {
-                        Ok(Some((label, url))) => {
-                            self.pending_images.push((label.clone(), url));
-                            self.flash(format!("Attached image: {label}"));
-                            self.transcript.push_notice(
-                                NoticeKind::Success,
-                                format!("attached image `{label}` (will send with next message)"),
-                            );
-                        }
-                        Ok(None) => self.transcript.push_notice(
-                            NoticeKind::Info,
-                            "no image in clipboard — pass `/image path/to/file.png` or `@file.png`",
-                        ),
-                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                    }
+                SlashCommand::OpenRewindPicker => {
+                    self.open_rewind_picker();
                     Action::None
+                }
+                SlashCommand::AttachImage(opt_path) => {
+                    self.attach_image(opt_path.as_deref());
+                    Action::None
+                }
+                SlashCommand::EvolveSession => {
+                    if self.running {
+                        self.flash("Wait for the active turn to finish before running /evolve");
+                        Action::None
+                    } else {
+                        self.transcript.push_notice(
+                            NoticeKind::Playbook,
+                            "evolve: requesting human-reviewed .twig/preferences or skill proposal…",
+                        );
+                        self.running = true;
+                        self.run_started = Some(Instant::now());
+                        self.update_status_header(String::from("Reflecting"));
+                        Action::SendTurn(EVOLVE_PROMPT.to_owned())
+                    }
                 }
                 SlashCommand::ClearImages => {
                     self.pending_images.clear();
@@ -1030,49 +1093,26 @@ impl App {
                     Action::None
                 }
                 SlashCommand::ShowSkills => {
-                    let books = if self.playbooks_meta.is_empty() {
-                        "bug-fix, feature, autonomous-run".to_owned()
-                    } else {
-                        self.playbooks_meta.join(", ")
-                    };
-                    let skills = if self.skills_meta.trim().is_empty() {
-                        "none in .twig/skills or ~/.config/twig/skills".to_owned()
-                    } else {
-                        self.skills_meta.clone()
-                    };
                     self.transcript.push_notice(
                         NoticeKind::Playbook,
-                        format!("playbooks: {books} · skills: {skills}"),
+                        format_skills_notice(&self.playbooks_meta, &self.skills_meta),
                     );
                     Action::None
                 }
                 SlashCommand::ShowMemory => {
                     match read_memory_preview(&self.repo_raw) {
                         Ok(Some(body)) if !body.trim().is_empty() => {
-                            self.transcript.push_notice(
-                                NoticeKind::Info,
-                                "project memory (.twig/preferences.md)",
-                            );
+                            self.transcript.push_notice(NoticeKind::Info, "project memory (.twig/preferences.md)");
                             self.transcript.push_assistant(body);
                         }
-                        Ok(Some(_)) => self
-                            .transcript
-                            .push_notice(NoticeKind::Info, ".twig/preferences.md is empty"),
-                        Ok(None) => self.transcript.push_notice(
-                            NoticeKind::Info,
-                            "no .twig/preferences.md yet — run /memory or /init",
-                        ),
+                        Ok(Some(_)) => self.transcript.push_notice(NoticeKind::Info, ".twig/preferences.md is empty"),
+                        Ok(None) => self.transcript.push_notice(NoticeKind::Info, "no .twig/preferences.md yet — run /memory or /init"),
                         Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                     }
                     Action::None
                 }
                 SlashCommand::ShowStatus => {
-                    let msg = format_status_notice(
-                        &self.footer_view(None, ""),
-                        self.turns_used,
-                        self.context_bytes,
-                        self.context_max,
-                    );
+                    let msg = format_status_notice(&self.footer_view(None, ""), self.turns_used, self.context_bytes, self.context_max);
                     self.transcript.push_notice(NoticeKind::Info, msg);
                     Action::None
                 }
@@ -1083,32 +1123,14 @@ impl App {
                     }
                     Action::None
                 }
-                SlashCommand::ToggleExpand => {
-                    self.transcript.toggle_expand();
-                    Action::None
-                }
-                SlashCommand::OpenFind(q) => {
-                    self.transcript.search_open_with(&q);
-                    Action::None
-                }
+                SlashCommand::ToggleExpand => { self.transcript.toggle_expand(); Action::None }
+                SlashCommand::OpenFind(q) => { self.transcript.search_open_with(&q); Action::None }
                 SlashCommand::CopyCode => match self.transcript.copy_latest_code_block() {
-                    Ok((text, msg)) => {
-                        self.flash(msg);
-                        Action::CopyCode(text)
-                    }
-                    Err(e) => {
-                        self.flash(e);
-                        Action::None
-                    }
+                    Ok((text, msg)) => { self.flash(msg); Action::CopyCode(text) }
+                    Err(e) => { self.flash(e); Action::None }
                 },
-                SlashCommand::ClearTranscript => {
-                    self.transcript.clear();
-                    Action::None
-                }
-                SlashCommand::ShowHelp => {
-                    self.set_footer_mode(FooterMode::ShortcutOverlay);
-                    Action::None
-                }
+                SlashCommand::ClearTranscript => { self.transcript.clear(); Action::None }
+                SlashCommand::ShowHelp => { self.set_footer_mode(FooterMode::ShortcutOverlay); Action::None }
                 other => Action::Slash(other),
             };
         }
@@ -1137,12 +1159,14 @@ impl App {
             flash,
             repo_label: &self.repo_label,
             git_branch: self.git_branch.as_deref(),
+            git_stat: self.git_stat,
             model: &self.model,
             effort: self.effort.as_deref(),
             title: self.title.as_deref(),
             sid: &self.sid,
             plan_mode: self.plan_mode,
             pending_images: self.pending_images.len(),
+            running_tasks: self.running_tasks,
             context_pct: self.context_pct(),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
@@ -1157,7 +1181,10 @@ impl App {
     fn footer_height(&self) -> u16 {
         match self.footer_mode {
             FooterMode::ShortcutOverlay => 5,
-            FooterMode::Contextual | FooterMode::QuitReminder | FooterMode::EscHint => 1,
+            FooterMode::Contextual
+            | FooterMode::QuitReminder
+            | FooterMode::EscHint
+            | FooterMode::RewindHint => 1,
         }
     }
 
@@ -1169,7 +1196,7 @@ impl App {
         self.sync_status_header();
         if matches!(
             self.footer_mode,
-            FooterMode::QuitReminder | FooterMode::EscHint
+            FooterMode::QuitReminder | FooterMode::EscHint | FooterMode::RewindHint
         ) && self.footer_mode_at.elapsed() >= Duration::from_millis(2500)
         {
             self.footer_mode = FooterMode::Contextual;
@@ -1355,12 +1382,39 @@ impl App {
         }
     }
 
+    fn send_rpc(
+        &mut self,
+        client: &mut ServeClient,
+        method: &str,
+        params: Value,
+        flash: &str,
+    ) -> Option<u64> {
+        match client.send(method, params) {
+            Ok(id) => {
+                if !flash.is_empty() {
+                    self.flash(flash);
+                }
+                Some(id)
+            }
+            Err(e) => {
+                self.transcript.push_notice(NoticeKind::Error, e);
+                None
+            }
+        }
+    }
+
+    fn maybe_refresh_git_stat(&mut self, workers: &LocalWorkers) {
+        if self.git_stat_dirty {
+            self.git_stat_dirty = false;
+            workers.spawn_git_stat(self.repo_raw.clone());
+        }
+    }
+
     fn run_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         client: &mut ServeClient,
-        local_tx: &Sender<LocalMsg>,
-        local_rx: &Receiver<LocalMsg>,
+        workers: &LocalWorkers,
     ) -> Result<bool, String> {
         loop {
             while let Some(msg) = client.try_recv() {
@@ -1379,9 +1433,10 @@ impl App {
                 }
                 self.apply_server_msg(msg);
             }
-            while let Ok(msg) = local_rx.try_recv() {
+            while let Some(msg) = workers.try_recv() {
                 self.apply_local_msg(msg);
             }
+            self.maybe_refresh_git_stat(workers);
             if let Some((title, body)) = self.pending_notify.take() {
                 notify_osc99(&title, &body);
             }
@@ -1395,328 +1450,12 @@ impl App {
                 loop {
                     match event::read().map_err(|e| e.to_string())? {
                         Event::Paste(data) => self.handle_paste(&data),
-                        Event::Key(key) => match self.handle_key(key) {
-                            Action::None => {}
-                            Action::SendTurn(text) => {
-                                let mut imgs = std::mem::take(&mut self.pending_images);
-                                imgs.extend(extract_inline_images(&self.repo_raw, &text));
-                                let params = if imgs.is_empty() {
-                                    json!({"input": text})
-                                } else {
-                                    let labels: Vec<&str> =
-                                        imgs.iter().map(|(l, _)| l.as_str()).collect();
-                                    self.transcript.push_notice(
-                                        NoticeKind::Info,
-                                        format!("attached images: {}", labels.join(", ")),
-                                    );
-                                    let payload: Vec<Value> = imgs
-                                        .into_iter()
-                                        .map(|(label, url)| json!({"label": label, "url": url}))
-                                        .collect();
-                                    json!({"input": text, "images": payload})
-                                };
-                                match client.send("turn", params) {
-                                    Ok(id) => self.active_turn_req = Some(id),
-                                    Err(e) => {
-                                        self.running = false;
-                                        self.transcript.push_notice(NoticeKind::Error, e);
-                                    }
-                                }
+                        Event::Key(key) => {
+                            let action = self.handle_key(key);
+                            if self.handle_action(action, terminal, client, workers)? {
+                                return Ok(self.running);
                             }
-                            Action::SendSteer(text) => {
-                                if let Err(e) = client.send("steer", json!({"input": text})) {
-                                    self.transcript.push_notice(NoticeKind::Error, e);
-                                }
-                            }
-                            Action::Cancel => {
-                                let _ = client.send("cancel", json!({}));
-                            }
-                            Action::ResolveApproval {
-                                id,
-                                allow,
-                                remember,
-                            } => {
-                                if let Err(e) = client.send(
-                                    "approval.resolve",
-                                    json!({"id": id, "allow": allow, "remember": remember}),
-                                ) {
-                                    self.transcript.push_notice(NoticeKind::Error, e);
-                                }
-                            }
-                            Action::SetPlan(next) => {
-                                match client.send("mode.set", json!({"plan": next})) {
-                                    Ok(_) => {
-                                        self.plan_mode = next;
-                                        let msg = if next {
-                                            "Plan mode ON (read-only · Shift+Tab to exit)"
-                                        } else {
-                                            "Plan mode OFF (full edit access)"
-                                        };
-                                        self.flash(msg);
-                                        self.transcript.push_notice(NoticeKind::Playbook, msg);
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::SetEffort(level) => {
-                                match client.send("effort.set", json!({"effort": level})) {
-                                    Ok(_) => self.flash(format!("Reasoning effort → {level}")),
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::SwitchSession(sid) => {
-                                if self.replace_client(client, Some(&sid)) {
-                                    self.flash(format!("Resumed session {sid}"));
-                                }
-                            }
-                            Action::SetModel(model) => {
-                                match client.send("model.set", json!({"model": model})) {
-                                    Ok(_) => {
-                                        self.flash(format!("Switching model → {model} (saved)"))
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::Slash(cmd) => match cmd {
-                                SlashCommand::NewSession => {
-                                    if self.replace_client(client, None) {
-                                        self.flash("Started new session");
-                                    }
-                                }
-                                SlashCommand::ForkSession => {
-                                    match client.send("session.fork", json!({})) {
-                                        Ok(id) => {
-                                            self.fork_req = Some(id);
-                                            self.flash("Forking session…");
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::RewindSession(turns) => {
-                                    match client.send("session.rewind", json!({"turns": turns})) {
-                                        Ok(id) => {
-                                            self.rewind_req = Some(id);
-                                            self.flash(format!("Rewinding {turns} turn(s)…"));
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::RenameSession(title) => {
-                                    match client.send("session.rename", json!({"title": title})) {
-                                        Ok(_) => {
-                                            self.title = Some(title.clone());
-                                            self.flash(format!("Renamed session → {title}"));
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::ArchiveSession => {
-                                    let old_sid = self.sid.clone();
-                                    if self.replace_client(client, None) {
-                                        match archive_session_file(&old_sid) {
-                                            Ok(dst) => {
-                                                let short: String =
-                                                    old_sid.chars().take(10).collect();
-                                                self.flash(format!("Archived {short}"));
-                                                self.transcript.push_notice(
-                                                    NoticeKind::Success,
-                                                    format!("archived session → {dst}"),
-                                                );
-                                            }
-                                            Err(e) => {
-                                                self.transcript.push_notice(NoticeKind::Warn, e);
-                                            }
-                                        }
-                                    }
-                                }
-                                SlashCommand::OpenModelPicker => {
-                                    self.flash("Fetching models from magpie…");
-                                    let tx = local_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = tx.send(LocalMsg::Models(fetch_magpie_models()));
-                                    });
-                                }
-                                SlashCommand::UndoEdit => {
-                                    match client.send("edit.undo", json!({})) {
-                                        Ok(id) => {
-                                            self.undo_req = Some(id);
-                                            self.flash("Reverting last edit…");
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::ListMcp => match client.send("mcp.list", json!({})) {
-                                    Ok(id) => {
-                                        self.mcp_req = Some(id);
-                                        self.flash("Checking MCP servers…");
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                },
-                                SlashCommand::CompactNow => {
-                                    match client.send("session.compact", json!({})) {
-                                        Ok(_) => self.flash("Compacting context…"),
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::VerifySession => {
-                                    match client.send("session.verify", json!({})) {
-                                        Ok(id) => {
-                                            self.verify_req = Some(id);
-                                            self.flash("Verifying session hash chain…");
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::EditMemory => match ensure_memory_file(&self.repo_raw)
-                                {
-                                    Ok((path, created)) => {
-                                        TerminalGuard::suspend();
-                                        let edited = edit_file_in_external_editor(&path);
-                                        TerminalGuard::resume(self.mouse_enabled)?;
-                                        terminal.clear().map_err(|e| e.to_string())?;
-                                        match edited {
-                                            Ok(lines) => {
-                                                let verb = if created { "Created" } else { "Saved" };
-                                                let msg = format!(
-                                                    "{verb} .twig/preferences.md ({lines} lines) — auto-loaded on next turn"
-                                                );
-                                                self.flash(&msg);
-                                                self.transcript
-                                                    .push_notice(NoticeKind::Success, msg);
-                                            }
-                                            Err(e) => self.flash(format!("Editor failed: {e}")),
-                                        }
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                },
-                                SlashCommand::InitProject => match init_project_files(&self.repo_raw)
-                                {
-                                    Ok((created, existing)) => {
-                                        self.flash("Initialized .twig/");
-                                        self.transcript.push_notice(
-                                            NoticeKind::Success,
-                                            format_init_report(&created, &existing),
-                                        );
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                },
-                                SlashCommand::RunDoctor => {
-                                    self.flash("Running twig doctor…");
-                                    let tx = local_tx.clone();
-                                    let repo = self.repo_raw.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = tx.send(LocalMsg::Doctor(run_doctor(&repo)));
-                                    });
-                                }
-                                SlashCommand::ExportTranscript(custom) => {
-                                    let md = self.transcript.export_markdown(
-                                        &self.sid,
-                                        self.title.as_deref(),
-                                        &self.model,
-                                        &self.repo_path,
-                                    );
-                                    match write_export_file(
-                                        &self.repo_raw,
-                                        &self.sid,
-                                        custom.as_deref(),
-                                        &md,
-                                    ) {
-                                        Ok(pretty) => {
-                                            self.flash("Exported transcript to Markdown");
-                                            self.transcript.push_notice(
-                                                NoticeKind::Success,
-                                                format!(
-                                                    "exported transcript ({} bytes) → {pretty}",
-                                                    md.len()
-                                                ),
-                                            );
-                                        }
-                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                    }
-                                }
-                                SlashCommand::RunDiff => match run_git_diff(&self.repo_raw) {
-                                    Ok(diff) if diff.trim().is_empty() => {
-                                        self.transcript.push_notice(
-                                            NoticeKind::Info,
-                                            "working tree clean — no diff",
-                                        );
-                                    }
-                                    Ok(diff) => {
-                                        let id = format!("diff-{}", self.next_local_id);
-                                        self.next_local_id += 1;
-                                        self.transcript.push_tool_snapshot(
-                                            id,
-                                            "diff".into(),
-                                            "git diff".into(),
-                                            "local".into(),
-                                            diff,
-                                            Some(0),
-                                        );
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                },
-                                SlashCommand::RunReview => {
-                                    self.transcript.push_notice(
-                                        NoticeKind::Playbook,
-                                        "starting independent read-only review on current git diff…",
-                                    );
-                                    self.transcript.follow_tail();
-                                    let tx = local_tx.clone();
-                                    let repo = self.repo_raw.clone();
-                                    std::thread::spawn(move || {
-                                        let _ = tx
-                                            .send(LocalMsg::Review(run_independent_review(&repo)));
-                                    });
-                                }
-                                _ => {}
-                            },
-                            Action::RunLocalShell(cmd) => {
-                                let id = format!("local-{}", self.next_local_id);
-                                self.next_local_id += 1;
-                                self.transcript.push_tool_started(
-                                    id.clone(),
-                                    "bash".into(),
-                                    format!("! {cmd}"),
-                                    "local".into(),
-                                );
-                                let tx = local_tx.clone();
-                                let repo = self.repo_raw.clone();
-                                std::thread::spawn(move || {
-                                    let (output, exit_code, elapsed) = run_local_shell(&repo, &cmd);
-                                    let _ = tx.send(LocalMsg::Shell {
-                                        id,
-                                        output,
-                                        exit_code,
-                                        elapsed,
-                                    });
-                                });
-                            }
-                            Action::ToggleMouse => {
-                                self.mouse_enabled = !self.mouse_enabled;
-                                TerminalGuard::set_mouse(self.mouse_enabled);
-                                self.flash(if self.mouse_enabled {
-                                    "Mouse scroll: on"
-                                } else {
-                                    "Mouse capture off — drag to select text freely (Alt+M to restore)"
-                                });
-                            }
-                            Action::OpenEditor => {
-                                let draft = self.composer.draft_expanded();
-                                TerminalGuard::suspend();
-                                let edited = edit_in_external_editor(&draft);
-                                TerminalGuard::resume(self.mouse_enabled)?;
-                                terminal.clear().map_err(|e| e.to_string())?;
-                                match edited {
-                                    Ok(text) => {
-                                        self.composer.set(text.trim_end_matches('\n'));
-                                        self.flash("Loaded draft from external editor");
-                                    }
-                                    Err(e) => self.flash(format!("Editor failed: {e}")),
-                                }
-                            }
-                            Action::CopyCode(block) => copy_to_clipboard(&block),
-                            Action::Quit => return Ok(self.running),
-                        },
+                        }
                         Event::Mouse(mouse) => self.handle_mouse(mouse.kind),
                         Event::Resize(_, _) => {}
                         _ => {}
@@ -1728,18 +1467,233 @@ impl App {
             }
         }
     }
+
+    fn handle_action(
+        &mut self,
+        action: Action,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        client: &mut ServeClient,
+        workers: &LocalWorkers,
+    ) -> Result<bool, String> {
+        match action {
+            Action::None => {}
+            Action::SendTurn(text) => {
+                let imgs = std::mem::take(&mut self.pending_images);
+                let (params, labels) = build_turn_params(&self.repo_raw, text, imgs);
+                if !labels.is_empty() {
+                    self.transcript.push_notice(
+                        NoticeKind::Info,
+                        format!("attached images: {}", labels.join(", ")),
+                    );
+                }
+                match client.send("turn", params) {
+                    Ok(id) => self.active_turn_req = Some(id),
+                    Err(e) => {
+                        self.running = false;
+                        self.transcript.push_notice(NoticeKind::Error, e);
+                    }
+                }
+            }
+            Action::SendSteer(text) => {
+                self.send_rpc(client, "steer", json!({"input": text}), "");
+            }
+            Action::Cancel => {
+                let _ = client.send("cancel", json!({}));
+            }
+            Action::ResolveApproval { id, allow, remember } => {
+                self.send_rpc(
+                    client,
+                    "approval.resolve",
+                    json!({"id": id, "allow": allow, "remember": remember}),
+                    "",
+                );
+            }
+            Action::SetPlan(next) => {
+                if self.send_rpc(client, "mode.set", json!({"plan": next}), "").is_some() {
+                    self.plan_mode = next;
+                    let msg = if next {
+                        "Plan mode ON (read-only · Shift+Tab to exit)"
+                    } else {
+                        "Plan mode OFF (full edit access)"
+                    };
+                    self.flash(msg);
+                    self.transcript.push_notice(NoticeKind::Playbook, msg);
+                }
+            }
+            Action::SetEffort(level) => {
+                self.send_rpc(client, "effort.set", json!({"effort": level}), &format!("Reasoning effort → {level}"));
+            }
+            Action::SwitchSession(sid) => {
+                if self.replace_client(client, Some(&sid)) {
+                    self.flash(format!("Resumed session {sid}"));
+                }
+            }
+            Action::SetModel(model) => {
+                self.send_rpc(client, "model.set", json!({"model": model}), &format!("Switching model → {model} (saved)"));
+            }
+            Action::Slash(cmd) => self.handle_slash_io(cmd, terminal, client, workers)?,
+            Action::RunLocalShell(cmd) => {
+                let id = format!("local-{}", self.next_local_id);
+                self.next_local_id += 1;
+                self.transcript.push_tool_started(id.clone(), "bash".into(), format!("! {cmd}"), "local".into());
+                workers.spawn_shell(self.repo_raw.clone(), id, cmd);
+            }
+            Action::ToggleMouse => {
+                self.mouse_enabled = !self.mouse_enabled;
+                TerminalGuard::set_mouse(self.mouse_enabled);
+                self.flash(if self.mouse_enabled {
+                    "Mouse scroll: on"
+                } else {
+                    "Mouse capture off — drag to select text freely (Alt+M to restore)"
+                });
+            }
+            Action::OpenEditor => {
+                let draft = self.composer.draft_expanded();
+                TerminalGuard::suspend();
+                let edited = edit_in_external_editor(&draft);
+                TerminalGuard::resume(self.mouse_enabled)?;
+                terminal.clear().map_err(|e| e.to_string())?;
+                match edited {
+                    Ok(text) => {
+                        self.composer.set(text.trim_end_matches('\n'));
+                        self.flash("Loaded draft from external editor");
+                    }
+                    Err(e) => self.flash(format!("Editor failed: {e}")),
+                }
+            }
+            Action::CopyCode(block) => copy_to_clipboard(&block),
+            Action::Quit => return Ok(true),
+        }
+        Ok(false)
+    }
+
+    fn handle_slash_io(
+        &mut self,
+        cmd: SlashCommand,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        client: &mut ServeClient,
+        workers: &LocalWorkers,
+    ) -> Result<(), String> {
+        match cmd {
+            SlashCommand::NewSession => {
+                if self.replace_client(client, None) {
+                    self.flash("Started new session");
+                }
+            }
+            SlashCommand::ForkSession => {
+                self.fork_req = self.send_rpc(client, "session.fork", json!({}), "Forking session…");
+            }
+            SlashCommand::RewindSession(turns) => {
+                self.rewind_req = self.send_rpc(client, "session.rewind", json!({"turns": turns}), &format!("Rewinding {turns} turn(s)…"));
+            }
+            SlashCommand::RenameSession(title) => {
+                if self.send_rpc(client, "session.rename", json!({"title": title}), &format!("Renamed session → {title}")).is_some() {
+                    self.title = Some(title);
+                }
+            }
+            SlashCommand::ArchiveSession => {
+                let old_sid = self.sid.clone();
+                if self.replace_client(client, None) {
+                    match archive_session_file(&old_sid) {
+                        Ok(dst) => {
+                            let short: String = old_sid.chars().take(10).collect();
+                            self.flash(format!("Archived {short}"));
+                            self.transcript.push_notice(NoticeKind::Success, format!("archived session → {dst}"));
+                        }
+                        Err(e) => self.transcript.push_notice(NoticeKind::Warn, e),
+                    }
+                }
+            }
+            SlashCommand::OpenModelPicker => {
+                self.flash("Fetching models from magpie…");
+                workers.spawn_models();
+            }
+            SlashCommand::UndoEdit => {
+                self.undo_req = self.send_rpc(client, "edit.undo", json!({}), "Reverting last edit…");
+            }
+            SlashCommand::ListTasks => {
+                self.tasks_req = self.send_rpc(client, "tasks.list", json!({}), "Listing background tasks…");
+            }
+            SlashCommand::ListMcp => {
+                self.mcp_req = self.send_rpc(client, "mcp.list", json!({}), "Checking MCP servers…");
+            }
+            SlashCommand::CompactNow => {
+                self.send_rpc(client, "session.compact", json!({}), "Compacting context…");
+            }
+            SlashCommand::VerifySession => {
+                self.verify_req = self.send_rpc(client, "session.verify", json!({}), "Verifying session hash chain…");
+            }
+            SlashCommand::EditMemory => match ensure_memory_file(&self.repo_raw) {
+                Ok((path, created)) => {
+                    TerminalGuard::suspend();
+                    let edited = edit_file_in_external_editor(&path);
+                    TerminalGuard::resume(self.mouse_enabled)?;
+                    terminal.clear().map_err(|e| e.to_string())?;
+                    match edited {
+                        Ok(lines) => {
+                            let verb = if created { "Created" } else { "Saved" };
+                            let msg = format!("{verb} .twig/preferences.md ({lines} lines) — auto-loaded on next turn");
+                            self.flash(&msg);
+                            self.transcript.push_notice(NoticeKind::Success, msg);
+                        }
+                        Err(e) => self.flash(format!("Editor failed: {e}")),
+                    }
+                }
+                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+            },
+            SlashCommand::InitProject => match init_project_files(&self.repo_raw) {
+                Ok((created, existing)) => {
+                    self.flash("Initialized .twig/");
+                    self.transcript.push_notice(NoticeKind::Success, format_init_report(&created, &existing));
+                }
+                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+            },
+            SlashCommand::RunDoctor => {
+                self.flash("Running twig doctor…");
+                workers.spawn_doctor(self.repo_raw.clone());
+            }
+            SlashCommand::ExportTranscript(custom) => {
+                let md = self.transcript.export_markdown(&self.sid, self.title.as_deref(), &self.model, &self.repo_path);
+                match write_export_file(&self.repo_raw, &self.sid, custom.as_deref(), &md) {
+                    Ok(pretty) => {
+                        self.flash("Exported transcript to Markdown");
+                        self.transcript.push_notice(NoticeKind::Success, format!("exported transcript ({} bytes) → {pretty}", md.len()));
+                    }
+                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                }
+            }
+            SlashCommand::RunDiff => match run_git_diff(&self.repo_raw) {
+                Ok(diff) if diff.trim().is_empty() => {
+                    self.transcript.push_notice(NoticeKind::Info, "working tree clean — no diff");
+                }
+                Ok(diff) => {
+                    let id = format!("diff-{}", self.next_local_id);
+                    self.next_local_id += 1;
+                    self.transcript.push_tool_snapshot(id, "diff".into(), "git diff".into(), "local".into(), diff, Some(0));
+                }
+                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+            },
+            SlashCommand::RunReview => {
+                self.transcript.push_notice(NoticeKind::Playbook, "starting independent read-only review on current git diff…");
+                self.transcript.follow_tail();
+                workers.spawn_review(self.repo_raw.clone());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn run_tui(repo: &str, resume: Option<&str>) -> Result<(), String> {
     let mut app = App::new(repo);
     let mut client = app.connect_session(repo, resume)?;
-    let (local_tx, local_rx) = mpsc::channel();
+    let workers = LocalWorkers::new();
 
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(|e| format!("init terminal: {e}"))?;
 
-    let cancel_on_exit = app.run_loop(&mut terminal, &mut client, &local_tx, &local_rx)?;
+    let cancel_on_exit = app.run_loop(&mut terminal, &mut client, &workers)?;
 
     drop(terminal);
     drop(_guard);
@@ -1956,14 +1910,31 @@ mod tests {
         app.apply_event(&json!({"ev": "tool.output", "id": "t1", "text": "@@ -1,1 +1,1 @@\n-old\n+new\n"}));
         app.apply_event(&json!({"ev": "tool.completed", "id": "t1", "bytes": 24, "exit_code": 0}));
 
-        let active_frame = render_frame_text(&mut app, 110, 28);
+        app.apply_event(&json!({
+            "ev": "task.started", "id": "bg-1", "command": "cargo test", "running": 1
+        }));
+        app.apply_local_msg(LocalMsg::GitStat(Some((42, 8))));
+        let active_frame = render_frame_text(&mut app, 130, 28);
         assert!(active_frame.contains("◈ plan"));
+        assert!(active_frame.contains("+42") && active_frame.contains("-8"));
+        assert!(active_frame.contains("⚙ 1 task"));
         assert!(active_frame.contains("high"));
         assert!(active_frame.contains("Plan progress  1/2"));
         assert!(active_frame.contains("ctx 34%"));
         assert!(active_frame.contains("cache 80%"));
         assert!(active_frame.contains("blake3 chain: ok (12 entries)"));
         assert!(active_frame.contains("$ Bash"));
+
+        app.transcript.push_user("first prompt".into());
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.footer_mode, FooterMode::RewindHint);
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.overlay_picker, Some(OverlayPicker::Rewind { .. })));
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Slash(SlashCommand::RewindSession(1))
+        );
+        assert_eq!(app.rewind_prefill.as_deref(), Some("first prompt"));
 
         app.apply_event(&json!({
             "ev": "approval.requested", "id": "t2", "name": "bash",

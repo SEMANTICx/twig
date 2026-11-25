@@ -207,6 +207,72 @@ pub fn accept(cand: &Score, best: &Score, margin: usize) -> Result<String, Strin
     ))
 }
 
+/// Aggregate contrastive comparison across tasks that have both passing and
+/// failing repetitions (isolates behavioral variance without leaking any task
+/// name, prompt, command, or judge text).
+fn contrastive_variance(rows: &[Value]) -> Value {
+    let mut by_task: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for row in rows {
+        if let Some(task) = row["task"].as_str() {
+            by_task.entry(task.to_owned()).or_default().push(row);
+        }
+    }
+    let mut mixed_tasks = 0usize;
+    let mut pass_calls = Vec::new();
+    let mut fail_calls = Vec::new();
+    let mut pass_secs = Vec::new();
+    let mut fail_secs = Vec::new();
+    let mut pass_timeouts = 0u64;
+    let mut fail_timeouts = 0u64;
+    let mut fail_kinds = BTreeMap::<String, usize>::new();
+
+    for group in by_task.values() {
+        let has_pass = group.iter().any(|r| r["pass"] == true);
+        let has_fail = group.iter().any(|r| r["pass"] == false);
+        if !(has_pass && has_fail) {
+            continue;
+        }
+        mixed_tasks += 1;
+        for r in group {
+            let calls = r["model_calls"].as_f64().unwrap_or(0.0);
+            let secs = r["secs"].as_f64().unwrap_or(0.0);
+            let timeouts = r["tool_timeouts"].as_u64().unwrap_or(0);
+            if r["pass"] == true {
+                pass_calls.push(calls);
+                pass_secs.push(secs);
+                pass_timeouts += timeouts;
+            } else if r["pass"] == false {
+                fail_calls.push(calls);
+                fail_secs.push(secs);
+                fail_timeouts += timeouts;
+                let kind = match r["failure_kind"].as_str() {
+                    Some("process") => "process",
+                    Some("trajectory") => "trajectory",
+                    _ => "content",
+                };
+                *fail_kinds.entry(kind.into()).or_default() += 1;
+            }
+        }
+    }
+    let mean = |xs: &[f64]| {
+        if xs.is_empty() {
+            0.0
+        } else {
+            xs.iter().sum::<f64>() / xs.len() as f64
+        }
+    };
+    json!({
+        "mixed_tasks": mixed_tasks,
+        "pass_mean_calls": mean(&pass_calls),
+        "fail_mean_calls": mean(&fail_calls),
+        "pass_mean_secs": mean(&pass_secs),
+        "fail_mean_secs": mean(&fail_secs),
+        "pass_timeouts": pass_timeouts,
+        "fail_timeouts": fail_timeouts,
+        "fail_kinds": fail_kinds,
+    })
+}
+
 pub fn digest(rows: &[Value], _tasks: &[Task], budget: usize) -> String {
     let mut failures = BTreeMap::<String, usize>::new();
     let mut cuts = BTreeMap::<String, usize>::new();
@@ -239,7 +305,8 @@ pub fn digest(rows: &[Value], _tasks: &[Task], budget: usize) -> String {
         "mean_model_calls": score.calls,
         "mean_seconds": score.secs,
         "mean_reported_tokens": score.tokens,
-        "papercuts_by_component": cuts
+        "papercuts_by_component": cuts,
+        "contrastive_variance": contrastive_variance(rows)
     });
     let text = evidence.to_string();
     if text.len() <= budget {
@@ -303,9 +370,11 @@ You get the current configuration and evidence from failed or costly runs of a
 scoring set. The scoring set is a sample of real work; the harness will be used
 on other work you will never see. So:
 
-- Find the general cause behind the evidence, then fix that cause. Never name a
-  file, function, task, value or command from the evidence: a fix that only
-  works for this sample is worse than no fix.
+- Find the general cause behind the evidence, then fix that cause. Use
+  `contrastive_variance` (passing vs failing runs on the same task) to diagnose
+  whether failures correlate with tool timeouts or excessive call loops. Never
+  name a file, function, task, value or command from the evidence: a fix that
+  only works for this sample is worse than no fix.
 - Prefer the smallest change that addresses the cause. One idea per candidate.
 - Raise a limit only if the evidence shows the limit was hit.
 - If a failure comes from a bug in the harness that configuration cannot fix,
@@ -850,6 +919,24 @@ mod tests {
         let text = digest(&[row], &[], 14_000);
         assert!(text.contains("content"));
         assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn contrastive_variance_isolates_mixed_runs_without_leaking_task_names() {
+        let rows = vec![
+            json!({"task":"SECRET_MIXED","pass":true,"secs":4.0,"model_calls":2.0,"tool_timeouts":0}),
+            json!({"task":"SECRET_MIXED","pass":false,"failure_kind":"process","secs":20.0,"model_calls":8.0,"tool_timeouts":2}),
+            json!({"task":"SECRET_ALL_PASS","pass":true,"secs":3.0,"model_calls":1.0,"tool_timeouts":0}),
+        ];
+        let text = digest(&rows, &[], 14_000);
+        assert!(!text.contains("SECRET"));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let cv = &v["contrastive_variance"];
+        assert_eq!(cv["mixed_tasks"], 1);
+        assert_eq!(cv["pass_mean_calls"], 2.0);
+        assert_eq!(cv["fail_mean_calls"], 8.0);
+        assert_eq!(cv["fail_timeouts"], 2);
+        assert_eq!(cv["fail_kinds"]["process"], 1);
     }
 
     #[test]
