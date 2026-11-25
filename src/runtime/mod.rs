@@ -450,6 +450,7 @@ impl<'a> Daemon<'a> {
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
                     "running_tasks": self.tools.running_tasks_count(),
+                    "env_summary": self.tools.env_summary(),
                 }))
             }
 
@@ -483,6 +484,7 @@ impl<'a> Daemon<'a> {
                     "context_max": self.context.max_bytes(),
                     "playbooks": playbooks,
                     "skills": self.tools.skill_metadata(),
+                    "env_summary": self.tools.env_summary(),
                 }))
             }
 
@@ -625,6 +627,7 @@ impl<'a> Daemon<'a> {
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
                     "running_tasks": self.tools.running_tasks_count(),
+                    "env_summary": self.tools.env_summary(),
                 }))
             }
 
@@ -647,7 +650,7 @@ impl<'a> Daemon<'a> {
                             .ok_or("enable requires a skill name")?;
                         let msg = store.enable(name, project)?;
                         self.tools.reload_skills();
-                        Ok(json!({"action": "enable", "ok": true, "report": msg}))
+                        Ok(json!({"action": "enable", "ok": true, "report": msg, "env_summary": self.tools.env_summary()}))
                     }
                     "disable" => {
                         let name = params["name"]
@@ -656,7 +659,7 @@ impl<'a> Daemon<'a> {
                             .ok_or("disable requires a skill name")?;
                         let msg = store.disable(name, project)?;
                         self.tools.reload_skills();
-                        Ok(json!({"action": "disable", "ok": true, "report": msg}))
+                        Ok(json!({"action": "disable", "ok": true, "report": msg, "env_summary": self.tools.env_summary()}))
                     }
                     other => Err(format!("unknown skill action: {other}")),
                 }

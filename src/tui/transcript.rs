@@ -21,6 +21,7 @@ use super::markdown::{
 
 pub struct RenderOpts<'a> {
     pub repo_path: &'a str,
+    pub env_summary: &'a str,
     pub live_streaming: bool,
     pub run_elapsed: Duration,
     pub dt: f32,
@@ -453,12 +454,13 @@ impl Transcript {
         &self,
         width: usize,
         repo_path: &str,
+        env_summary: &str,
         live_streaming: bool,
         run_elapsed: Duration,
         motion: MotionMode,
     ) -> Vec<Line<'static>> {
         if self.cells.is_empty() {
-            return render_welcome_card("", "", None, repo_path, width);
+            return render_welcome_card(repo_path, env_summary);
         }
         let mut lines = Vec::new();
         let inner = width.saturating_sub(4).max(16);
@@ -695,6 +697,7 @@ impl Transcript {
         let mut lines = self.build_lines(
             area.width as usize,
             opts.repo_path,
+            opts.env_summary,
             opts.live_streaming,
             opts.run_elapsed,
             opts.motion,

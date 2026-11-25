@@ -872,16 +872,10 @@ impl SmoothScroll {
     }
 }
 
-/// Minimal borderless warm-terracotta welcome header — no boxes and no duplication
-/// with the bottom status line (model/repo/branch live exclusively in the footer).
-pub fn render_welcome_card(
-    _model: &str,
-    _repo_label: &str,
-    _git_branch: Option<&str>,
-    repo_path: &str,
-    _width: usize,
-) -> Vec<Line<'static>> {
-    vec![
+/// Minimal borderless warm-terracotta welcome header — zero duplication with
+/// composer prefixes or footer status; displays repo path + loaded harness environment.
+pub fn render_welcome_card(repo_path: &str, env_summary: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -893,20 +887,20 @@ pub fn render_welcome_card(
                 Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  {}", env!("CARGO_PKG_VERSION")),
+                format!(" {}  ", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(MUTED),
             ),
-        ]),
-        Line::from(vec![
-            Span::raw("    "),
             Span::styled(repo_path.to_owned(), Style::default().fg(STONE)),
-            Span::styled(
-                "  ·  / commands  ·  @ files  ·  ! shell  ·  ? shortcuts",
-                Style::default().fg(MUTED),
-            ),
         ]),
-        Line::from(""),
-    ]
+    ];
+    if !env_summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(env_summary.to_owned(), Style::default().fg(MUTED)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines
 }
 
 /// 2-column Codex-style shortcut reference rows for the `?` footer overlay.
@@ -939,8 +933,8 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
         row(
             "Shift+Tab",
             "toggle plan mode (RO)",
-            "!cmd · @ · /",
-            "shell · file · commands",
+            "! · @ · $ · /",
+            "shell · file · skill · cmd",
         ),
         row(
             "Ctrl+O",
@@ -1141,7 +1135,7 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
                 Style::default().fg(IVORY),
             ));
         }
-        if let Some(pct) = view.context_pct {
+        if let Some(pct) = view.context_pct.filter(|&p| p > 0) {
             let color = if pct >= 85 {
                 ROSE
             } else if pct >= 65 {
@@ -1183,13 +1177,6 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
         }
         if !view.mouse_enabled {
             spans.push(Span::styled(" · select", Style::default().fg(AMBER)));
-        }
-        if !view.sid.is_empty() && view.title.is_none() {
-            let short: String = view.sid.chars().take(10).collect();
-            spans.push(Span::styled(
-                format!(" · {short}"),
-                Style::default().fg(MUTED),
-            ));
         }
         Line::from(spans)
     };

@@ -131,8 +131,12 @@ impl Tools {
     /// (harness self-awareness, hybrid Layer-1 skills, MCP, and plan mode).
     pub fn system_addendum_for(&self, input: &str) -> String {
         let mut out = String::from(
-            "\nHarness tools: prefer read/edit/write/grep/glob over shell cat/sed/grep; use task for long background commands and subagent batches for parallel exploration/review. \
-             Skills use 3 tiers (project .twig/skills > global ~/.config/twig/skills, vault ~/.local/share/twig-skills-vault); manage via `twig skill <list|enable|disable|add|doctor>`, and load `skill-creator` when authoring skills.",
+            "\nYou run inside the twig harness. Prefer read/edit/write/grep/glob over shell cat/sed/grep; \
+             inspect clipped outputs via read(path=\"artifact:<file>\"); use task for long background commands, \
+             parallel subagent batches for exploration/review, and papercut for harness defects. \
+             Skills use 3 tiers (.twig/skills > ~/.config/twig/skills, cold vault ~/.local/share/twig-skills-vault); \
+             manage via `twig skill <list|enable|disable|add|doctor>`, and load `skill-creator` when authoring skills. \
+             User TUI controls: /plan (Shift+Tab), /rewind (Esc×2), /undo, /skills, $skill-name, /evolve, /verify, !cmd, @file.",
         );
         if let Some(skills) = &self.skills {
             out.push_str(&skills.system_prompt_block_for(input));
@@ -149,6 +153,38 @@ impl Tools {
             );
         }
         out
+    }
+
+    /// Compact one-line summary of the active harness environment for the TUI welcome header.
+    pub fn env_summary(&self) -> String {
+        let (active, vault) = SkillStore::default_for(Some(&self.worktree)).counts();
+        let skills_part = if vault > 0 {
+            format!("skills {active} (+{vault} vault)")
+        } else {
+            format!("skills {active}")
+        };
+        let loaded_docs: Vec<&str> = ["AGENTS.md", "CLAUDE.md", ".twig/preferences.md"]
+            .into_iter()
+            .filter(|rel| {
+                std::fs::metadata(self.worktree.join(rel))
+                    .is_ok_and(|m| m.is_file() && m.len() > 0)
+            })
+            .collect();
+        let docs_part = if loaded_docs.is_empty() {
+            "prefs /init".to_owned()
+        } else {
+            format!("docs {}", loaded_docs.join(", "))
+        };
+        let mcp_part = match &self.mcp {
+            Some(reg) => format!("mcp {}", reg.server_names_summary()),
+            None => "mcp 0".to_owned(),
+        };
+        let sandbox_part = if self.isolation {
+            "sandbox bwrap"
+        } else {
+            "sandbox off"
+        };
+        format!("{skills_part}  ·  {docs_part}  ·  {mcp_part}  ·  {sandbox_part}")
     }
 
     pub fn schema(&self) -> Value {

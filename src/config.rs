@@ -95,8 +95,7 @@ impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             system: DEFAULT_SYSTEM.into(),
-            bash_description: "Run a shell command in the worktree. Use for reading, searching, \
-                               building and testing."
+            bash_description: "Run a shell command in the worktree for building, testing, git, and CLI tasks (prefer read/edit/write/grep/glob for file access)."
                 .into(),
             read_description: "Read a text file inside the worktree.".into(),
             max_output: 8000,

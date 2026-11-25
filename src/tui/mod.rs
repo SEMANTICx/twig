@@ -104,6 +104,7 @@ struct App {
     plan_mode: bool,
     playbook: Option<String>,
     guard_level: Option<String>,
+    env_summary: String,
     turns_used: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -171,6 +172,7 @@ impl App {
             plan_mode: false,
             playbook: None,
             guard_level: None,
+            env_summary: String::new(),
             turns_used: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -334,6 +336,9 @@ impl App {
                 }
                 if let Some(turns) = result.get("turns").and_then(Value::as_u64) {
                     self.turns_used = turns;
+                }
+                if let Some(env) = result.get("env_summary").and_then(Value::as_str) {
+                    self.env_summary = env.to_owned();
                 }
                 if self.history_req == Some(id) {
                     self.history_req = None;
@@ -1259,6 +1264,7 @@ impl App {
             chunks[0],
             RenderOpts {
                 repo_path: &self.repo_path,
+                env_summary: &self.env_summary,
                 live_streaming,
                 run_elapsed,
                 dt,
@@ -1357,7 +1363,7 @@ impl App {
         } else if self.transcript.is_expanded() {
             "tools:expanded · ^O compact · ? shortcuts  "
         } else {
-            "? shortcuts · Shift+Tab plan · ^F find  "
+            "? shortcuts · Shift+Tab plan · ^R history  "
         };
         render_footer(frame, chunks[5], &self.footer_view(flash, right_hint));
     }
@@ -1880,8 +1886,11 @@ mod tests {
     #[test]
     fn renders_welcome_telemetry_tools_approval_and_new_commands() {
         let mut app = App::new("/tmp/demo");
-        let welcome = render_frame_text(&mut app, 100, 28);
+        app.env_summary = "skills 10 (+13 vault)  ·  docs AGENTS.md  ·  mcp 0  ·  sandbox off".into();
+        let welcome = render_frame_text(&mut app, 110, 28);
         assert!(welcome.contains("✻ twig") && !welcome.contains("╭─"));
+        assert!(welcome.contains("skills 10 (+13 vault)") && welcome.contains("docs AGENTS.md"));
+        assert!(!welcome.contains("ctx 0%"));
 
         assert_eq!(
             app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),

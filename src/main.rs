@@ -741,7 +741,7 @@ fn main() {
             println!(
                 "twig 0.2.0 — a thin agent harness\n\n\
                  usage:\n  \
-                 twig chat [repo] [sid] [--plain] interactive TUI (or --plain line mode)\n  \
+                 twig chat [repo] [sid] [--plain] interactive TUI (/cmd, @file, $skill, !shell)\n  \
                  twig serve [worktree] [runs]   JSON-RPC over stdio\n  \
                  twig selfcheck                 offline checks (no network)\n  \
                  twig doctor                    check config/state paths and dependencies\n  \
@@ -756,8 +756,9 @@ fn main() {
                  twig automate [cfg] [--once]   unattended GitHub maintenance queue\n  \
                  twig subagent [repo] [role]    isolated role subagent\n  \
                  twig review [repo] <diff>      fresh read-only independent reviewer\n\n\
-                 env: TWIG_BASE_URL (default http://127.0.0.1:3425/v1), TWIG_API_KEY, TWIG_ROLES,\n       \
-                 TWIG_CONFIG, TWIG_WORKERS (4), TWIG_WALL_SECS (300)"
+                 env: TWIG_BASE_URL (default http://127.0.0.1:3425/v1), TWIG_API_KEY, TWIG_MODEL,\n       \
+                 TWIG_ROLES, TWIG_CONFIG, TWIG_SKILLS_DIR, TWIG_SKILLS_VAULT,\n       \
+                 TWIG_WORKERS (4), TWIG_WALL_SECS (300)"
             );
         }
     }

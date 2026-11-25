@@ -676,6 +676,24 @@ impl SkillStore {
         out
     }
 
+    /// Count `(active_enabled, vault_inactive)` skills for the TUI environment pulse.
+    pub fn counts(&self) -> (usize, usize) {
+        let mut active = HashSet::new();
+        if let Some(proj) = &self.project_dir {
+            for (folder, _, _) in Self::scan_entries(proj) {
+                active.insert(folder);
+            }
+        }
+        for (folder, _, _) in Self::scan_entries(&self.global_dir) {
+            active.insert(folder);
+        }
+        let vault_inactive = Self::scan_entries(&self.vault_dir)
+            .into_iter()
+            .filter(|(folder, _, _)| !active.contains(folder))
+            .count();
+        (active.len(), vault_inactive)
+    }
+
     pub fn list_report(&self) -> String {
         let mut out = String::new();
         let mut enabled_names = HashSet::new();
