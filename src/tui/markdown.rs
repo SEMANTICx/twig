@@ -449,30 +449,14 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                 is_diff_block =
                     lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
                 diff_gutter = DiffGutterState::default();
-                let label = if lang.is_empty() {
-                    "╭─ code ".to_string()
-                } else {
-                    format!("╭─ {lang} ")
-                };
-                let rule_len = width.saturating_sub(display_width(&label)).min(48);
-                out.push(Line::from(vec![
-                    Span::styled("╭─ ", Style::default().fg(HAIRLINE)),
-                    Span::styled(
-                        if lang.is_empty() { "code" } else { lang }.to_owned(),
-                        Style::default().fg(STONE),
-                    ),
-                    Span::styled(
-                        format!(" {}", "─".repeat(rule_len)),
-                        Style::default().fg(HAIRLINE),
-                    ),
-                ]));
+                if !lang.is_empty() {
+                    out.push(Line::from(Span::styled(
+                        format!("  {lang}"),
+                        Style::default().fg(MUTED),
+                    )));
+                }
             } else {
                 is_diff_block = false;
-                let rule_len = width.saturating_sub(1).min(56);
-                out.push(Line::from(Span::styled(
-                    format!("╰{}", "─".repeat(rule_len)),
-                    Style::default().fg(HAIRLINE),
-                )));
             }
             continue;
         }
@@ -480,7 +464,7 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
         if in_code {
             if is_diff_block {
                 for row in diff_gutter.render_line(line, width.saturating_sub(2)) {
-                    let mut spans = vec![Span::styled("│ ", Style::default().fg(HAIRLINE))];
+                    let mut spans = vec![Span::styled("▎ ", Style::default().fg(HAIRLINE))];
                     spans.extend(row);
                     out.push(Line::from(spans));
                 }
@@ -488,7 +472,7 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                 let code_style = Style::default().fg(ACCENT_PEAK);
                 for wrapped in wrap_plain(line, width.saturating_sub(2)) {
                     out.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(HAIRLINE)),
+                        Span::styled("▎ ", Style::default().fg(HAIRLINE)),
                         Span::styled(wrapped, code_style),
                     ]));
                 }
@@ -707,141 +691,51 @@ impl SmoothScroll {
     }
 }
 
-/// Claude Code iconic rounded terracotta welcome card with responsive 2-column layout.
+/// Minimal borderless warm-terracotta welcome header (zero boxes, pure typography).
 pub fn render_welcome_card(
     model: &str,
     repo_label: &str,
     git_branch: Option<&str>,
     repo_path: &str,
-    width: usize,
+    _width: usize,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let card_w = width.saturating_sub(4).clamp(32, 78);
-    let inner = card_w.saturating_sub(2);
-    let title = format!(" ✻ twig v{} ", env!("CARGO_PKG_VERSION"));
-    let top_fill = inner.saturating_sub(display_width(&title) + 1);
-    let border = Style::default().fg(ACCENT);
-    let branch = git_branch.map(|b| format!(" ({b})")).unwrap_or_default();
-    let repo_meta = format!("{repo_label}{branch}");
-    let clip = |s: &str, max_c: usize| -> String {
-        let lim = max_c.max(8);
-        let out: String = s.chars().take(lim).collect();
-        if s.chars().count() > lim {
-            format!("{out}…")
-        } else {
-            out
-        }
-    };
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("╭─", border),
-        Span::styled(
-            title,
-            Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("{}╮", "─".repeat(top_fill)), border),
-    ]));
-
-    let blank_row = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("│", border),
-        Span::raw(" ".repeat(inner)),
-        Span::styled("│", border),
-    ]);
-    lines.push(blank_row.clone());
-
-    if inner >= 62 {
-        let left_w = 32usize;
-        let right_w = inner.saturating_sub(left_w + 3);
-        let two_col = |l_spans: Vec<Span<'static>>, r_spans: Vec<Span<'static>>| {
-            let lw: usize = l_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
-            let rw: usize = r_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
-            let mut row = vec![Span::raw("  "), Span::styled("│", border)];
-            row.extend(l_spans);
-            row.push(Span::raw(" ".repeat(left_w.saturating_sub(lw))));
-            row.push(Span::styled(" │ ", Style::default().fg(HAIRLINE)));
-            row.extend(r_spans);
-            row.push(Span::raw(" ".repeat(right_w.saturating_sub(rw))));
-            row.push(Span::styled("│", border));
-            Line::from(row)
-        };
-
-        lines.push(two_col(
-            vec![
-                Span::styled("   ╭───╮  ", Style::default().fg(ACCENT)),
-                Span::styled(
-                    "Welcome back",
-                    Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
-                ),
-            ],
-            vec![Span::styled(
-                "Tips for getting started",
-                Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD),
-            )],
-        ));
-        lines.push(two_col(
-            vec![
-                Span::styled("   │ ", Style::default().fg(ACCENT)),
-                Span::styled(
-                    "✻",
-                    Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" │  ", Style::default().fg(ACCENT)),
-                Span::styled(
-                    clip(&format!("{model} · {repo_meta}"), left_w - 11),
-                    Style::default().fg(STONE),
-                ),
-            ],
-            vec![Span::styled(
-                clip("Enter send (steer while running)", right_w),
-                Style::default().fg(STONE),
-            )],
-        ));
-        lines.push(two_col(
-            vec![
-                Span::styled("   ╰───╯  ", Style::default().fg(ACCENT)),
-                Span::styled(clip(repo_path, left_w - 11), Style::default().fg(MUTED)),
-            ],
-            vec![Span::styled(
-                clip("@ file · / command · ? shortcuts", right_w),
-                Style::default().fg(MUTED),
-            )],
-        ));
-    } else {
-        let one_col = |spans: Vec<Span<'static>>| {
-            let w: usize = spans.iter().map(|s| display_width(s.content.as_ref())).sum();
-            let mut row = vec![Span::raw("  "), Span::styled("│", border)];
-            row.extend(spans);
-            row.push(Span::raw(" ".repeat(inner.saturating_sub(w))));
-            row.push(Span::styled("│", border));
-            Line::from(row)
-        };
-        lines.push(one_col(vec![
-            Span::styled("  ✻ ", Style::default().fg(ACCENT)),
-            Span::styled(
-                clip(&format!("{model} · {repo_meta}"), inner - 5),
-                Style::default().fg(IVORY),
-            ),
-        ]));
-        lines.push(one_col(vec![Span::styled(
-            format!("    {}", clip(repo_path, inner - 5)),
+    let mut meta = vec![
+        Span::raw("    "),
+        Span::styled(model.to_owned(), Style::default().fg(ACCENT_PEAK)),
+        Span::styled(" · ", Style::default().fg(MUTED)),
+        Span::styled(repo_label.to_owned(), Style::default().fg(STONE)),
+    ];
+    if let Some(branch) = git_branch {
+        meta.push(Span::styled(
+            format!(" ({branch})"),
             Style::default().fg(MUTED),
-        )]));
+        ));
     }
-
-    lines.push(blank_row);
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(format!("╰{}╯", "─".repeat(inner)), border),
-    ]));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  Press ? for shortcuts · ^O tool tree · ^F find · ^G $EDITOR · Alt+Y copy code",
-        Style::default().fg(MUTED),
-    )));
-    lines
+    if repo_path != repo_label {
+        meta.push(Span::styled(
+            format!(" · {repo_path}"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  ✻ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "twig",
+                Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(meta),
+        Line::from(""),
+    ]
 }
 
 /// 2-column Codex-style shortcut reference rows for the `?` footer overlay.
@@ -960,7 +854,7 @@ mod tests {
         let rendered = render_markdown(md, 52);
         assert!(rendered[0].to_string().contains("Title"));
         assert!(rendered[1].to_string().contains("• check"));
-        assert!(rendered.iter().any(|l| l.to_string().contains("╭─ diff")));
+        assert!(rendered.iter().any(|l| l.to_string().contains("diff")));
         assert!(rendered.iter().any(|l| l.to_string().contains("10 - old")));
         assert!(rendered.iter().any(|l| l.to_string().contains("10 + new")));
 

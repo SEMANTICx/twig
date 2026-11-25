@@ -1319,16 +1319,19 @@ impl App {
         if area.height < 6 || area.width < 18 {
             return;
         }
-        let box_w = area.width.saturating_sub(2) as usize;
-        let inner_w = box_w.saturating_sub(2);
-        let border = Style::default().fg(AMBER);
+        let rule_len = area.width.saturating_sub(2) as usize;
+        let rule = format!(" {}", "─".repeat(rule_len));
+        let inner_w = area.width.saturating_sub(4) as usize;
         let cmd_preview = summarize_tool_args(&pending.name, &pending.args);
         let title = if pending.recovered {
-            format!(" ▲ Recovered approval ({}) — NO replay ", pending.id)
+            format!("  ▲ Recovered approval ({}) — NO replay", pending.id)
         } else {
-            format!(" ▲ Approve {}? ({}) ", title_tool_name(&pending.name), pending.id)
+            format!(
+                "  ▲ Approve {}? ({})",
+                title_tool_name(&pending.name),
+                pending.id
+            )
         };
-        let top_fill = inner_w.saturating_sub(display_width(&title) + 1);
 
         let opt = |idx: usize, label: &str| -> Line<'static> {
             let active = self.approval_sel == idx;
@@ -1337,8 +1340,7 @@ impl App {
             let fg = if active { IVORY } else { STONE };
             let pad = inner_w.saturating_sub(display_width(marker) + display_width(label));
             Line::from(vec![
-                Span::raw(" "),
-                Span::styled("│", border),
+                Span::raw("  "),
                 Span::styled(
                     marker,
                     Style::default()
@@ -1355,42 +1357,27 @@ impl App {
                     }),
                 ),
                 Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-                Span::styled("│", border),
             ])
         };
 
-        let preview_line = format!("  $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(5)));
+        let preview_line = format!(" $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(4)));
         let preview_pad = inner_w.saturating_sub(display_width(&preview_line));
 
         let rows = vec![
+            Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
+            Line::from(Span::styled(
+                title,
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )),
             Line::from(vec![
-                Span::raw(" "),
-                Span::styled("╭─", border),
-                Span::styled(
-                    title,
-                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}╮", "─".repeat(top_fill)), border),
-            ]),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled("│", border),
+                Span::raw("  "),
                 Span::styled(preview_line, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
                 Span::styled(" ".repeat(preview_pad), Style::default().bg(SURFACE)),
-                Span::styled("│", border),
             ]),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled("│", border),
-                Span::raw(" ".repeat(inner_w)),
-                Span::styled("│", border),
-            ]),
+            Line::from(""),
             opt(0, "1. Yes, allow once (y / Enter)"),
             opt(1, "2. No, deny and tell agent (n / Esc)"),
-            Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!("╰{}╯", "─".repeat(inner_w)), border),
-            ]),
+            Line::from(Span::styled(rule, Style::default().fg(AMBER))),
         ];
         frame.render_widget(Paragraph::new(rows), area);
     }
@@ -1678,7 +1665,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(frame_text.contains("compose in $EDITOR"));
-        assert!(frame_text.contains("Welcome back"));
+        assert!(frame_text.contains("twig"));
 
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.footer_mode, FooterMode::Contextual);
@@ -1755,7 +1742,7 @@ mod tests {
         let backend = TestBackend::new(92, 28);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        // Empty state renders rounded Claude Code welcome card
+        // Empty state renders borderless minimal welcome header
         terminal.draw(|f| app.draw(f)).unwrap();
         let welcome: String = terminal
             .backend()
@@ -1764,8 +1751,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(welcome.contains("╭─"));
-        assert!(welcome.contains("Welcome back"));
+        assert!(welcome.contains("✻ twig"));
+        assert!(!welcome.contains("╭─"));
 
         // Active conversation renders ⏺ / ⎿ tool trees + shimmer status
         app.apply_server_msg(ServerMsg::Reply {

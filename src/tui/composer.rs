@@ -459,7 +459,7 @@ impl Composer {
         }
     }
 
-    /// Rounded Lip-Gloss-style docked popup above the composer for `/` commands or `@` mentions.
+    /// Borderless minimal popup above the composer for `/` commands or `@` mentions.
     pub fn render_popup(&self, frame: &mut Frame, composer_area: Rect, transcript_h: u16) {
         let Some(popup) = self.active_popup() else {
             return;
@@ -467,8 +467,8 @@ impl Composer {
         if transcript_h < 4 || composer_area.width < 20 {
             return;
         }
-        let popup_w = composer_area.width.saturating_sub(4).min(70);
-        let inner_w = popup_w.saturating_sub(2) as usize;
+        let popup_w = composer_area.width.saturating_sub(4).min(68);
+        let inner_w = popup_w as usize;
         let (title, rows): (&str, Vec<Line<'static>>) = match popup {
             PopupKind::Slash(items) => {
                 let sel = self.popup_sel.min(items.len().saturating_sub(1));
@@ -487,7 +487,6 @@ impl Composer {
                             .collect();
                         let pad = inner_w.saturating_sub(used + display_width(&desc_clipped));
                         Line::from(vec![
-                            Span::styled("│", Style::default().fg(HAIRLINE)),
                             Span::styled(marker, Style::default().fg(ACCENT).bg(bg)),
                             Span::styled(
                                 cmd_col,
@@ -503,7 +502,6 @@ impl Composer {
                                     .bg(bg),
                             ),
                             Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-                            Span::styled("│", Style::default().fg(HAIRLINE)),
                         ])
                     })
                     .collect();
@@ -525,7 +523,6 @@ impl Composer {
                             .collect();
                         let pad = inner_w.saturating_sub(used + display_width(&clipped));
                         Line::from(vec![
-                            Span::styled("│", Style::default().fg(HAIRLINE)),
                             Span::styled(
                                 marker,
                                 Style::default()
@@ -539,7 +536,6 @@ impl Composer {
                                     .bg(bg),
                             ),
                             Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-                            Span::styled("│", Style::default().fg(HAIRLINE)),
                         ])
                     })
                     .collect();
@@ -547,25 +543,21 @@ impl Composer {
             }
         };
 
-        let popup_h = (rows.len() as u16 + 2).min(transcript_h);
+        let popup_h = (rows.len() as u16 + 1).min(transcript_h);
         let popup_area = Rect {
             x: composer_area.x + 2,
             y: composer_area.y.saturating_sub(popup_h),
             width: popup_w,
             height: popup_h,
         };
-        let mut all = Vec::with_capacity(rows.len() + 2);
-        let top_fill = inner_w.saturating_sub(display_width(title) + 1);
+        let mut all = Vec::with_capacity(rows.len() + 1);
+        let top_fill = inner_w.saturating_sub(display_width(title) + 2);
         all.push(Line::from(vec![
-            Span::styled("╭─", Style::default().fg(HAIRLINE)),
-            Span::styled(title, Style::default().fg(STONE)),
-            Span::styled(format!("{}╮", "─".repeat(top_fill)), Style::default().fg(HAIRLINE)),
+            Span::styled("──", Style::default().fg(HAIRLINE)),
+            Span::styled(title, Style::default().fg(MUTED)),
+            Span::styled("─".repeat(top_fill), Style::default().fg(HAIRLINE)),
         ]));
         all.extend(rows);
-        all.push(Line::from(Span::styled(
-            format!("╰{}╯", "─".repeat(inner_w)),
-            Style::default().fg(HAIRLINE),
-        )));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(Paragraph::new(all), popup_area);
     }
