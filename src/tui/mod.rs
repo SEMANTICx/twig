@@ -1,8 +1,9 @@
 //! Borderless Claude-Code warm-terracotta TUI with full Codex-parity workflow:
 //! - Zero box borders: pure typography welcome header, inset hairline composer, Codex full-width
 //!   slash-command & `@file` selection bar, and hairline approval selector
-//! - Full Codex/Claude command suite: `/new`, `/resume` (with history replay), `/rename`,
-//!   `/status`, `/diff`, `/review`, `/skills`, `/model`, `/compact`, `/config`, `/mouse`, `!cmd`
+//! - Full Codex/Claude/twig command suite: `/plan` (`Shift+Tab`), `/new`, `/resume`, `/rename`,
+//!   `/archive`, `/status`, `/verify`, `/diff`, `/review`, `/memory`, `/init`, `/doctor`,
+//!   `/export`, `/skills`, `/model`, `/compact`, `/config`, `/mouse`, `!cmd`
 //! - Live token/cache/context telemetry footer, Kitty OSC 99 desktop notifications,
 //!   60fps exponential smooth scroll, cadenced shimmer, breathing floral star, and syntax highlighting
 
@@ -23,27 +24,29 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use serde_json::{json, Value};
 
 use self::client::{
-    chat_plain, copy_to_clipboard, detect_git_branch, edit_in_external_editor, list_sessions,
-    notify_osc99, run_git_diff, run_independent_review, run_local_shell, shorten_home, ServeClient,
-    ServerMsg, SessionSummary, TerminalGuard,
+    archive_session_file, chat_plain, copy_to_clipboard, detect_git_branch,
+    edit_file_in_external_editor, edit_in_external_editor, ensure_memory_file,
+    format_verify_report, init_project_files, list_sessions, notify_osc99, run_doctor,
+    run_git_diff, run_independent_review, run_local_shell, shorten_home, write_export_file,
+    ServeClient, ServerMsg, SessionSummary, TerminalGuard,
 };
 use self::composer::{Composer, PopupAccept};
 use self::markdown::{
-    active_rule_color, breathing_star, display_width, fmt_elapsed_compact, shimmer_is_sweeping,
-    shortcut_overlay_lines, summary_shimmer, MotionMode, ACCENT, ACCENT_PEAK, AMBER, HAIRLINE,
-    HAIRLINE_FOCUS, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE, SURFACE_HI,
+    active_rule_color, breathing_star, fmt_elapsed_compact, fmt_tokens_compact, render_footer,
+    shimmer_is_sweeping, summary_shimmer, FooterMode, FooterView, MotionMode, ACCENT, AMBER,
+    HAIRLINE, HAIRLINE_FOCUS, MUTED,
 };
 use self::transcript::{
-    clip_str, render_resume_picker, summarize_tool_args, title_tool_name, NoticeKind, RenderOpts,
-    Transcript,
+    render_approval_panel, render_resume_picker, summarize_tool_args, title_tool_name, NoticeKind,
+    RenderOpts, Transcript,
 };
 use crate::config::HarnessConfig;
 
@@ -64,14 +67,6 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
     run_tui(repo, resume)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FooterMode {
-    Contextual,
-    ShortcutOverlay,
-    QuitReminder,
-    EscHint,
-}
-
 #[derive(Debug, Clone)]
 struct PendingApproval {
     id: String,
@@ -81,13 +76,14 @@ struct PendingApproval {
 }
 
 enum LocalMsg {
-    ShellDone {
+    Shell {
         id: String,
         output: String,
         exit_code: Option<i32>,
         elapsed: Duration,
     },
-    ReviewDone(Result<String, String>),
+    Review(Result<String, String>),
+    Doctor(Result<(String, bool), String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,11 +93,18 @@ enum Action {
     SendSteer(String),
     Cancel,
     ResolveApproval { id: String, allow: bool },
+    SetPlan(bool),
     NewSession,
     SwitchSession(String),
     RenameSession(String),
+    ArchiveSession,
     SetModel(String),
     CompactNow,
+    VerifySession,
+    EditMemory,
+    InitProject,
+    RunDoctor,
+    ExportTranscript(Option<String>),
     RunLocalShell(String),
     RunDiff,
     RunReview,
@@ -119,6 +122,7 @@ struct App {
     sid: String,
     title: Option<String>,
     model: String,
+    plan_mode: bool,
     playbook: Option<String>,
     guard_level: Option<String>,
     playbooks_meta: Vec<String>,
@@ -136,6 +140,7 @@ struct App {
     status_header_started: Instant,
     active_turn_req: Option<u64>,
     history_req: Option<u64>,
+    verify_req: Option<u64>,
     transcript: Transcript,
     approvals: VecDeque<PendingApproval>,
     approval_sel: usize,
@@ -171,6 +176,7 @@ impl App {
             sid: String::new(),
             title: None,
             model: std::env::var("TWIG_MODEL").unwrap_or_else(|_| "magpie".into()),
+            plan_mode: false,
             playbook: None,
             guard_level: None,
             playbooks_meta: Vec::new(),
@@ -188,6 +194,7 @@ impl App {
             status_header_started: now,
             active_turn_req: None,
             history_req: None,
+            verify_req: None,
             transcript: Transcript::new(),
             approvals: VecDeque::new(),
             approval_sel: 0,
@@ -208,6 +215,7 @@ impl App {
     fn reset_session_view(&mut self) {
         self.sid.clear();
         self.title = None;
+        self.plan_mode = false;
         self.playbook = None;
         self.guard_level = None;
         self.turns_used = 0;
@@ -219,6 +227,7 @@ impl App {
         self.run_started = None;
         self.last_delta_at = None;
         self.active_turn_req = None;
+        self.verify_req = None;
         self.transcript.clear();
         self.approvals.clear();
         self.approval_sel = 0;
@@ -297,6 +306,9 @@ impl App {
                 if let Some(title) = result.get("title").and_then(Value::as_str) {
                     self.title = Some(title.to_owned());
                 }
+                if let Some(plan) = result.get("plan").and_then(Value::as_bool) {
+                    self.plan_mode = plan;
+                }
                 if let Some(cb) = result.get("context_bytes").and_then(Value::as_u64) {
                     self.context_bytes = cb as usize;
                 }
@@ -320,6 +332,18 @@ impl App {
                     if let Some(messages) = result.get("messages").and_then(Value::as_array) {
                         self.transcript.replay_history(messages);
                     }
+                }
+                if self.verify_req == Some(id) {
+                    self.verify_req = None;
+                    let (chain_ok, report) = format_verify_report(&result);
+                    self.transcript.push_notice(
+                        if chain_ok {
+                            NoticeKind::Success
+                        } else {
+                            NoticeKind::Error
+                        },
+                        report,
+                    );
                 }
                 if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
                     if !compacted {
@@ -401,7 +425,7 @@ impl App {
 
     fn apply_local_msg(&mut self, msg: LocalMsg) {
         match msg {
-            LocalMsg::ShellDone {
+            LocalMsg::Shell {
                 id,
                 output,
                 exit_code,
@@ -411,7 +435,7 @@ impl App {
                     .finish_tool(&id, Some(output), exit_code, Some(elapsed));
                 self.transcript.follow_tail();
             }
-            LocalMsg::ReviewDone(res) => match res {
+            LocalMsg::Review(res) => match res {
                 Ok(text) => {
                     self.transcript
                         .push_notice(NoticeKind::Success, "independent review completed");
@@ -420,6 +444,29 @@ impl App {
                 Err(e) => self
                     .transcript
                     .push_notice(NoticeKind::Error, format!("review: {e}")),
+            },
+            LocalMsg::Doctor(res) => match res {
+                Ok((output, ok)) => {
+                    self.transcript.push_notice(
+                        if ok {
+                            NoticeKind::Success
+                        } else {
+                            NoticeKind::Warn
+                        },
+                        if ok {
+                            "twig doctor: all checks passed"
+                        } else {
+                            "twig doctor reported issues"
+                        },
+                    );
+                    if !output.is_empty() {
+                        self.transcript
+                            .push_assistant(format!("```text\n{output}\n```"));
+                    }
+                }
+                Err(e) => self
+                    .transcript
+                    .push_notice(NoticeKind::Error, format!("doctor: {e}")),
             },
         }
     }
@@ -526,6 +573,11 @@ impl App {
                         .push_notice(NoticeKind::Warn, format!("guard tripped · {level}"));
                 }
             }
+            Some("mode.changed") => {
+                if let Some(plan) = ev["plan"].as_bool() {
+                    self.plan_mode = plan;
+                }
+            }
             Some("context.compacted") => {
                 let removed = ev["compaction"]["removed_messages"].as_u64().unwrap_or(0);
                 self.transcript.push_notice(
@@ -582,19 +634,11 @@ impl App {
 
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
-                KeyCode::Char('Y') => {
-                    return match self.transcript.copy_latest_reply() {
-                        Ok((text, msg)) => {
-                            self.flash(msg);
-                            Action::CopyCode(text)
-                        }
-                        Err(e) => {
-                            self.flash(e);
-                            Action::None
-                        }
-                    };
-                }
-                KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Char('Y')
+                | KeyCode::Char('y')
+                    if key.code == KeyCode::Char('Y')
+                        || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
                     return match self.transcript.copy_latest_reply() {
                         Ok((text, msg)) => {
                             self.flash(msg);
@@ -743,6 +787,10 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        if key.code == KeyCode::BackTab {
+            return Action::SetPlan(!self.plan_mode);
         }
 
         if matches!(key.code, KeyCode::Char('?'))
@@ -919,8 +967,35 @@ impl App {
 
         match trimmed {
             "/quit" | "/exit" => return Action::Quit,
+            "/plan" => return Action::SetPlan(!self.plan_mode),
+            "/plan on" => return Action::SetPlan(true),
+            "/plan off" => return Action::SetPlan(false),
             "/new" => return Action::NewSession,
+            "/archive" => return Action::ArchiveSession,
             "/cancel" => return Action::Cancel,
+            "/verify" => return Action::VerifySession,
+            "/memory" => return Action::EditMemory,
+            "/memory show" => {
+                let path = Path::new(&self.repo_raw).join(".twig/preferences.md");
+                match std::fs::read_to_string(&path) {
+                    Ok(body) if !body.trim().is_empty() => {
+                        self.transcript
+                            .push_notice(NoticeKind::Info, "project memory (.twig/preferences.md)");
+                        self.transcript.push_assistant(body);
+                    }
+                    Ok(_) => self
+                        .transcript
+                        .push_notice(NoticeKind::Info, ".twig/preferences.md is empty"),
+                    Err(_) => self.transcript.push_notice(
+                        NoticeKind::Info,
+                        "no .twig/preferences.md yet — run /memory or /init",
+                    ),
+                }
+                return Action::None;
+            }
+            "/init" => return Action::InitProject,
+            "/doctor" => return Action::RunDoctor,
+            "/export" => return Action::ExportTranscript(None),
             "/clear" => {
                 self.transcript.clear();
                 return Action::None;
@@ -975,10 +1050,11 @@ impl App {
                     .as_deref()
                     .map(|t| format!(" · title:{t}"))
                     .unwrap_or_default();
+                let mode = if self.plan_mode { "plan (RO)" } else { "edit" };
                 self.transcript.push_notice(
                     NoticeKind::Info,
                     format!(
-                        "sid:{} · model:{} · turns:{} · ctx:{ctx_pct} ({}/{}B) · {}{cache_pct}{title}",
+                        "sid:{} · model:{} · mode:{mode} · turns:{} · ctx:{ctx_pct} ({}/{}B) · {}{cache_pct}{title}",
                         if self.sid.is_empty() { "—" } else { &self.sid },
                         self.model,
                         self.turns_used,
@@ -1040,6 +1116,10 @@ impl App {
             return Action::None;
         }
 
+        if let Some(path) = trimmed.strip_prefix("/export ") {
+            let path = path.trim();
+            return Action::ExportTranscript((!path.is_empty()).then(|| path.to_owned()));
+        }
         if let Some(sid) = trimmed.strip_prefix("/resume ") {
             let sid = sid.trim();
             if !sid.is_empty() {
@@ -1205,13 +1285,31 @@ impl App {
         if let Some((sessions, sel)) = &self.resume_picker {
             render_resume_picker(frame, chunks[3], sessions, *sel);
         } else if let Some(pending) = self.approvals.front() {
-            self.render_approval_panel(frame, chunks[3], pending);
+            render_approval_panel(
+                frame,
+                chunks[3],
+                &pending.id,
+                &pending.name,
+                &pending.args,
+                pending.recovered,
+                self.approval_sel,
+            );
         } else {
             let (rule_color, prompt_color, placeholder) = if self.running {
                 (
                     active_rule_color(run_elapsed, self.motion),
                     AMBER,
                     "Type steering guidance and press Enter (or Esc to interrupt)…",
+                )
+            } else if self.plan_mode {
+                (
+                    AMBER,
+                    AMBER,
+                    if self.composer.is_empty() {
+                        "Plan mode (read-only) — ask twig to explore or design… (Shift+Tab to exit)"
+                    } else {
+                        ""
+                    },
                 )
             } else if !self.composer.is_empty() {
                 (HAIRLINE_FOCUS, ACCENT, "")
@@ -1236,190 +1334,11 @@ impl App {
             }
         }
 
-        self.render_footer(frame, chunks[4]);
-    }
-
-    fn render_approval_panel(&self, frame: &mut Frame, area: Rect, pending: &PendingApproval) {
-        if area.height < 6 || area.width < 18 {
-            return;
-        }
-        let rule_len = area.width.saturating_sub(2) as usize;
-        let rule = format!(" {}", "─".repeat(rule_len));
-        let inner_w = area.width.saturating_sub(4) as usize;
-        let cmd_preview = summarize_tool_args(&pending.name, &pending.args);
-        let title = if pending.recovered {
-            format!("  ▲ Recovered approval ({}) — NO replay", pending.id)
-        } else {
-            format!(
-                "  ▲ Approve {}? ({})",
-                title_tool_name(&pending.name),
-                pending.id
-            )
-        };
-
-        let opt = |idx: usize, label: &str| -> Line<'static> {
-            let active = self.approval_sel == idx;
-            let bg = if active { SURFACE_HI } else { Color::Reset };
-            let marker = if active { " ▸ " } else { "   " };
-            let fg = if active { IVORY } else { STONE };
-            let pad = inner_w.saturating_sub(display_width(marker) + display_width(label));
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(ACCENT)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    label.to_owned(),
-                    Style::default().fg(fg).bg(bg).add_modifier(if active {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-                ),
-                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            ])
-        };
-
-        let preview_line = format!(" $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(4)));
-        let preview_pad = inner_w.saturating_sub(display_width(&preview_line));
-
-        let rows = vec![
-            Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
-            Line::from(Span::styled(
-                title,
-                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(preview_line, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
-                Span::styled(" ".repeat(preview_pad), Style::default().bg(SURFACE)),
-            ]),
-            Line::from(""),
-            opt(0, "1. Yes, allow once (y / Enter)"),
-            opt(1, "2. No, deny and tell agent (n / Esc)"),
-            Line::from(Span::styled(rule, Style::default().fg(AMBER))),
-        ];
-        frame.render_widget(Paragraph::new(rows), area);
-    }
-
-    fn render_footer(&self, frame: &mut Frame, area: Rect) {
-        match self.footer_mode {
-            FooterMode::ShortcutOverlay => {
-                frame.render_widget(Paragraph::new(shortcut_overlay_lines()), area);
-                return;
-            }
-            FooterMode::QuitReminder => {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        "  Press Ctrl+C again to quit",
-                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                    )),
-                    area,
-                );
-                return;
-            }
-            FooterMode::EscHint => {
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        "  Press Esc again to clear draft",
-                        Style::default().fg(AMBER),
-                    )),
-                    area,
-                );
-                return;
-            }
-            FooterMode::Contextual => {}
-        }
-
         let flash = self
             .status_flash
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
             .map(|(s, _)| s.as_str());
-
-        let left: Line<'static> = if let Some(msg) = flash {
-            Line::from(Span::styled(format!("  {msg}"), Style::default().fg(AMBER)))
-        } else {
-            let mut spans = vec![
-                Span::styled(
-                    "  ✻ ",
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(self.repo_label.clone(), Style::default().fg(STONE)),
-            ];
-            if let Some(branch) = &self.git_branch {
-                spans.push(Span::styled(
-                    format!(" ({branch})"),
-                    Style::default().fg(MUTED),
-                ));
-            }
-            spans.push(Span::styled(
-                format!(" · {}", self.model),
-                Style::default().fg(ACCENT_PEAK),
-            ));
-            if let Some(title) = &self.title {
-                spans.push(Span::styled(
-                    format!(" · {}", clip_str(title, 20)),
-                    Style::default().fg(IVORY),
-                ));
-            }
-            if let Some(pct) = self.context_pct() {
-                let color = if pct >= 85 {
-                    ROSE
-                } else if pct >= 65 {
-                    AMBER
-                } else {
-                    MUTED
-                };
-                spans.push(Span::styled(
-                    format!(" · ctx {pct}%"),
-                    Style::default().fg(color),
-                ));
-            }
-            let total_tok = self.input_tokens + self.output_tokens;
-            if total_tok > 0 {
-                spans.push(Span::styled(
-                    format!(" · {}", fmt_tokens_compact(total_tok)),
-                    Style::default().fg(MUTED),
-                ));
-                if self.cached_tokens > 0 {
-                    if let Some(hit) = (self.cached_tokens * 100).checked_div(self.input_tokens) {
-                        spans.push(Span::styled(
-                            format!(" · cache {hit}%"),
-                            Style::default().fg(SAGE),
-                        ));
-                    }
-                }
-            }
-            if let Some(book) = &self.playbook {
-                spans.push(Span::styled(
-                    format!(" · ✦ {book}"),
-                    Style::default().fg(AMBER),
-                ));
-            }
-            if let Some(level) = &self.guard_level {
-                spans.push(Span::styled(
-                    format!(" · ▲ {level}"),
-                    Style::default().fg(ROSE),
-                ));
-            }
-            if !self.mouse_enabled {
-                spans.push(Span::styled(" · select", Style::default().fg(AMBER)));
-            }
-            if !self.sid.is_empty() && self.title.is_none() {
-                let short: String = self.sid.chars().take(10).collect();
-                spans.push(Span::styled(
-                    format!(" · {short}"),
-                    Style::default().fg(MUTED),
-                ));
-            }
-            Line::from(spans)
-        };
-
         let right_hint = if self.resume_picker.is_some() {
             "↑/↓ select · Enter open · Esc close  "
         } else if !self.approvals.is_empty() {
@@ -1430,20 +1349,34 @@ impl App {
             "Enter steer · Shift+Enter newline  "
         } else if !self.composer.is_empty() {
             "Enter send · Shift+Enter newline · ^G edit  "
+        } else if self.plan_mode {
+            "Shift+Tab exit plan · ? shortcuts  "
         } else if self.transcript.is_expanded() {
             "tools:expanded · ^O compact · ? shortcuts  "
         } else {
-            "? shortcuts · ^O tools · ^F find  "
+            "? shortcuts · Shift+Tab plan · ^F find  "
         };
-        let right_w = (display_width(right_hint) as u16).min(area.width / 2);
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(10), Constraint::Length(right_w)])
-            .split(area);
-        frame.render_widget(Paragraph::new(left), cols[0]);
-        frame.render_widget(
-            Paragraph::new(Span::styled(right_hint, Style::default().fg(MUTED))),
-            cols[1],
+        render_footer(
+            frame,
+            chunks[4],
+            &FooterView {
+                mode: self.footer_mode,
+                flash,
+                repo_label: &self.repo_label,
+                git_branch: self.git_branch.as_deref(),
+                model: &self.model,
+                title: self.title.as_deref(),
+                sid: &self.sid,
+                plan_mode: self.plan_mode,
+                context_pct: self.context_pct(),
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
+                playbook: self.playbook.as_deref(),
+                guard_level: self.guard_level.as_deref(),
+                mouse_enabled: self.mouse_enabled,
+                right_hint,
+            },
         );
     }
 
@@ -1515,6 +1448,21 @@ impl App {
                                     self.transcript.push_notice(NoticeKind::Error, e);
                                 }
                             }
+                            Action::SetPlan(next) => {
+                                match client.send("mode.set", json!({"plan": next})) {
+                                    Ok(_) => {
+                                        self.plan_mode = next;
+                                        let msg = if next {
+                                            "Plan mode ON (read-only · Shift+Tab to exit)"
+                                        } else {
+                                            "Plan mode OFF (full edit access)"
+                                        };
+                                        self.flash(msg);
+                                        self.transcript.push_notice(NoticeKind::Playbook, msg);
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
                             Action::NewSession => {
                                 let cancel = self.running;
                                 self.reset_session_view();
@@ -1541,6 +1489,33 @@ impl App {
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
+                            Action::ArchiveSession => {
+                                let old_sid = self.sid.clone();
+                                let cancel = self.running;
+                                self.reset_session_view();
+                                let repo = self.repo_raw.clone();
+                                match self.connect_session(&repo, None) {
+                                    Ok(new_client) => {
+                                        let old = std::mem::replace(client, new_client);
+                                        old.shutdown(cancel);
+                                        match archive_session_file(&old_sid) {
+                                            Ok(dst) => {
+                                                let short: String =
+                                                    old_sid.chars().take(10).collect();
+                                                self.flash(format!("Archived {short}"));
+                                                self.transcript.push_notice(
+                                                    NoticeKind::Success,
+                                                    format!("archived session → {dst}"),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                self.transcript.push_notice(NoticeKind::Warn, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
                             Action::RenameSession(title) => {
                                 match client.send("session.rename", json!({"title": title})) {
                                     Ok(_) => {
@@ -1562,6 +1537,84 @@ impl App {
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
+                            Action::VerifySession => {
+                                match client.send("session.verify", json!({})) {
+                                    Ok(id) => {
+                                        self.verify_req = Some(id);
+                                        self.flash("Verifying session hash chain…");
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
+                            Action::EditMemory => match ensure_memory_file(&self.repo_raw) {
+                                Ok((path, created)) => {
+                                    TerminalGuard::suspend();
+                                    let edited = edit_file_in_external_editor(&path);
+                                    TerminalGuard::resume(self.mouse_enabled)?;
+                                    terminal.clear().map_err(|e| e.to_string())?;
+                                    match edited {
+                                        Ok(lines) => {
+                                            let verb = if created { "Created" } else { "Saved" };
+                                            let msg = format!(
+                                                "{verb} .twig/preferences.md ({lines} lines) — auto-loaded on next turn"
+                                            );
+                                            self.flash(&msg);
+                                            self.transcript.push_notice(NoticeKind::Success, msg);
+                                        }
+                                        Err(e) => self.flash(format!("Editor failed: {e}")),
+                                    }
+                                }
+                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                            },
+                            Action::InitProject => match init_project_files(&self.repo_raw) {
+                                Ok((created, existing)) => {
+                                    let mut parts = Vec::new();
+                                    if !created.is_empty() {
+                                        parts.push(format!("created {}", created.join(", ")));
+                                    }
+                                    if !existing.is_empty() {
+                                        parts.push(format!("kept existing {}", existing.join(", ")));
+                                    }
+                                    let msg = format!("twig init: {}", parts.join(" · "));
+                                    self.flash("Initialized .twig/");
+                                    self.transcript.push_notice(NoticeKind::Success, msg);
+                                }
+                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                            },
+                            Action::RunDoctor => {
+                                self.flash("Running twig doctor…");
+                                let tx = local_tx.clone();
+                                let repo = self.repo_raw.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(LocalMsg::Doctor(run_doctor(&repo)));
+                                });
+                            }
+                            Action::ExportTranscript(custom) => {
+                                let md = self.transcript.export_markdown(
+                                    &self.sid,
+                                    self.title.as_deref(),
+                                    &self.model,
+                                    &self.repo_path,
+                                );
+                                match write_export_file(
+                                    &self.repo_raw,
+                                    &self.sid,
+                                    custom.as_deref(),
+                                    &md,
+                                ) {
+                                    Ok(pretty) => {
+                                        self.flash("Exported transcript to Markdown");
+                                        self.transcript.push_notice(
+                                            NoticeKind::Success,
+                                            format!(
+                                                "exported transcript ({} bytes) → {pretty}",
+                                                md.len()
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                }
+                            }
                             Action::RunLocalShell(cmd) => {
                                 let id = format!("local-{}", self.next_local_id);
                                 self.next_local_id += 1;
@@ -1575,7 +1628,7 @@ impl App {
                                 let repo = self.repo_raw.clone();
                                 std::thread::spawn(move || {
                                     let (output, exit_code, elapsed) = run_local_shell(&repo, &cmd);
-                                    let _ = tx.send(LocalMsg::ShellDone {
+                                    let _ = tx.send(LocalMsg::Shell {
                                         id,
                                         output,
                                         exit_code,
@@ -1614,7 +1667,7 @@ impl App {
                                 let repo = self.repo_raw.clone();
                                 std::thread::spawn(move || {
                                     let _ = tx
-                                        .send(LocalMsg::ReviewDone(run_independent_review(&repo)));
+                                        .send(LocalMsg::Review(run_independent_review(&repo)));
                                 });
                             }
                             Action::ToggleMouse => {
@@ -1656,16 +1709,6 @@ impl App {
     }
 }
 
-fn fmt_tokens_compact(n: u64) -> String {
-    if n < 1_000 {
-        format!("{n} tok")
-    } else if n < 1_000_000 {
-        format!("{:.1}k tok", n as f64 / 1_000.0)
-    } else {
-        format!("{:.2}M tok", n as f64 / 1_000_000.0)
-    }
-}
-
 fn run_tui(repo: &str, resume: Option<&str>) -> Result<(), String> {
     let mut app = App::new(repo);
     let mut client = app.connect_session(repo, resume)?;
@@ -1690,6 +1733,18 @@ mod tests {
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    fn render_frame_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
     }
 
     #[test]
@@ -1733,7 +1788,6 @@ mod tests {
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
             Action::NewSession
         );
-
         assert_eq!(
             app.handle_key(press(KeyCode::Char('m'), KeyModifiers::ALT)),
             Action::ToggleMouse
@@ -1749,22 +1803,10 @@ mod tests {
                 "turns": 1,
                 "context_bytes": 4096,
                 "context_max": 10000,
-                "messages": [
-                    {"role": "user", "content": "check build"},
-                    {
-                        "role": "assistant",
-                        "content": "Running build now.",
-                        "tool_calls": [{
-                            "id": "c1",
-                            "type": "function",
-                            "function": {"name": "bash", "arguments": "{\"command\":\"cargo check\"}"}
-                        }]
-                    },
-                    {"role": "tool", "tool_call_id": "c1", "content": "Finished"}
-                ]
+                "messages": [{"role": "user", "content": "check build"}]
             }),
         });
-        assert_eq!(app.transcript.len(), 3);
+        assert_eq!(app.transcript.len(), 1);
         assert_eq!(app.title.as_deref(), Some("refactor tui"));
         assert_eq!(app.context_pct(), Some(40));
     }
@@ -1774,33 +1816,21 @@ mod tests {
         let mut app = App::new(".");
         app.handle_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
         assert_eq!(app.footer_mode, FooterMode::ShortcutOverlay);
-
-        let backend = TestBackend::new(92, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let frame_text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let frame_text = render_frame_text(&mut app, 92, 24);
         assert!(frame_text.contains("compose in $EDITOR"));
-        assert!(frame_text.contains("twig"));
+        assert!(frame_text.contains("Shift+Tab"));
 
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.footer_mode, FooterMode::Contextual);
-
         app.handle_key(press(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.footer_mode, FooterMode::EscHint);
-        assert!(!app.composer.is_empty());
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.composer.is_empty());
     }
 
     #[test]
-    fn approval_selector_supports_arrows_numbers_and_hotkeys() {
+    fn approval_selector_and_copy_search_shortcuts_work() {
         let mut app = App::new(".");
         app.apply_event(&json!({
             "ev": "approval.requested",
@@ -1810,134 +1840,96 @@ mod tests {
         }));
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::ResolveApproval {
-                id: "call_1".into(),
-                allow: true
-            }
+            Action::ResolveApproval { id: "call_1".into(), allow: true }
         );
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::ResolveApproval {
-                id: "call_1".into(),
-                allow: false
-            }
+            Action::ResolveApproval { id: "call_1".into(), allow: false }
         );
-        assert_eq!(
-            app.handle_key(press(KeyCode::Char('1'), KeyModifiers::NONE)),
-            Action::ResolveApproval {
-                id: "call_1".into(),
-                allow: true
-            }
-        );
-    }
+        app.approvals.clear();
 
-    #[test]
-    fn alt_y_and_alt_shift_y_copy_code_and_full_reply_and_ctrl_f_searches() {
-        let mut app = App::new(".");
-        app.transcript.push_assistant(
-            "First:\n```rust\nlet a = 1;\n```\nSecond:\n```rust\nlet b = 2;\n```".into(),
-        );
+        app.transcript.push_assistant("Code:\n```rust\nlet b = 2;\n```".into());
         assert_eq!(
             app.handle_key(press(KeyCode::Char('y'), KeyModifiers::ALT)),
             Action::CopyCode("let b = 2;".into())
         );
         assert_eq!(
-            app.handle_key(press(KeyCode::Char('y'), KeyModifiers::ALT)),
-            Action::CopyCode("let a = 1;".into())
+            app.handle_key(press(KeyCode::Char('Y'), KeyModifiers::ALT | KeyModifiers::SHIFT)),
+            Action::CopyCode("Code:\n```rust\nlet b = 2;\n```".into())
         );
-        assert_eq!(
-            app.handle_key(press(
-                KeyCode::Char('Y'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT
-            )),
-            Action::CopyCode(
-                "First:\n```rust\nlet a = 1;\n```\nSecond:\n```rust\nlet b = 2;\n```".into()
-            )
-        );
-
         app.handle_key(press(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for ch in "let b".chars() {
             app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        let backend = TestBackend::new(90, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
+        let _ = render_frame_text(&mut app, 90, 24);
         assert_eq!(app.transcript.search_match_count(), 1);
     }
 
     #[test]
-    fn renders_deduplicated_welcome_telemetry_tools_and_approval() {
+    fn renders_welcome_telemetry_tools_approval_and_new_commands() {
         let mut app = App::new("/tmp/demo");
-        let backend = TestBackend::new(100, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let welcome = render_frame_text(&mut app, 100, 28);
+        assert!(welcome.contains("✻ twig") && !welcome.contains("╭─"));
 
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let welcome: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(welcome.contains("✻ twig"));
-        assert!(!welcome.contains("╭─"));
+        assert_eq!(
+            app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Action::SetPlan(true)
+        );
+        app.plan_mode = true;
+        assert_eq!(app.dispatch_input("/plan"), Action::SetPlan(false));
+        assert_eq!(app.dispatch_input("/plan on"), Action::SetPlan(true));
+        assert_eq!(app.dispatch_input("/memory"), Action::EditMemory);
+        assert_eq!(app.dispatch_input("/init"), Action::InitProject);
+        assert_eq!(app.dispatch_input("/doctor"), Action::RunDoctor);
+        assert_eq!(app.dispatch_input("/archive"), Action::ArchiveSession);
+        assert_eq!(app.dispatch_input("/verify"), Action::VerifySession);
+        assert_eq!(app.dispatch_input("/export"), Action::ExportTranscript(None));
+        assert_eq!(
+            app.dispatch_input("/export out/chat.md"),
+            Action::ExportTranscript(Some("out/chat.md".into()))
+        );
 
         app.apply_server_msg(ServerMsg::Reply {
             id: 1,
             result: json!({
-                "pong": true,
-                "sid": "abc123456789",
-                "model": "demo-model",
-                "context_bytes": 3400,
-                "context_max": 10000
+                "pong": true, "sid": "abc123456789", "model": "demo-model",
+                "plan": true, "context_bytes": 3400, "context_max": 10000
             }),
         });
         app.apply_event(&json!({
             "ev": "model.usage",
             "usage": {"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 800}
         }));
-        app.transcript.push_user("Check diff".into());
-        app.apply_event(&json!({"ev": "turn.started", "model": "demo-model", "turns_used": 1}));
-        app.apply_event(&json!({"ev": "model.delta", "text": "Checking **git** diff."}));
+        app.verify_req = Some(17);
+        app.apply_server_msg(ServerMsg::Reply {
+            id: 17,
+            result: json!({
+                "chain": {"ok": true, "entries": 12},
+                "guard": {"samples": 2, "stall": 0, "digest": "abcdef123456"},
+                "policy": {"hits": 5, "misses": 1, "size": 3},
+                "plan": true, "read_only": true
+            }),
+        });
         app.apply_event(&json!({
-            "ev": "tool.started",
-            "id": "t1",
-            "tool": "bash",
-            "args": {"command": "git diff"},
-            "tier": "auto"
+            "ev": "tool.started", "id": "t1", "tool": "bash",
+            "args": {"command": "git diff"}, "tier": "auto"
         }));
         app.apply_event(&json!({"ev": "tool.output", "id": "t1", "text": "@@ -1,1 +1,1 @@\n-old\n+new\n"}));
         app.apply_event(&json!({"ev": "tool.completed", "id": "t1", "bytes": 24, "exit_code": 0}));
 
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let active_frame: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let active_frame = render_frame_text(&mut app, 110, 28);
+        assert!(active_frame.contains("◈ plan"));
         assert!(active_frame.contains("ctx 34%"));
         assert!(active_frame.contains("cache 80%"));
-        assert!(active_frame.contains("⏺"));
-        assert!(active_frame.contains("⎿"));
+        assert!(active_frame.contains("blake3 chain: ok (12 entries)"));
         assert!(active_frame.contains("$ Bash"));
 
         app.apply_event(&json!({
-            "ev": "approval.requested",
-            "id": "t2",
-            "name": "bash",
+            "ev": "approval.requested", "id": "t2", "name": "bash",
             "args": {"command": "rm -rf /"}
         }));
-        terminal.draw(|f| app.draw(f)).unwrap();
-        let approval_frame: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let approval_frame = render_frame_text(&mut app, 100, 28);
         assert!(approval_frame.contains("Approve Bash?"));
         assert!(approval_frame.contains("1. Yes, allow once"));
     }

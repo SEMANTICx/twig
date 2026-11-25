@@ -21,12 +21,19 @@ use super::markdown::{
 
 /// Codex & Claude Code parity slash command catalog.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/plan", "toggle read-only planning mode (Shift+Tab)"),
     ("/new", "start a new chat session"),
     ("/resume", "browse and resume a previous session"),
     ("/rename ", "rename the current session"),
+    ("/archive", "archive current session and start a new one"),
     ("/status", "show session telemetry, usage, and context"),
+    ("/verify", "verify session hash chain, guard, and policy stats"),
     ("/diff", "show current git diff with line numbers"),
     ("/review", "run independent read-only review on current changes"),
+    ("/memory", "edit .twig/preferences.md project memory in $EDITOR"),
+    ("/init", "initialize .twig/preferences.md and .twig/project.json"),
+    ("/doctor", "run twig environment & dependency diagnostics"),
+    ("/export ", "export conversation transcript to Markdown"),
     ("/skills", "list available playbooks and project skills"),
     ("/model ", "view or switch the active model (or reset)"),
     ("/compact", "compact conversation context now"),

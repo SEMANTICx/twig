@@ -240,6 +240,7 @@ pub struct Daemon<'a> {
     check: Option<Check>,
     model_override: Option<String>,
     title: Option<String>,
+    plan_mode: bool,
 }
 
 impl<'a> Daemon<'a> {
@@ -275,6 +276,12 @@ impl<'a> Daemon<'a> {
             .find(|r| r["kind"] == "session.renamed")
             .and_then(|r| r["title"].as_str())
             .map(str::to_owned);
+        let plan_mode = rows
+            .iter()
+            .rev()
+            .find(|r| r["kind"] == "mode.changed")
+            .and_then(|r| r["plan"].as_bool())
+            .unwrap_or(false);
         let recovered = recover_session(&rows, default_check);
         let guard =
             Guard::new(&worktree, cfg.max_turns, cfg.stall_turns, 3).ignoring([runs_dir.clone()]);
@@ -282,6 +289,8 @@ impl<'a> Daemon<'a> {
         for c in recovered.constraints {
             context.add_constraint(c);
         }
+        let mut tools = Tools::with_config(&worktree, cfg);
+        tools.apply_plan_mode(plan_mode);
 
         Ok(Self {
             llm,
@@ -290,7 +299,8 @@ impl<'a> Daemon<'a> {
             check: recovered.check,
             model_override: None,
             title,
-            tools: Tools::with_config(&worktree, cfg),
+            plan_mode,
+            tools,
             system: cfg.system.clone(),
             worktree,
             record,
@@ -381,6 +391,8 @@ impl<'a> Daemon<'a> {
                     "sid": self.sid(),
                     "model": model,
                     "title": self.title,
+                    "plan": self.plan_mode,
+                    "read_only": self.tools.is_read_only(),
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
                 }))
@@ -405,6 +417,8 @@ impl<'a> Daemon<'a> {
                     "sid": self.sid(),
                     "title": self.title,
                     "model": model,
+                    "plan": self.plan_mode,
+                    "read_only": self.tools.is_read_only(),
                     "turns": turns,
                     "messages": self.messages,
                     "pending": self.pending,
@@ -475,6 +489,20 @@ impl<'a> Daemon<'a> {
                     .clone()
                     .unwrap_or_else(|| self.llm.roles().get("code").to_string());
                 Ok(json!({"model": active}))
+            }
+
+            "mode.set" => {
+                let next = params
+                    .get("plan")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(!self.plan_mode);
+                self.plan_mode = next;
+                let read_only = self.tools.apply_plan_mode(next);
+                self.record
+                    .append("mode.changed", json!({"plan": next}))
+                    .map_err(|e| e.to_string())?;
+                emit(json!({"ev": "mode.changed", "plan": next, "read_only": read_only}));
+                Ok(json!({"plan": next, "read_only": read_only}))
             }
 
             "steer" => {
@@ -572,12 +600,7 @@ impl<'a> Daemon<'a> {
                         &std::fs::read_to_string(preferences).map_err(|e| e.to_string())?,
                     );
                 }
-                let metadata = self.tools.skill_metadata();
-                if !metadata.is_empty() {
-                    system.push_str(&format!(
-                        "\nAvailable project skills (load body via skill tool only when relevant): {metadata}"
-                    ));
-                }
+                system.push_str(&self.tools.system_addendum());
 
                 let mut verify_rounds = 0u32;
                 loop {
@@ -852,6 +875,22 @@ impl<'a> Daemon<'a> {
                 Ok(entries) => Ok(json!({"ok": true, "entries": entries})),
                 Err((index, why)) => Ok(json!({"ok": false, "bad_index": index, "why": why})),
             },
+
+            "session.verify" => {
+                let chain = match Record::verify_chain(self.record.path()) {
+                    Ok(entries) => json!({"ok": true, "entries": entries}),
+                    Err((index, why)) => json!({"ok": false, "bad_index": index, "why": why}),
+                };
+                let (samples, stall, digest) = self.guard.report();
+                let (hits, misses, size) = self.policy.stats();
+                Ok(json!({
+                    "chain": chain,
+                    "guard": {"samples": samples, "stall": stall, "digest": digest},
+                    "policy": {"hits": hits, "misses": misses, "size": size},
+                    "plan": self.plan_mode,
+                    "read_only": self.tools.is_read_only(),
+                }))
+            }
 
             "record.tail" => {
                 let n = params.get("n").and_then(Value::as_u64).unwrap_or(20) as usize;
@@ -1172,5 +1211,45 @@ mod tests {
                 .unwrap()["pending"],
             json!([])
         );
+    }
+
+    #[test]
+    fn mode_set_plan_toggles_read_only_persists_and_session_verify_reports_integrity() {
+        let dir = std::env::temp_dir().join(format!("twig-daemon-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        let llm = StubLlm::new(vec![]);
+        let mut daemon =
+            Daemon::new(&llm, &dir, &runs, "plan-test", &HarnessConfig::default()).unwrap();
+
+        let on = daemon
+            .dispatch("mode.set", &json!({"plan": true}), &mut |_| {})
+            .unwrap();
+        assert_eq!(on["plan"], true);
+        assert_eq!(on["read_only"], true);
+
+        let verify = daemon
+            .dispatch("session.verify", &json!({}), &mut |_| {})
+            .unwrap();
+        assert_eq!(verify["chain"]["ok"], true);
+        assert_eq!(verify["plan"], true);
+        assert!(verify["guard"]["digest"].is_string());
+
+        // Plan mode persists across restart via mode.changed record entry.
+        drop(daemon);
+        let mut resumed =
+            Daemon::new(&llm, &dir, &runs, "plan-test", &HarnessConfig::default()).unwrap();
+        let ping = resumed.dispatch("ping", &json!({}), &mut |_| {}).unwrap();
+        assert_eq!(ping["plan"], true);
+        assert_eq!(ping["read_only"], true);
+
+        // Guard narrowing cannot be cleared by turning plan mode off.
+        resumed.tools.restrict_read_only();
+        let off = resumed
+            .dispatch("mode.set", &json!({"plan": false}), &mut |_| {})
+            .unwrap();
+        assert_eq!(off["plan"], false);
+        assert_eq!(off["read_only"], true);
     }
 }

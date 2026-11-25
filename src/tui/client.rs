@@ -4,6 +4,7 @@
 //! - Host helpers: `$EDITOR` bridge, OSC 52 + `wl-copy` clipboard, git branch, `--plain` fallback
 
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -247,6 +248,167 @@ pub fn run_independent_review(repo: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run `twig doctor` in `repo` and return `(combined_output, succeeded)`.
+pub fn run_doctor(repo: &str) -> Result<(String, bool), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = Command::new(exe)
+        .arg("doctor")
+        .current_dir(repo)
+        .output()
+        .map_err(|e| format!("spawn twig doctor: {e}"))?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&err);
+    }
+    Ok((combined.trim_end().to_owned(), out.status.success()))
+}
+
+const PREFERENCES_TEMPLATE: &str = "\
+# Project Preferences (auto-loaded by twig on every turn)
+
+- Follow existing architecture, naming, and error-handling conventions.
+- Run the project's test and lint suite before declaring a task done.
+- Keep edits minimal, focused, and well-tested.
+";
+
+const PROJECT_JSON_TEMPLATE: &str = "{\n  \"notes\": \"Optional: add a 'check' command for automatic acceptance verification.\"\n}\n";
+
+/// Ensure `<repo>/.twig/preferences.md` exists; returns `(path, created)`.
+pub fn ensure_memory_file(repo: &str) -> Result<(PathBuf, bool), String> {
+    let twig_dir = Path::new(repo).join(".twig");
+    std::fs::create_dir_all(&twig_dir).map_err(|e| format!("create .twig: {e}"))?;
+    let path = twig_dir.join("preferences.md");
+    if path.exists() {
+        return Ok((path, false));
+    }
+    std::fs::write(&path, PREFERENCES_TEMPLATE)
+        .map_err(|e| format!("write preferences.md: {e}"))?;
+    Ok((path, true))
+}
+
+/// Initialize `.twig/preferences.md` and `.twig/project.json` without overwriting existing files.
+pub fn init_project_files(repo: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let twig_dir = Path::new(repo).join(".twig");
+    std::fs::create_dir_all(&twig_dir).map_err(|e| format!("create .twig: {e}"))?;
+    let mut created = Vec::new();
+    let mut existing = Vec::new();
+    for (name, template) in [
+        ("preferences.md", PREFERENCES_TEMPLATE),
+        ("project.json", PROJECT_JSON_TEMPLATE),
+    ] {
+        let path = twig_dir.join(name);
+        let rel = format!(".twig/{name}");
+        if path.exists() {
+            existing.push(rel);
+        } else {
+            std::fs::write(&path, template).map_err(|e| format!("write {rel}: {e}"))?;
+            created.push(rel);
+        }
+    }
+    Ok((created, existing))
+}
+
+/// Archive `<sid>.jsonl` into `<state_dir>/sessions/archive/` and clean any stale lock file.
+pub fn archive_session_file(sid: &str) -> Result<String, String> {
+    archive_session_in_dir(&paths::state_dir().join("sessions"), sid)
+}
+
+fn archive_session_in_dir(sessions_dir: &Path, sid: &str) -> Result<String, String> {
+    let trimmed = sid.trim();
+    if trimmed.is_empty() {
+        return Err("no active session id to archive".into());
+    }
+    let src = sessions_dir.join(format!("{trimmed}.jsonl"));
+    if !src.exists() {
+        return Err(format!("session record not found: {}", src.display()));
+    }
+    let archive_dir = sessions_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir).map_err(|e| format!("create archive dir: {e}"))?;
+    let dst = archive_dir.join(format!("{trimmed}.jsonl"));
+    std::fs::rename(&src, &dst).map_err(|e| format!("archive session: {e}"))?;
+    let lock = sessions_dir.join(format!("{trimmed}.lock"));
+    if lock.exists() {
+        let _ = std::fs::remove_file(lock);
+    }
+    Ok(dst.display().to_string())
+}
+
+/// Write exported transcript Markdown to a default or user-specified path under `repo`.
+pub fn write_export_file(
+    repo: &str,
+    sid: &str,
+    custom: Option<&str>,
+    content: &str,
+) -> Result<String, String> {
+    let target = match custom {
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                Path::new(repo).join(pb)
+            }
+        }
+        None => {
+            let short: String = sid.chars().take(10).collect();
+            let fname = if short.is_empty() {
+                "twig-export.md".to_owned()
+            } else {
+                format!("twig-export-{short}.md")
+            };
+            Path::new(repo).join(fname)
+        }
+    };
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&target, content).map_err(|e| format!("export: {e}"))?;
+    Ok(shorten_home(&target.display().to_string()))
+}
+
+/// Format a `session.verify` RPC reply into `(chain_ok, concise_report)`.
+pub fn format_verify_report(result: &Value) -> (bool, String) {
+    let chain_ok = result["chain"]["ok"] == true;
+    let chain_summary = if chain_ok {
+        format!(
+            "ok ({} entries)",
+            result["chain"]["entries"].as_u64().unwrap_or(0)
+        )
+    } else {
+        format!(
+            "FAILED at #{} ({})",
+            result["chain"]["bad_index"].as_u64().unwrap_or(0),
+            result["chain"]["why"].as_str().unwrap_or("corrupt")
+        )
+    };
+    let samples = result["guard"]["samples"].as_u64().unwrap_or(0);
+    let stall = result["guard"]["stall"].as_u64().unwrap_or(0);
+    let digest: String = result["guard"]["digest"]
+        .as_str()
+        .unwrap_or("—")
+        .chars()
+        .take(10)
+        .collect();
+    let hits = result["policy"]["hits"].as_u64().unwrap_or(0);
+    let misses = result["policy"]["misses"].as_u64().unwrap_or(0);
+    let rules = result["policy"]["size"].as_u64().unwrap_or(0);
+    let mode = if result["read_only"] == true {
+        "read-only"
+    } else {
+        "edit"
+    };
+    (
+        chain_ok,
+        format!(
+            "blake3 chain: {chain_summary} · guard: {samples} samples, stall {stall}, digest {digest} · policy: {hits}h/{misses}m ({rules} cached) · mode: {mode}"
+        ),
+    )
+}
+
 pub fn detect_git_branch(repo: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
@@ -268,27 +430,40 @@ pub fn shorten_home(path: &str) -> String {
     path.to_owned()
 }
 
-pub fn edit_in_external_editor(initial: &str) -> Result<String, String> {
+fn run_editor_on_path(path: &Path) -> Result<(), String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
-    let path = std::env::temp_dir().join(format!("twig-prompt-{}.md", std::process::id()));
-    std::fs::write(&path, initial).map_err(|e| e.to_string())?;
     let parts = shlex::split(&editor).unwrap_or_else(|| vec![editor]);
     let (bin, args) = parts
         .split_first()
         .ok_or_else(|| "empty $EDITOR".to_owned())?;
     let status = Command::new(bin)
         .args(args)
-        .arg(&path)
+        .arg(path)
         .status()
         .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&path);
     if !status.success() {
         return Err(format!("{bin} exited with {status}"));
     }
-    Ok(content)
+    Ok(())
+}
+
+pub fn edit_in_external_editor(initial: &str) -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("twig-prompt-{}.md", std::process::id()));
+    std::fs::write(&path, initial).map_err(|e| e.to_string())?;
+    let run_res = run_editor_on_path(&path);
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string());
+    let _ = std::fs::remove_file(&path);
+    run_res?;
+    content
+}
+
+/// Open an existing repository file (e.g. `.twig/preferences.md`) directly in `$EDITOR`.
+pub fn edit_file_in_external_editor(path: &Path) -> Result<usize, String> {
+    run_editor_on_path(path)?;
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    Ok(content.lines().count())
 }
 
 /// Copy text to system clipboard via OSC 52 (Kitty/Ghostty/WezTerm/tmux) + Wayland `wl-copy`.
@@ -557,5 +732,41 @@ mod tests {
     fn base64_encoder_matches_rfc4648() {
         assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
         assert_eq!(encode_base64(b"twig"), "dHdpZw==");
+    }
+
+    #[test]
+    fn init_project_files_creates_templates_without_overwriting() {
+        let dir = std::env::temp_dir().join(format!("twig-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (created, existing) = init_project_files(dir.to_str().unwrap()).unwrap();
+        assert_eq!(created, vec![".twig/preferences.md", ".twig/project.json"]);
+        assert!(existing.is_empty());
+
+        std::fs::write(dir.join(".twig/preferences.md"), "custom prefs\n").unwrap();
+        let (created2, existing2) = init_project_files(dir.to_str().unwrap()).unwrap();
+        assert!(created2.is_empty());
+        assert_eq!(existing2, vec![".twig/preferences.md", ".twig/project.json"]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".twig/preferences.md")).unwrap(),
+            "custom prefs\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_session_moves_jsonl_and_cleans_lock() {
+        let dir = std::env::temp_dir().join(format!("twig-archive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s1.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.join("s1.lock"), "1").unwrap();
+
+        let dst = archive_session_in_dir(&dir, "s1").unwrap();
+        assert!(dst.ends_with("archive/s1.jsonl"));
+        assert!(!dir.join("s1.jsonl").exists());
+        assert!(!dir.join("s1.lock").exists());
+        assert!(dir.join("archive/s1.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

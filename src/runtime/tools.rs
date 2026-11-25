@@ -1,6 +1,7 @@
 //! Worktree-confined tool execution with a narrow external interface.
 //!
-//! `read_only` is private and changed only via `restrict_read_only()`, and skill
+//! Access restrictions (`read_only_mask` combining permanent guard narrowing and
+//! user-toggled `/plan` mode) stay private behind behavioral methods, and skill
 //! metadata is queried via `SkillIndex::summary_json()`, avoiding field leaks.
 
 use std::path::{Path, PathBuf};
@@ -15,9 +16,12 @@ use crate::control::Control;
 use crate::exec::{isolation, run_live as exec_run_live, Owner};
 use crate::llm::ToolCall;
 
+const GUARD_RO: u8 = 0b01;
+const PLAN_RO: u8 = 0b10;
+
 pub struct Tools {
     worktree: PathBuf,
-    read_only: bool,
+    read_only_mask: u8,
     timeout: Duration,
     max_output: usize,
     read_max_lines: usize,
@@ -42,7 +46,7 @@ impl Tools {
         let skills = SkillIndex::discover(&worktree.join(".twig/skills")).ok();
         Self {
             worktree,
-            read_only: false,
+            read_only_mask: 0,
             timeout: Duration::from_secs(cfg.bash_timeout_secs),
             max_output: cfg.max_output,
             read_max_lines: cfg.read_max_lines,
@@ -62,9 +66,41 @@ impl Tools {
         &self.worktree
     }
 
-    /// Degrade the toolset to read-only mode (e.g. when the progress guard narrows).
+    /// Degrade the toolset to read-only mode permanently (e.g. when the progress guard narrows).
     pub fn restrict_read_only(&mut self) {
-        self.read_only = true;
+        self.read_only_mask |= GUARD_RO;
+    }
+
+    /// Toggle user-controlled read-only planning mode without ever weakening a guard latch.
+    /// Returns whether the toolset is effectively read-only afterward.
+    pub fn apply_plan_mode(&mut self, enabled: bool) -> bool {
+        if enabled {
+            self.read_only_mask |= PLAN_RO;
+        } else {
+            self.read_only_mask &= !PLAN_RO;
+        }
+        self.read_only_mask != 0
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only_mask != 0
+    }
+
+    /// System prompt instructions owned by the active tool configuration (skills + plan mode).
+    pub fn system_addendum(&self) -> String {
+        let mut out = String::new();
+        let metadata = self.skill_metadata();
+        if !metadata.is_empty() {
+            out.push_str(&format!(
+                "\nAvailable project skills (load body via skill tool only when relevant): {metadata}"
+            ));
+        }
+        if (self.read_only_mask & PLAN_RO) != 0 {
+            out.push_str(
+                "\nPlan mode is active (read-only). Explore the codebase, analyze requirements, and propose a concrete step-by-step plan. Do not modify files or run mutating commands.",
+            );
+        }
+        out
     }
 
     pub fn schema(&self) -> Value {
@@ -182,11 +218,15 @@ impl Tools {
         if raw.trim().is_empty() {
             return "refused: empty command".into();
         }
-        if self.read_only && !self.isolation {
-            return "refused: guard is narrow, toolset is read-only".into();
+        if self.is_read_only() && !self.isolation {
+            return if self.read_only_mask == PLAN_RO {
+                "refused: plan mode is active, toolset is read-only".into()
+            } else {
+                "refused: guard is narrow, toolset is read-only".into()
+            };
         }
         let isolated = if self.isolation {
-            match isolation::shell(&self.worktree, raw, self.network, self.read_only) {
+            match isolation::shell(&self.worktree, raw, self.network, self.is_read_only()) {
                 Ok(s) => Some(s),
                 Err(e) => return format!("isolation error: {e}"),
             }
@@ -228,6 +268,9 @@ impl Tools {
             "reviewer" => Role::Reviewer,
             _ => return "invalid subagent role".into(),
         };
+        if self.is_read_only() && matches!(role, Role::Code | Role::Test) {
+            return "refused: read-only mode only permits scout or reviewer subagents".into();
+        }
         if self.agent_pool.is_none() {
             let executable = match std::env::current_exe() {
                 Ok(p) => p,

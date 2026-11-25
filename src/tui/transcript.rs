@@ -13,10 +13,10 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use super::markdown::{
-    breathing_star, display_width, extract_code_blocks, fmt_elapsed_compact, highlight_search,
-    render_markdown, render_welcome_card, streaming_caret, style_output_line, tool_glyph,
-    wrap_plain, DiffGutterState, MotionMode, SmoothScroll, ACCENT, AMBER, IVORY, MUTED, ROSE, SAGE,
-    STONE, SURFACE,
+    breathing_star, clip_str, display_width, extract_code_blocks, fmt_elapsed_compact,
+    highlight_search, render_markdown, render_welcome_card, streaming_caret, style_output_line,
+    tool_glyph, wrap_plain, DiffGutterState, MotionMode, SmoothScroll, ACCENT, ACCENT_PEAK, AMBER,
+    IVORY, MUTED, ROSE, SAGE, STONE, SURFACE, SURFACE_HI,
 };
 
 pub struct RenderOpts<'a> {
@@ -710,6 +710,132 @@ impl Transcript {
             frame.set_cursor_position((cur_x, area.y));
         }
     }
+
+    /// Format the full transcript as clean Markdown for `/export`.
+    pub fn export_markdown(
+        &self,
+        sid: &str,
+        title: Option<&str>,
+        model: &str,
+        repo_path: &str,
+    ) -> String {
+        let heading = title
+            .map(|t| format!("# {t}"))
+            .unwrap_or_else(|| "# twig session export".to_owned());
+        let mut out = format!(
+            "{heading}\n\n- **Session:** `{}`\n- **Model:** `{model}`\n- **Workspace:** `{repo_path}`\n\n---\n\n",
+            if sid.is_empty() { "unknown" } else { sid }
+        );
+        for cell in &self.cells {
+            match cell {
+                Cell::User(text) => {
+                    out.push_str("## User\n\n");
+                    out.push_str(text.trim_end());
+                    out.push_str("\n\n");
+                }
+                Cell::Steering(text) => {
+                    out.push_str(&format!("> **Steering:** {}\n\n", text.trim()));
+                }
+                Cell::Assistant(text) => {
+                    out.push_str("## Assistant\n\n");
+                    out.push_str(text.trim_end());
+                    out.push_str("\n\n");
+                }
+                Cell::Tool(tool) => {
+                    let exit = tool
+                        .exit_code
+                        .map(|c| format!(" (exit {c})"))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "### Tool: {} `{}`{exit}\n\n",
+                        title_tool_name(&tool.name),
+                        tool.summary
+                    ));
+                    if !tool.output.trim().is_empty() {
+                        out.push_str("```text\n");
+                        out.push_str(tool.output.trim_end());
+                        out.push_str("\n```\n\n");
+                    }
+                }
+                Cell::Notice { text, .. } => {
+                    out.push_str(&format!("> *{}*\n\n", text.trim()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Borderless warm-amber hairline approval selector rendered above the footer.
+pub fn render_approval_panel(
+    frame: &mut Frame,
+    area: Rect,
+    id: &str,
+    name: &str,
+    args: &Value,
+    recovered: bool,
+    sel: usize,
+) {
+    if area.height < 6 || area.width < 18 {
+        return;
+    }
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let inner_w = area.width.saturating_sub(4) as usize;
+    let cmd_preview = summarize_tool_args(name, args);
+    let title = if recovered {
+        format!("  ▲ Recovered approval ({id}) — NO replay")
+    } else {
+        format!("  ▲ Approve {}? ({id})", title_tool_name(name))
+    };
+
+    let opt = |idx: usize, label: &str| -> Line<'static> {
+        let active = sel == idx;
+        let bg = if active { SURFACE_HI } else { Color::Reset };
+        let marker = if active { " ▸ " } else { "   " };
+        let fg = if active { IVORY } else { STONE };
+        let pad = inner_w.saturating_sub(display_width(marker) + display_width(label));
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(ACCENT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label.to_owned(),
+                Style::default().fg(fg).bg(bg).add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ])
+    };
+
+    let preview_line = format!(" $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(4)));
+    let preview_pad = inner_w.saturating_sub(display_width(&preview_line));
+
+    let rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
+        Line::from(Span::styled(
+            title,
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(preview_line, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
+            Span::styled(" ".repeat(preview_pad), Style::default().bg(SURFACE)),
+        ]),
+        Line::from(""),
+        opt(0, "1. Yes, allow once (y / Enter)"),
+        opt(1, "2. No, deny and tell agent (n / Esc)"),
+        Line::from(Span::styled(rule, Style::default().fg(AMBER))),
+    ];
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 /// Borderless Codex-style interactive session picker rendered above the footer for `/resume`.
@@ -796,16 +922,6 @@ pub fn title_tool_name(name: &str) -> String {
     }
 }
 
-pub fn clip_str(s: &str, max_chars: usize) -> String {
-    let limit = max_chars.max(8);
-    let clipped: String = s.chars().take(limit).collect();
-    if s.chars().count() > limit {
-        format!("{clipped}…")
-    } else {
-        clipped
-    }
-}
-
 pub fn summarize_tool_args(name: &str, args: &Value) -> String {
     let raw = match name {
         "bash" => args["command"].as_str().unwrap_or(""),
@@ -816,4 +932,57 @@ pub fn summarize_tool_args(name: &str, args: &Value) -> String {
         _ => "",
     };
     clip_str(&raw.replace('\n', " "), 92)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn export_markdown_formats_conversation_and_tools() {
+        let mut t = Transcript::new();
+        t.push_user("Explain architecture".into());
+        t.push_assistant("Five deep modules.".into());
+        t.push_tool_snapshot(
+            "t1".into(),
+            "bash".into(),
+            "cargo test".into(),
+            "auto".into(),
+            "ok".into(),
+            Some(0),
+        );
+        let md = t.export_markdown("sess-42", Some("Audit"), "magpie", "~/twig");
+        assert!(md.contains("# Audit"));
+        assert!(md.contains("Explain architecture"));
+        assert!(md.contains("Five deep modules."));
+        assert!(md.contains("Tool: Bash `cargo test` (exit 0)"));
+    }
+
+    #[test]
+    fn copy_extracts_code_blocks_and_full_reply_and_replays_history() {
+        let mut t = Transcript::new();
+        t.push_assistant(
+            "First:\n```rust\nlet a = 1;\n```\nSecond:\n```rust\nlet b = 2;\n```".into(),
+        );
+        assert_eq!(t.copy_latest_code_block().unwrap().0, "let b = 2;");
+        assert_eq!(t.copy_latest_code_block().unwrap().0, "let a = 1;");
+        assert!(t.copy_latest_reply().unwrap().0.contains("let a = 1;"));
+
+        t.clear();
+        t.replay_history(&[
+            json!({"role": "user", "content": "check build"}),
+            json!({
+                "role": "assistant",
+                "content": "Running build now.",
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"cargo check\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "Finished"}),
+        ]);
+        assert_eq!(t.len(), 3);
+    }
 }

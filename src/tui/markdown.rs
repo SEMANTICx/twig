@@ -5,8 +5,11 @@
 
 use std::time::Duration;
 
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Claude Code warm terracotta minimalist palette (RGB tuples for continuous `blend()`).
@@ -927,8 +930,8 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
             "insert newline",
         ),
         row(
-            "Esc",
-            "interrupt / press×2 clear",
+            "Shift+Tab",
+            "toggle plan mode (RO)",
             "!cmd · @ · /",
             "shell · file · commands",
         ),
@@ -945,10 +948,186 @@ pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
             "copy code / full reply",
         ),
         Line::from(Span::styled(
-            "  Alt+M toggle mouse select · ? or Esc close · PgUp/PgDn scroll · Ctrl+C quit",
+            "  Esc interrupt / ×2 clear · Alt+M mouse select · ? close · PgUp/PgDn scroll · ^C quit",
             Style::default().fg(MUTED),
         )),
     ]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FooterMode {
+    Contextual,
+    ShortcutOverlay,
+    QuitReminder,
+    EscHint,
+}
+
+pub struct FooterView<'a> {
+    pub mode: FooterMode,
+    pub flash: Option<&'a str>,
+    pub repo_label: &'a str,
+    pub git_branch: Option<&'a str>,
+    pub model: &'a str,
+    pub title: Option<&'a str>,
+    pub sid: &'a str,
+    pub plan_mode: bool,
+    pub context_pct: Option<usize>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub playbook: Option<&'a str>,
+    pub guard_level: Option<&'a str>,
+    pub mouse_enabled: bool,
+    pub right_hint: &'a str,
+}
+
+pub fn clip_str(s: &str, max_chars: usize) -> String {
+    let limit = max_chars.max(8);
+    let clipped: String = s.chars().take(limit).collect();
+    if s.chars().count() > limit {
+        format!("{clipped}…")
+    } else {
+        clipped
+    }
+}
+
+pub fn fmt_tokens_compact(n: u64) -> String {
+    if n < 1_000 {
+        format!("{n} tok")
+    } else if n < 1_000_000 {
+        format!("{:.1}k tok", n as f64 / 1_000.0)
+    } else {
+        format!("{:.2}M tok", n as f64 / 1_000_000.0)
+    }
+}
+
+/// Borderless Codex/Claude footer with live model, plan-mode badge, context %, tokens, and cache %.
+pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
+    match view.mode {
+        FooterMode::ShortcutOverlay => {
+            frame.render_widget(Paragraph::new(shortcut_overlay_lines()), area);
+            return;
+        }
+        FooterMode::QuitReminder => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  Press Ctrl+C again to quit",
+                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                )),
+                area,
+            );
+            return;
+        }
+        FooterMode::EscHint => {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  Press Esc again to clear draft",
+                    Style::default().fg(AMBER),
+                )),
+                area,
+            );
+            return;
+        }
+        FooterMode::Contextual => {}
+    }
+
+    let left: Line<'static> = if let Some(msg) = view.flash {
+        Line::from(Span::styled(format!("  {msg}"), Style::default().fg(AMBER)))
+    } else {
+        let mut spans = vec![
+            Span::styled(
+                "  ✻ ",
+                Style::default()
+                    .fg(if view.plan_mode { AMBER } else { ACCENT })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(view.repo_label.to_owned(), Style::default().fg(STONE)),
+        ];
+        if let Some(branch) = view.git_branch {
+            spans.push(Span::styled(
+                format!(" ({branch})"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        spans.push(Span::styled(
+            format!(" · {}", view.model),
+            Style::default().fg(ACCENT_PEAK),
+        ));
+        if view.plan_mode {
+            spans.push(Span::styled(
+                " · ◈ plan",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(title) = view.title {
+            spans.push(Span::styled(
+                format!(" · {}", clip_str(title, 20)),
+                Style::default().fg(IVORY),
+            ));
+        }
+        if let Some(pct) = view.context_pct {
+            let color = if pct >= 85 {
+                ROSE
+            } else if pct >= 65 {
+                AMBER
+            } else {
+                MUTED
+            };
+            spans.push(Span::styled(
+                format!(" · ctx {pct}%"),
+                Style::default().fg(color),
+            ));
+        }
+        let total_tok = view.input_tokens + view.output_tokens;
+        if total_tok > 0 {
+            spans.push(Span::styled(
+                format!(" · {}", fmt_tokens_compact(total_tok)),
+                Style::default().fg(MUTED),
+            ));
+            if view.cached_tokens > 0 {
+                if let Some(hit) = (view.cached_tokens * 100).checked_div(view.input_tokens) {
+                    spans.push(Span::styled(
+                        format!(" · cache {hit}%"),
+                        Style::default().fg(SAGE),
+                    ));
+                }
+            }
+        }
+        if let Some(book) = view.playbook {
+            spans.push(Span::styled(
+                format!(" · ✦ {book}"),
+                Style::default().fg(AMBER),
+            ));
+        }
+        if let Some(level) = view.guard_level {
+            spans.push(Span::styled(
+                format!(" · ▲ {level}"),
+                Style::default().fg(ROSE),
+            ));
+        }
+        if !view.mouse_enabled {
+            spans.push(Span::styled(" · select", Style::default().fg(AMBER)));
+        }
+        if !view.sid.is_empty() && view.title.is_none() {
+            let short: String = view.sid.chars().take(10).collect();
+            spans.push(Span::styled(
+                format!(" · {short}"),
+                Style::default().fg(MUTED),
+            ));
+        }
+        Line::from(spans)
+    };
+
+    let right_w = (display_width(view.right_hint) as u16).min(area.width / 2);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(right_w)])
+        .split(area);
+    frame.render_widget(Paragraph::new(left), cols[0]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(view.right_hint.to_owned(), Style::default().fg(MUTED))),
+        cols[1],
+    );
 }
 
 #[cfg(test)]
