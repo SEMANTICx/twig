@@ -1,8 +1,8 @@
-//! Borderless Claude-Code-style multiline composer with:
-//! - Hairline top/bottom rules (`─`) and terracotta `❯` prompt glyph
-//! - CJK/emoji-safe cursor placement and readline shortcuts
+//! Borderless Claude-Code-style multiline composer with generous breathing margins:
+//! - Inset top & bottom hairline rules (`─`) and warm terracotta `❯` glyph
+//! - CJK/emoji-safe cursor math and readline shortcuts
 //! - Codex-style large-paste folding pills (`[Pasted #1 · 12 lines]`)
-//! - `/` slash-command and `@` repo-file fuzzy completion popups
+//! - Charmbracelet/Lip-Gloss rounded popups for `/` commands and `@` repo file mentions
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,7 +28,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/copy", "Copy latest assistant code block (Alt+Y)"),
     ("/editor", "Compose prompt in $EDITOR (Ctrl+G)"),
     ("/clear", "Clear local transcript view"),
-    ("/help", "Show keyboard shortcuts and commands"),
+    ("/help", "Show keyboard shortcuts (or press ?)"),
     ("/quit", "Exit twig chat"),
 ];
 
@@ -115,7 +115,6 @@ impl Composer {
         if self.cursor == 0 {
             return;
         }
-        // If cursor is right after a paste pill, remove the entire pill cleanly.
         if let Some(pill) = self
             .pastes
             .keys()
@@ -303,7 +302,6 @@ impl Composer {
     }
 
     fn active_popup(&self) -> Option<PopupKind> {
-        // 1. Slash commands at start of prompt.
         if self.text.starts_with('/') && !self.text.contains('\n') && !self.text.contains(' ') {
             let matches: Vec<(String, String)> = SLASH_COMMANDS
                 .iter()
@@ -314,7 +312,6 @@ impl Composer {
                 return Some(PopupKind::Slash(matches));
             }
         }
-        // 2. `@path` fuzzy repo file mention near cursor.
         let before = &self.text[..self.cursor];
         let token_start = before
             .rfind(|c: char| c.is_whitespace())
@@ -356,13 +353,14 @@ impl Composer {
     }
 
     pub fn desired_height(&self, total_width: usize) -> u16 {
-        let text_w = total_width.saturating_sub(4).max(16);
+        // 2-col left margin + `❯ ` (2 cols) + 2-col right margin = 6 cols chrome
+        let text_w = total_width.saturating_sub(6).max(16);
         let lines = wrap_plain(&self.text, text_w);
         // 1 top hairline + content lines (1..=6) + 1 bottom hairline
         (lines.len() as u16 + 2).clamp(3, 8)
     }
 
-    /// Claude Code borderless hairline composer (`─` top & bottom, `❯` terracotta prompt).
+    /// Claude Code hairline composer with 2-col horizontal breathing margin (`  ❯  `).
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -372,15 +370,15 @@ impl Composer {
         placeholder: &str,
         show_cursor: bool,
     ) {
-        if area.height < 3 || area.width < 8 {
+        if area.height < 3 || area.width < 10 {
             return;
         }
-        let rule = "─".repeat(area.width as usize);
+        let rule_len = area.width.saturating_sub(2) as usize;
+        let rule_line = format!(" {}", "─".repeat(rule_len));
         let rule_style = Style::default().fg(rule_color);
 
-        // Top hairline
         frame.render_widget(
-            Paragraph::new(Span::styled(rule.clone(), rule_style)),
+            Paragraph::new(Span::styled(rule_line.clone(), rule_style)),
             Rect {
                 x: area.x,
                 y: area.y,
@@ -388,9 +386,8 @@ impl Composer {
                 height: 1,
             },
         );
-        // Bottom hairline
         frame.render_widget(
-            Paragraph::new(Span::styled(rule, rule_style)),
+            Paragraph::new(Span::styled(rule_line, rule_style)),
             Rect {
                 x: area.x,
                 y: area.y + area.height - 1,
@@ -405,12 +402,12 @@ impl Composer {
             width: area.width,
             height: area.height.saturating_sub(2),
         };
-        let text_w = area.width.saturating_sub(4).max(12) as usize;
+        let text_w = area.width.saturating_sub(6).max(12) as usize;
 
         let rendered_lines: Vec<Line<'static>> = if self.text.is_empty() {
             vec![Line::from(vec![
                 Span::styled(
-                    " ❯ ",
+                    "  ❯ ",
                     Style::default()
                         .fg(prompt_color)
                         .add_modifier(Modifier::BOLD),
@@ -422,7 +419,7 @@ impl Composer {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, segment)| {
-                    let prefix = if idx == 0 { " ❯ " } else { "   " };
+                    let prefix = if idx == 0 { "  ❯ " } else { "    " };
                     let mut spans = vec![Span::styled(
                         prefix,
                         Style::default()
@@ -455,21 +452,23 @@ impl Composer {
                 .unwrap_or(0);
             if cur_row < body_area.height {
                 frame.set_cursor_position((
-                    body_area.x + 3 + cur_col.min(text_w as u16),
+                    body_area.x + 4 + cur_col.min(text_w as u16),
                     body_area.y + cur_row,
                 ));
             }
         }
     }
 
-    /// Docked minimal popup above the composer for `/` commands or `@` file mentions.
+    /// Rounded Lip-Gloss-style docked popup above the composer for `/` commands or `@` mentions.
     pub fn render_popup(&self, frame: &mut Frame, composer_area: Rect, transcript_h: u16) {
         let Some(popup) = self.active_popup() else {
             return;
         };
-        if transcript_h < 4 {
+        if transcript_h < 4 || composer_area.width < 20 {
             return;
         }
+        let popup_w = composer_area.width.saturating_sub(4).min(70);
+        let inner_w = popup_w.saturating_sub(2) as usize;
         let (title, rows): (&str, Vec<Line<'static>>) = match popup {
             PopupKind::Slash(items) => {
                 let sel = self.popup_sel.min(items.len().saturating_sub(1));
@@ -479,28 +478,36 @@ impl Composer {
                     .map(|(i, (cmd, desc))| {
                         let active = i == sel;
                         let bg = if active { SURFACE_HI } else { Color::Reset };
+                        let marker = if active { " ▸ " } else { "   " };
+                        let cmd_col = format!("{cmd:<12}");
+                        let used = display_width(marker) + display_width(&cmd_col);
+                        let desc_clipped: String = desc
+                            .chars()
+                            .take(inner_w.saturating_sub(used + 1))
+                            .collect();
+                        let pad = inner_w.saturating_sub(used + display_width(&desc_clipped));
                         Line::from(vec![
+                            Span::styled("│", Style::default().fg(HAIRLINE)),
+                            Span::styled(marker, Style::default().fg(ACCENT).bg(bg)),
                             Span::styled(
-                                if active { " ❯ " } else { "   " },
-                                Style::default().fg(ACCENT).bg(bg),
-                            ),
-                            Span::styled(
-                                format!("{cmd:<12}"),
+                                cmd_col,
                                 Style::default()
                                     .fg(if active { ACCENT_PEAK } else { ACCENT })
                                     .bg(bg)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                desc,
+                                desc_clipped,
                                 Style::default()
                                     .fg(if active { IVORY } else { STONE })
                                     .bg(bg),
                             ),
+                            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+                            Span::styled("│", Style::default().fg(HAIRLINE)),
                         ])
                     })
                     .collect();
-                (" Commands · ↑/↓ select · Tab complete ", lines)
+                (" Commands · ↑/↓ · Tab ", lines)
             }
             PopupKind::Mention { items, .. } => {
                 let sel = self.popup_sel.min(items.len().saturating_sub(1));
@@ -510,49 +517,61 @@ impl Composer {
                     .map(|(i, path)| {
                         let active = i == sel;
                         let bg = if active { SURFACE_HI } else { Color::Reset };
+                        let marker = if active { " ▸ ◇ " } else { "   ◇ " };
+                        let used = display_width(marker);
+                        let clipped: String = path
+                            .chars()
+                            .take(inner_w.saturating_sub(used + 1))
+                            .collect();
+                        let pad = inner_w.saturating_sub(used + display_width(&clipped));
                         Line::from(vec![
+                            Span::styled("│", Style::default().fg(HAIRLINE)),
                             Span::styled(
-                                if active { " ❯ " } else { "   " },
-                                Style::default().fg(ACCENT).bg(bg),
+                                marker,
+                                Style::default()
+                                    .fg(if active { ACCENT } else { MUTED })
+                                    .bg(bg),
                             ),
                             Span::styled(
-                                path,
+                                clipped,
                                 Style::default()
                                     .fg(if active { IVORY } else { STONE })
                                     .bg(bg),
                             ),
+                            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+                            Span::styled("│", Style::default().fg(HAIRLINE)),
                         ])
                     })
                     .collect();
-                (" Files · ↑/↓ select · Tab insert ", lines)
+                (" Files · ↑/↓ · Tab ", lines)
             }
         };
 
-        let popup_h = (rows.len() as u16 + 1).min(transcript_h);
-        let popup_w = composer_area.width.min(72);
+        let popup_h = (rows.len() as u16 + 2).min(transcript_h);
         let popup_area = Rect {
-            x: composer_area.x,
+            x: composer_area.x + 2,
             y: composer_area.y.saturating_sub(popup_h),
             width: popup_w,
             height: popup_h,
         };
-        let mut all = Vec::with_capacity(rows.len() + 1);
-        let rule_fill = (popup_w as usize)
-            .saturating_sub(display_width(title) + 2)
-            .min(40);
+        let mut all = Vec::with_capacity(rows.len() + 2);
+        let top_fill = inner_w.saturating_sub(display_width(title) + 1);
         all.push(Line::from(vec![
-            Span::styled("──", Style::default().fg(HAIRLINE)),
-            Span::styled(title, Style::default().fg(MUTED)),
-            Span::styled("─".repeat(rule_fill), Style::default().fg(HAIRLINE)),
+            Span::styled("╭─", Style::default().fg(HAIRLINE)),
+            Span::styled(title, Style::default().fg(STONE)),
+            Span::styled(format!("{}╮", "─".repeat(top_fill)), Style::default().fg(HAIRLINE)),
         ]));
         all.extend(rows);
+        all.push(Line::from(Span::styled(
+            format!("╰{}╯", "─".repeat(inner_w)),
+            Style::default().fg(HAIRLINE),
+        )));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(Paragraph::new(all), popup_area);
     }
 }
 
 fn style_composer_segment(seg: &str) -> Vec<Span<'static>> {
-    // Highlight inline paste pills `[Pasted #...]` in warm accent tint.
     let mut out = Vec::new();
     let mut rest = seg;
     while let Some(start) = rest.find("[Pasted #") {
@@ -588,7 +607,14 @@ fn list_repo_files(repo: &str) -> Vec<String> {
         return Vec::new();
     }
     if let Ok(out) = Command::new("git")
-        .args(["-C", repo, "ls-files", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "-C",
+            repo,
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .output()
     {
         if out.status.success() {
