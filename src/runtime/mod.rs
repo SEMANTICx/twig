@@ -484,6 +484,7 @@ impl<'a> Daemon<'a> {
                 } else {
                     self.model_override = Some(requested.to_owned());
                 }
+                let _ = crate::llm::Provider::save_model(self.model_override.as_deref());
                 let active = self
                     .model_override
                     .clone()
@@ -916,6 +917,16 @@ impl<'a> Daemon<'a> {
                 let drained = std::mem::take(&mut self.audit);
                 Ok(json!({"rows": drained}))
             }
+
+            "edit.undo" => match self.tools.undo_last_edit() {
+                Ok(summary) => {
+                    self.record
+                        .append("edit.undone", json!({"summary": summary}))
+                        .map_err(|e| e.to_string())?;
+                    Ok(json!({"ok": true, "summary": summary}))
+                }
+                Err(e) => Err(e),
+            },
 
             other => Err(format!("unknown method {other:?}")),
         }

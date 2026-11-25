@@ -82,6 +82,11 @@ pub fn tool_glyph(name: &str) -> &'static str {
     match name {
         "bash" => "$",
         "read" => "◇",
+        "edit" => "✎",
+        "write" => "+",
+        "grep" => "⌕",
+        "glob" => "◌",
+        "diff" => "±",
         "skill" => "✦",
         "subagent" => "◈",
         "papercut" => "⚑",

@@ -34,9 +34,9 @@ use serde_json::{json, Value};
 use self::client::{
     archive_session_file, chat_plain, copy_to_clipboard, detect_git_branch,
     edit_file_in_external_editor, edit_in_external_editor, ensure_memory_file,
-    format_verify_report, init_project_files, list_sessions, notify_osc99, run_doctor,
-    run_git_diff, run_independent_review, run_local_shell, shorten_home, write_export_file,
-    ServeClient, ServerMsg, SessionSummary, TerminalGuard,
+    fetch_magpie_models, format_verify_report, init_project_files, list_sessions, notify_osc99,
+    run_doctor, run_git_diff, run_independent_review, run_local_shell, shorten_home,
+    write_export_file, ServeClient, ServerMsg, TerminalGuard,
 };
 use self::composer::{Composer, PopupAccept};
 use self::markdown::{
@@ -45,10 +45,11 @@ use self::markdown::{
     HAIRLINE, HAIRLINE_FOCUS, MUTED,
 };
 use self::transcript::{
-    render_approval_panel, render_resume_picker, summarize_tool_args, title_tool_name, NoticeKind,
-    RenderOpts, Transcript,
+    render_approval_panel, summarize_tool_args, title_tool_name, NoticeKind, OverlayPicker,
+    PickerOutcome, RenderOpts, Transcript,
 };
 use crate::config::HarnessConfig;
+use crate::llm::Provider;
 
 const ACTIVITY_VERBS: &[&str] = &[
     "Thinking",
@@ -84,6 +85,7 @@ enum LocalMsg {
     },
     Review(Result<String, String>),
     Doctor(Result<(String, bool), String>),
+    Models(Result<Vec<String>, String>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,7 +100,9 @@ enum Action {
     SwitchSession(String),
     RenameSession(String),
     ArchiveSession,
+    OpenModelPicker,
     SetModel(String),
+    UndoEdit,
     CompactNow,
     VerifySession,
     EditMemory,
@@ -141,10 +145,11 @@ struct App {
     active_turn_req: Option<u64>,
     history_req: Option<u64>,
     verify_req: Option<u64>,
+    undo_req: Option<u64>,
     transcript: Transcript,
     approvals: VecDeque<PendingApproval>,
     approval_sel: usize,
-    resume_picker: Option<(Vec<SessionSummary>, usize)>,
+    overlay_picker: Option<OverlayPicker>,
     composer: Composer,
     mouse_enabled: bool,
     motion: MotionMode,
@@ -175,7 +180,10 @@ impl App {
             git_branch: detect_git_branch(repo),
             sid: String::new(),
             title: None,
-            model: std::env::var("TWIG_MODEL").unwrap_or_else(|_| "magpie".into()),
+            model: std::env::var("TWIG_MODEL")
+                .ok()
+                .or_else(Provider::saved_model)
+                .unwrap_or_else(|| "magpie".into()),
             plan_mode: false,
             playbook: None,
             guard_level: None,
@@ -195,10 +203,11 @@ impl App {
             active_turn_req: None,
             history_req: None,
             verify_req: None,
+            undo_req: None,
             transcript: Transcript::new(),
             approvals: VecDeque::new(),
             approval_sel: 0,
-            resume_picker: None,
+            overlay_picker: None,
             composer: Composer::new(repo),
             mouse_enabled: true,
             motion: MotionMode::from_env(),
@@ -228,10 +237,11 @@ impl App {
         self.last_delta_at = None;
         self.active_turn_req = None;
         self.verify_req = None;
+        self.undo_req = None;
         self.transcript.clear();
         self.approvals.clear();
         self.approval_sel = 0;
-        self.resume_picker = None;
+        self.overlay_picker = None;
     }
 
     fn update_status_header(&mut self, next: String) {
@@ -344,6 +354,14 @@ impl App {
                         },
                         report,
                     );
+                }
+                if self.undo_req == Some(id) {
+                    self.undo_req = None;
+                    if let Some(summary) = result.get("summary").and_then(Value::as_str) {
+                        self.flash(summary);
+                        self.transcript
+                            .push_notice(NoticeKind::Success, format!("undo: {summary}"));
+                    }
                 }
                 if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
                     if !compacted {
@@ -468,6 +486,25 @@ impl App {
                     .transcript
                     .push_notice(NoticeKind::Error, format!("doctor: {e}")),
             },
+            LocalMsg::Models(res) => match res {
+                Ok(models) if !models.is_empty() => {
+                    self.overlay_picker = Some(OverlayPicker::model(models, self.model.clone()));
+                }
+                Ok(_) => self.transcript.push_notice(
+                    NoticeKind::Info,
+                    format!(
+                        "active model: {} (magpie returned no model list; use `/model <name>` or `/model reset`)",
+                        self.model
+                    ),
+                ),
+                Err(e) => self.transcript.push_notice(
+                    NoticeKind::Warn,
+                    format!(
+                        "active model: {} (could not fetch magpie models: {e}; use `/model <name>`)",
+                        self.model
+                    ),
+                ),
+            },
         }
     }
 
@@ -494,6 +531,21 @@ impl App {
                 if let Some(m) = ev["max_bytes"].as_u64() {
                     self.context_max = m as usize;
                 }
+            }
+            Some("model.reasoning") => {
+                let delta = ev["text"].as_str().unwrap_or("");
+                if !delta.is_empty() {
+                    self.last_delta_at = Some(Instant::now());
+                    self.transcript.append_reasoning_delta(delta);
+                }
+            }
+            Some("model.retry") => {
+                let attempt = ev["attempt"].as_u64().unwrap_or(1);
+                let secs = ev["backoff_secs"].as_u64().unwrap_or(1);
+                self.transcript.push_notice(
+                    NoticeKind::Warn,
+                    format!("model transient error — retrying (attempt {attempt}, {secs}s backoff)…"),
+                );
             }
             Some("model.delta") => {
                 let delta = ev["text"].as_str().unwrap_or("");
@@ -670,8 +722,8 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
-                    if self.resume_picker.is_some() {
-                        self.resume_picker = None;
+                    if self.overlay_picker.is_some() {
+                        self.overlay_picker = None;
                         return Action::None;
                     }
                     if self.transcript.search_is_open() {
@@ -738,25 +790,22 @@ impl App {
             }
         }
 
-        if let Some((sessions, sel)) = self.resume_picker.as_mut() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.resume_picker = None,
-                KeyCode::Up | KeyCode::Char('k') if !sessions.is_empty() => {
-                    *sel = sel.saturating_sub(1);
+        if let Some(picker) = self.overlay_picker.as_mut() {
+            return match picker.handle_key(key) {
+                PickerOutcome::None => Action::None,
+                PickerOutcome::Close => {
+                    self.overlay_picker = None;
+                    Action::None
                 }
-                KeyCode::Down | KeyCode::Char('j') if !sessions.is_empty() => {
-                    *sel = (*sel + 1).min(sessions.len() - 1);
+                PickerOutcome::SelectSession(sid) => {
+                    self.overlay_picker = None;
+                    Action::SwitchSession(sid)
                 }
-                KeyCode::Enter => {
-                    if let Some(chosen) = sessions.get(*sel).cloned() {
-                        self.resume_picker = None;
-                        return Action::SwitchSession(chosen.sid);
-                    }
-                    self.resume_picker = None;
+                PickerOutcome::SelectModel(model) => {
+                    self.overlay_picker = None;
+                    Action::SetModel(model)
                 }
-                _ => {}
-            }
-            return Action::None;
+            };
         }
 
         if self.transcript.search_is_open() {
@@ -1019,6 +1068,7 @@ impl App {
             "/editor" => return Action::OpenEditor,
             "/mouse" => return Action::ToggleMouse,
             "/diff" => return Action::RunDiff,
+            "/undo" => return Action::UndoEdit,
             "/review" => return Action::RunReview,
             "/compact" => return Action::CompactNow,
             "/help" => {
@@ -1031,7 +1081,7 @@ impl App {
                     self.transcript
                         .push_notice(NoticeKind::Info, "no saved sessions found");
                 } else {
-                    self.resume_picker = Some((sessions, 0));
+                    self.overlay_picker = Some(OverlayPicker::resume(sessions));
                 }
                 return Action::None;
             }
@@ -1072,13 +1122,13 @@ impl App {
                     self.playbooks_meta.join(", ")
                 };
                 let skills = if self.skills_meta.trim().is_empty() {
-                    "none in .twig/skills".to_owned()
+                    "none in .twig/skills or ~/.config/twig/skills".to_owned()
                 } else {
                     self.skills_meta.clone()
                 };
                 self.transcript.push_notice(
                     NoticeKind::Playbook,
-                    format!("playbooks: {books} · project skills: {skills}"),
+                    format!("playbooks: {books} · skills: {skills}"),
                 );
                 return Action::None;
             }
@@ -1096,16 +1146,7 @@ impl App {
                 ),
                 Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
             },
-            "/model" => {
-                self.transcript.push_notice(
-                    NoticeKind::Info,
-                    format!(
-                        "active model: {} (use `/model <name>` or `/model reset`)",
-                        self.model
-                    ),
-                );
-                return Action::None;
-            }
+            "/model" => return Action::OpenModelPicker,
             "/find" => {
                 self.transcript.search_open_with("");
                 return Action::None;
@@ -1209,21 +1250,16 @@ impl App {
 
         let area = frame.area();
         let has_approval = !self.approvals.is_empty();
-        let has_resume = self.resume_picker.is_some();
+        let has_picker = self.overlay_picker.is_some();
         let search_open = self.transcript.search_is_open();
-        let activity_h: u16 = if self.running && !has_approval && !has_resume {
+        let activity_h: u16 = if self.running && !has_approval && !has_picker {
             1
         } else {
             0
         };
         let search_h: u16 = if search_open { 1 } else { 0 };
-        let bottom_panel_h: u16 = if has_resume {
-            let count = self
-                .resume_picker
-                .as_ref()
-                .map(|(v, _)| v.len().clamp(1, 8) as u16)
-                .unwrap_or(1);
-            count + 3
+        let bottom_panel_h: u16 = if let Some(picker) = &self.overlay_picker {
+            picker.desired_height()
         } else if has_approval {
             7
         } else {
@@ -1282,8 +1318,8 @@ impl App {
             self.transcript.render_search_bar(frame, chunks[2]);
         }
 
-        if let Some((sessions, sel)) = &self.resume_picker {
-            render_resume_picker(frame, chunks[3], sessions, *sel);
+        if let Some(picker) = &self.overlay_picker {
+            picker.render(frame, chunks[3]);
         } else if let Some(pending) = self.approvals.front() {
             render_approval_panel(
                 frame,
@@ -1339,8 +1375,8 @@ impl App {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
             .map(|(s, _)| s.as_str());
-        let right_hint = if self.resume_picker.is_some() {
-            "↑/↓ select · Enter open · Esc close  "
+        let right_hint = if let Some(picker) = &self.overlay_picker {
+            picker.hint()
         } else if !self.approvals.is_empty() {
             "↑/↓ select · Enter confirm · Esc deny  "
         } else if self.transcript.search_is_open() {
@@ -1525,12 +1561,26 @@ impl App {
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
+                            Action::OpenModelPicker => {
+                                self.flash("Fetching models from magpie…");
+                                let tx = local_tx.clone();
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(LocalMsg::Models(fetch_magpie_models()));
+                                });
+                            }
                             Action::SetModel(model) => {
                                 match client.send("model.set", json!({"model": model})) {
-                                    Ok(_) => self.flash(format!("Switching model → {model}")),
+                                    Ok(_) => self.flash(format!("Switching model → {model} (saved)")),
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
+                            Action::UndoEdit => match client.send("edit.undo", json!({})) {
+                                Ok(id) => {
+                                    self.undo_req = Some(id);
+                                    self.flash("Reverting last edit…");
+                                }
+                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                            },
                             Action::CompactNow => {
                                 match client.send("session.compact", json!({})) {
                                     Ok(_) => self.flash("Compacting context…"),
@@ -1884,6 +1934,8 @@ mod tests {
         assert_eq!(app.dispatch_input("/doctor"), Action::RunDoctor);
         assert_eq!(app.dispatch_input("/archive"), Action::ArchiveSession);
         assert_eq!(app.dispatch_input("/verify"), Action::VerifySession);
+        assert_eq!(app.dispatch_input("/undo"), Action::UndoEdit);
+        assert_eq!(app.dispatch_input("/model"), Action::OpenModelPicker);
         assert_eq!(app.dispatch_input("/export"), Action::ExportTranscript(None));
         assert_eq!(
             app.dispatch_input("/export out/chat.md"),

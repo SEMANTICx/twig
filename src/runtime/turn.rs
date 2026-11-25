@@ -243,6 +243,8 @@ pub fn run_turn_live(
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             )
+        } else if matches!(call.name.as_str(), "edit" | "write") {
+            Tier::Audit
         } else {
             Tier::Auto
         };

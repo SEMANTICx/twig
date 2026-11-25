@@ -53,6 +53,7 @@ struct ToolCell {
 enum Cell {
     User(String),
     Steering(String),
+    Reasoning(String),
     Assistant(String),
     Tool(ToolCell),
     Notice { kind: NoticeKind, text: String },
@@ -119,6 +120,17 @@ impl Transcript {
             buf.push_str(delta);
         } else {
             self.cells.push(Cell::Assistant(delta.to_owned()));
+        }
+    }
+
+    pub fn append_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(Cell::Reasoning(buf)) = self.cells.last_mut() {
+            buf.push_str(delta);
+        } else {
+            self.cells.push(Cell::Reasoning(delta.to_owned()));
         }
     }
 
@@ -530,7 +542,8 @@ impl Transcript {
 
                     let out_lines: Vec<&str> = tool.output.lines().collect();
                     if !out_lines.is_empty() {
-                        let is_local_expanded = tool.tier == "local" || tool.name == "diff";
+                        let is_local_expanded =
+                            tool.tier == "local" || matches!(tool.name.as_str(), "diff" | "edit");
                         let show_lines = if self.expand_tools || is_local_expanded {
                             200
                         } else if !tool.finished {
@@ -589,6 +602,33 @@ impl Transcript {
                                 }
                             }
                         }
+                    }
+                }
+                Cell::Reasoning(text) => {
+                    let wrapped = wrap_plain(text.trim(), inner.saturating_sub(6));
+                    let total = wrapped.len();
+                    let show = if self.expand_tools { total } else { total.min(2) };
+                    let header_hint = if !self.expand_tools && total > 2 {
+                        format!("  … +{total} lines (^O expand)")
+                    } else {
+                        String::new()
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  ∴ ", Style::default().fg(MUTED)),
+                        Span::styled(
+                            "Thinking",
+                            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                        ),
+                        Span::styled(header_hint, Style::default().fg(MUTED)),
+                    ]));
+                    for row in wrapped.into_iter().take(show) {
+                        lines.push(Line::from(vec![
+                            Span::raw("    "),
+                            Span::styled(
+                                row,
+                                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                            ),
+                        ]));
                     }
                 }
                 Cell::Notice { kind, text } => {
@@ -736,6 +776,11 @@ impl Transcript {
                 Cell::Steering(text) => {
                     out.push_str(&format!("> **Steering:** {}\n\n", text.trim()));
                 }
+                Cell::Reasoning(text) => {
+                    out.push_str("<details>\n<summary>Thinking</summary>\n\n");
+                    out.push_str(text.trim_end());
+                    out.push_str("\n\n</details>\n\n");
+                }
                 Cell::Assistant(text) => {
                     out.push_str("## Assistant\n\n");
                     out.push_str(text.trim_end());
@@ -838,8 +883,219 @@ pub fn render_approval_panel(
     frame.render_widget(Paragraph::new(rows), area);
 }
 
+pub enum PickerOutcome {
+    None,
+    Close,
+    SelectSession(String),
+    SelectModel(String),
+}
+
+/// Borderless Codex-style interactive overlay picker shared by `/resume` and `/model`.
+pub enum OverlayPicker {
+    Resume {
+        sessions: Vec<super::client::SessionSummary>,
+        sel: usize,
+    },
+    Model {
+        all: Vec<String>,
+        filter: String,
+        active: String,
+        sel: usize,
+    },
+}
+
+impl OverlayPicker {
+    pub fn resume(sessions: Vec<super::client::SessionSummary>) -> Self {
+        Self::Resume { sessions, sel: 0 }
+    }
+
+    pub fn model(all: Vec<String>, active: String) -> Self {
+        let sel = all.iter().position(|m| m == &active).unwrap_or(0);
+        Self::Model {
+            all,
+            filter: String::new(),
+            active,
+            sel,
+        }
+    }
+
+    pub fn hint(&self) -> &'static str {
+        match self {
+            Self::Resume { .. } => "↑/↓ select · Enter open · Esc close  ",
+            Self::Model { .. } => "type to filter · ↑/↓ select · Enter apply · Esc close  ",
+        }
+    }
+
+    pub fn desired_height(&self) -> u16 {
+        let count = match self {
+            Self::Resume { sessions, .. } => sessions.len(),
+            Self::Model { all, filter, .. } => filtered_models(all, filter).len(),
+        };
+        (count.clamp(1, 8) as u16) + 3
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> PickerOutcome {
+        match self {
+            Self::Resume { sessions, sel } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => PickerOutcome::Close,
+                KeyCode::Up | KeyCode::Char('k') if !sessions.is_empty() => {
+                    *sel = sel.saturating_sub(1);
+                    PickerOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') if !sessions.is_empty() => {
+                    *sel = (*sel + 1).min(sessions.len() - 1);
+                    PickerOutcome::None
+                }
+                KeyCode::Enter => sessions
+                    .get(*sel)
+                    .map(|s| PickerOutcome::SelectSession(s.sid.clone()))
+                    .unwrap_or(PickerOutcome::Close),
+                _ => PickerOutcome::None,
+            },
+            Self::Model {
+                all, filter, sel, ..
+            } => {
+                let items = filtered_models(all, filter);
+                match key.code {
+                    KeyCode::Esc => PickerOutcome::Close,
+                    KeyCode::Up if !items.is_empty() => {
+                        *sel = sel.saturating_sub(1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Down if !items.is_empty() => {
+                        *sel = (*sel + 1).min(items.len() - 1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Enter => items
+                        .get(*sel)
+                        .map(|m| PickerOutcome::SelectModel((*m).to_owned()))
+                        .unwrap_or(PickerOutcome::Close),
+                    KeyCode::Backspace => {
+                        filter.pop();
+                        *sel = 0;
+                        PickerOutcome::None
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        filter.push(c);
+                        *sel = 0;
+                        PickerOutcome::None
+                    }
+                    _ => PickerOutcome::None,
+                }
+            }
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        match self {
+            Self::Resume { sessions, sel } => render_resume_picker(frame, area, sessions, *sel),
+            Self::Model {
+                all,
+                filter,
+                active,
+                sel,
+            } => render_model_picker(frame, area, all, filter, active, *sel),
+        }
+    }
+}
+
+fn filtered_models<'a>(all: &'a [String], filter: &str) -> Vec<&'a str> {
+    let q = filter.trim().to_lowercase();
+    all.iter()
+        .map(String::as_str)
+        .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
+        .collect()
+}
+
+fn render_model_picker(
+    frame: &mut Frame,
+    area: Rect,
+    all: &[String],
+    filter: &str,
+    active_model: &str,
+    sel: usize,
+) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let items = filtered_models(all, filter);
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
+    let sel = sel.min(items.len().saturating_sub(1));
+    let start = sel.saturating_sub(max_rows.saturating_sub(1));
+    let end = (start + max_rows).min(items.len());
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+
+    let header = if filter.is_empty() {
+        format!(
+            "  Select model ({} via magpie · type to filter · Enter apply)",
+            all.len()
+        )
+    } else {
+        format!("  Select model  filter: {filter}  ({} matches)", items.len())
+    };
+    let mut rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            header,
+            Style::default()
+                .fg(ACCENT_PEAK)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    if items.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "   (no matching models)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        for (offset, name) in items[start..end].iter().enumerate() {
+            let is_sel = start + offset == sel;
+            let is_current = *name == active_model;
+            let bg = if is_sel { ACCENT } else { Color::Reset };
+            let marker = if is_sel { " › " } else { "   " };
+            let badge = if is_current { "  (active)" } else { "" };
+            let used = display_width(marker) + display_width(badge);
+            let label = clip_str(name, row_w.saturating_sub(used + 2));
+            let pad = row_w.saturating_sub(used + display_width(&label));
+            rows.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { ACCENT })
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { IVORY })
+                        .bg(bg)
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { SAGE })
+                        .bg(bg),
+                ),
+                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+            ]));
+        }
+    }
+    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
 /// Borderless Codex-style interactive session picker rendered above the footer for `/resume`.
-pub fn render_resume_picker(
+fn render_resume_picker(
     frame: &mut Frame,
     area: Rect,
     sessions: &[super::client::SessionSummary],
@@ -925,7 +1181,8 @@ pub fn title_tool_name(name: &str) -> String {
 pub fn summarize_tool_args(name: &str, args: &Value) -> String {
     let raw = match name {
         "bash" => args["command"].as_str().unwrap_or(""),
-        "read" => args["path"].as_str().unwrap_or(""),
+        "read" | "edit" | "write" => args["path"].as_str().unwrap_or(""),
+        "grep" | "glob" => args["pattern"].as_str().unwrap_or(""),
         "skill" => args["name"].as_str().unwrap_or("list"),
         "subagent" => args["task"].as_str().unwrap_or(""),
         "papercut" => args["component"].as_str().unwrap_or(""),

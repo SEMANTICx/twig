@@ -187,12 +187,15 @@ pub fn validate_skips(items: &[TodoItem]) -> Result<(), Vec<usize>> {
 struct SkillMetadata {
     name: String,
     description: String,
+    scope: String,
+    #[serde(skip_serializing)]
     path: PathBuf,
+    #[serde(skip_serializing)]
+    confined_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SkillIndex {
-    root: PathBuf,
     entries: Vec<SkillMetadata>,
 }
 
@@ -204,15 +207,47 @@ impl SkillIndex {
     /// One directory level, matching `<name>/SKILL.md` and standalone Markdown.
     /// Only the bounded frontmatter is read, never the skill body at discovery.
     pub fn discover(root: &Path) -> io::Result<Self> {
-        let root = root.canonicalize()?;
         let mut entries = Vec::new();
+        Self::scan_root(root, "project", true, &mut entries)?;
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Self { entries })
+    }
+
+    /// Discover project-local `.twig/skills` (strict confinement, highest precedence) plus
+    /// curated global `~/.config/twig/skills` (or `TWIG_SKILLS_DIR`, allowing intentional symlinks).
+    pub fn discover_default(worktree: &Path) -> Option<Self> {
+        let mut entries = Vec::new();
+        let project_dir = worktree.join(".twig/skills");
+        if project_dir.is_dir() {
+            let _ = Self::scan_root(&project_dir, "project", true, &mut entries);
+        }
+        let global_dir = std::env::var_os("TWIG_SKILLS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::config::paths::config_dir().join("skills"));
+        if global_dir.is_dir() {
+            let _ = Self::scan_root(&global_dir, "global", false, &mut entries);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(Self { entries })
+    }
+
+    fn scan_root(
+        root: &Path,
+        scope: &str,
+        strict_confinement: bool,
+        entries: &mut Vec<SkillMetadata>,
+    ) -> io::Result<()> {
+        let root = root.canonicalize()?;
         for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
-            let kind = entry.file_type()?;
-            let path = if kind.is_dir() {
-                entry.path().join("SKILL.md")
-            } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "md") {
-                entry.path()
+            let raw_path = entry.path();
+            let path = if raw_path.is_dir() {
+                raw_path.join("SKILL.md")
+            } else if raw_path.is_file() && raw_path.extension().is_some_and(|e| e == "md") {
+                raw_path
             } else {
                 continue;
             };
@@ -220,7 +255,7 @@ impl SkillIndex {
                 continue;
             }
             let path = path.canonicalize()?;
-            if !path.starts_with(&root) {
+            if strict_confinement && !path.starts_with(&root) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "skill escapes index root",
@@ -265,21 +300,29 @@ impl SkillIndex {
                 }
             }
             if !closed || name.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid or oversized skill header: {}", path.display()),
-                ));
+                if strict_confinement {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid or oversized skill header: {}", path.display()),
+                    ));
+                }
+                continue;
             }
             if entries.iter().any(|e: &SkillMetadata| e.name == name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("duplicate skill {name}"),
-                ));
+                if strict_confinement {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("duplicate skill {name}"),
+                    ));
+                }
+                continue;
             }
             entries.push(SkillMetadata {
                 name,
                 description,
+                scope: scope.to_owned(),
                 path,
+                confined_root: strict_confinement.then(|| root.clone()),
             });
             if entries.len() > MAX_SKILLS {
                 return Err(io::Error::new(
@@ -288,8 +331,7 @@ impl SkillIndex {
                 ));
             }
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Self { root, entries })
+        Ok(())
     }
 
     /// JSON metadata catalog for tool responses and system prompts. Never includes bodies.
@@ -304,11 +346,13 @@ impl SkillIndex {
             .find(|e| e.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown skill"))?;
         let path = metadata.path.canonicalize()?;
-        if !path.starts_with(&self.root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "skill escapes index root",
-            ));
+        if let Some(root) = &metadata.confined_root {
+            if !path.starts_with(root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "skill escapes index root",
+                ));
+            }
         }
         read_bounded(&path, MAX_SKILL_BYTES)
     }
@@ -453,5 +497,40 @@ when: bug, broken, crash, regression
         assert_eq!(index.load("repair").unwrap(), "CHANGED BODY");
         assert!(index.load("../repair").is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn curated_global_skills_merge_with_project_precedence() {
+        let base = std::env::temp_dir().join(format!("twig-skills-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let project = base.join("project");
+        let global = base.join("global");
+        std::fs::create_dir_all(project.join("shared")).unwrap();
+        std::fs::create_dir_all(global.join("shared")).unwrap();
+        std::fs::create_dir_all(global.join("ponytail")).unwrap();
+        std::fs::write(
+            project.join("shared/SKILL.md"),
+            "---\nname: shared\ndescription: project override\n---\nPROJECT",
+        )
+        .unwrap();
+        std::fs::write(
+            global.join("shared/SKILL.md"),
+            "---\nname: shared\ndescription: global version\n---\nGLOBAL",
+        )
+        .unwrap();
+        std::fs::write(
+            global.join("ponytail/SKILL.md"),
+            "---\nname: ponytail\ndescription: architecture debt audit\n---\nPONYTAIL BODY",
+        )
+        .unwrap();
+
+        let mut entries = Vec::new();
+        SkillIndex::scan_root(&project, "project", true, &mut entries).unwrap();
+        SkillIndex::scan_root(&global, "global", false, &mut entries).unwrap();
+        let index = SkillIndex { entries };
+        assert_eq!(index.load("shared").unwrap(), "---\nname: shared\ndescription: project override\n---\nPROJECT");
+        assert!(index.load("ponytail").unwrap().contains("PONYTAIL BODY"));
+        assert!(index.summary_json().contains("architecture debt audit"));
+        let _ = std::fs::remove_dir_all(base);
     }
 }

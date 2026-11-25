@@ -248,6 +248,11 @@ pub fn run_independent_review(repo: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Query available models from magpie (`GET /v1/models`) for the interactive `/model` picker.
+pub fn fetch_magpie_models() -> Result<Vec<String>, String> {
+    crate::llm::Provider::new().list_models()
+}
+
 /// Run `twig doctor` in `repo` and return `(combined_output, succeeded)`.
 pub fn run_doctor(repo: &str) -> Result<(String, bool), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
