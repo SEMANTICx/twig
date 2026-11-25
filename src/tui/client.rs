@@ -1,13 +1,156 @@
-//! Subprocess transport for `twig serve` (JSON-RPC over stdio) plus plain non-TTY fallback.
+//! Host I/O boundary for `twig chat`:
+//! - `ServeClient` subprocess JSON-RPC transport for `twig serve`
+//! - `TerminalGuard` RAII raw-mode / alternate-screen / mouse / bracketed-paste manager
+//! - Host helpers: `$EDITOR` bridge, OSC 52 + `wl-copy` clipboard, git branch, `--plain` fallback
 
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use serde_json::{json, Value};
 
 use crate::config::paths;
+
+pub struct TerminalGuard;
+
+impl TerminalGuard {
+    pub fn enter() -> Result<Self, String> {
+        enable_raw_mode().map_err(|e| format!("terminal raw mode: {e}"))?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )
+        .map_err(|e| format!("enter alternate screen: {e}"))?;
+        Ok(Self)
+    }
+
+    pub fn suspend() {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(
+            stdout,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+    }
+
+    pub fn resume() -> Result<(), String> {
+        enable_raw_mode().map_err(|e| format!("resume raw mode: {e}"))?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )
+        .map_err(|e| format!("resume alternate screen: {e}"))
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        Self::suspend();
+    }
+}
+
+pub fn detect_git_branch(repo: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+pub fn shorten_home(path: &str) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = path.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    path.to_owned()
+}
+
+pub fn edit_in_external_editor(initial: &str) -> Result<String, String> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let path = std::env::temp_dir().join(format!("twig-prompt-{}.md", std::process::id()));
+    std::fs::write(&path, initial).map_err(|e| e.to_string())?;
+    let parts = shlex::split(&editor).unwrap_or_else(|| vec![editor]);
+    let (bin, args) = parts
+        .split_first()
+        .ok_or_else(|| "empty $EDITOR".to_owned())?;
+    let status = Command::new(bin)
+        .args(args)
+        .arg(&path)
+        .status()
+        .map_err(|e| format!("spawn {bin}: {e}"))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&path);
+    if !status.success() {
+        return Err(format!("{bin} exited with {status}"));
+    }
+    Ok(content)
+}
+
+/// Copy text to system clipboard via OSC 52 (Kitty/Ghostty/WezTerm/tmux) + Wayland `wl-copy`.
+pub fn copy_to_clipboard(text: &str) {
+    let b64 = encode_base64(text.as_bytes());
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{b64}\x07");
+    let _ = stdout.flush();
+    if let Ok(mut child) = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 #[derive(Debug)]
 pub enum ServerMsg {
@@ -222,4 +365,15 @@ pub fn chat_plain(repo: &str, resume: Option<&str>) -> Result<(), String> {
     let _ = child.wait();
     let _ = reader.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encoder_matches_rfc4648() {
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+        assert_eq!(encode_base64(b"twig"), "dHdpZw==");
+    }
 }

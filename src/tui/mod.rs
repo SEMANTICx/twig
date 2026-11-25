@@ -1,30 +1,27 @@
-//! Claude Code warm-terracotta minimalist TUI for `twig chat`, combining:
-//! - Claude Code visual skeleton (borderless hairline rules, `⏺`/`⎿` tool trees, warm `#D97757` palette)
-//! - Codex CLI motion & input engine (TrueColor cosine shimmer, DEC 2026 sync updates, paste pills, bottom approval selector)
-//! - `omp` keyboard efficiency & telemetry (`Ctrl+G` `$EDITOR`, `Alt+Y` code copy, `Ctrl+F` search, compact footer)
-//!
-//! Deep module with a narrow public surface (`chat(repo, resume, plain)`):
-//! automatically falls back to plain stdio when not attached to a TTY.
+//! Claude Code warm-terracotta minimalist TUI for `twig chat`, powered by upstream
+//! OpenAI Codex (`codex-rs/tui`) motion, rendering, and footer patterns:
+//! - Claude Code warm `#D97757` palette, borderless hairline composer, `⏺`/`⎿` tool trees
+//! - Codex `summary_shimmer.rs` cadenced 600ms-delay / 1s-sweep / 4s-interval TrueColor shimmer
+//! - Codex `status_indicator_widget.rs` adaptive frame pacing (32ms active, 250ms idle) & `fmt_elapsed_compact`
+//! - Codex `motion.rs` 200ms tool spinner delay & `TWIG_REDUCED_MOTION` support
+//! - Codex `diff_render.rs` hunk line-number gutter + `#213A2B`/`#4A221D` diff backgrounds
+//! - Codex `bottom_pane/footer.rs` `FooterMode` state machine + `?` 2-column shortcut overlay
+//! - `omp` keyboard power tools (`Ctrl+G` `$EDITOR`, `Alt+Y` code copy, `Ctrl+F` transcript search)
 
 mod client;
 mod composer;
 mod markdown;
 
 use std::collections::VecDeque;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
-    EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -33,25 +30,31 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use serde_json::{json, Value};
 
-use self::client::{chat_plain, ServeClient, ServerMsg};
+use self::client::{
+    chat_plain, copy_to_clipboard, detect_git_branch, edit_in_external_editor, shorten_home,
+    ServeClient, ServerMsg, TerminalGuard,
+};
 use self::composer::Composer;
 use self::markdown::{
-    display_width, extract_code_blocks, highlight_search, render_markdown, shimmer_spans,
-    style_output_line, wrap_plain, ACCENT, ACCENT_PEAK, AMBER, HAIRLINE, IVORY, MUTED, ROSE, SAGE,
-    STONE, SURFACE, SURFACE_HI,
+    display_width, extract_code_blocks, fmt_elapsed_compact, highlight_search, render_markdown,
+    shimmer_is_sweeping, style_output_line, summary_shimmer, wrap_plain, DiffGutterState,
+    MotionMode, ACCENT, ACCENT_PEAK, AMBER, HAIRLINE, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE,
+    SURFACE_HI,
 };
 
-/// Claude-style breathing star glyph cycle.
+/// Claude-style breathing star glyph cycle (100ms per frame, 200ms onset delay per Codex `motion.rs`).
 const STAR_SPINNER: &[&str] = &["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+const SPINNER_DELAY: Duration = Duration::from_millis(200);
+const SPINNER_FRAME_MS: u128 = 110;
 
-/// Calm engineering activity verbs cycled during active turns.
+/// Calm engineering activity verbs rotated gently during active turns.
 const ACTIVITY_VERBS: &[&str] = &[
-    "Thinking…",
-    "Reasoning…",
-    "Analyzing…",
-    "Tracing…",
-    "Synthesizing…",
-    "Working…",
+    "Thinking",
+    "Reasoning",
+    "Analyzing",
+    "Tracing",
+    "Synthesizing",
+    "Working",
 ];
 
 /// Entrypoint for `twig chat`: interactive Ratatui TUI on a TTY, plain stdio otherwise.
@@ -62,50 +65,13 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
     run_tui(repo, resume)
 }
 
-struct TerminalGuard;
-
-impl TerminalGuard {
-    fn enter() -> Result<Self, String> {
-        enable_raw_mode().map_err(|e| format!("terminal raw mode: {e}"))?;
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        )
-        .map_err(|e| format!("enter alternate screen: {e}"))?;
-        Ok(Self)
-    }
-
-    fn suspend() {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-    }
-
-    fn resume() -> Result<(), String> {
-        enable_raw_mode().map_err(|e| format!("resume raw mode: {e}"))?;
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        )
-        .map_err(|e| format!("resume alternate screen: {e}"))
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        Self::suspend();
-    }
+/// Ported from `codex-rs/tui/src/bottom_pane/footer.rs`: explicit footer state machine.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FooterMode {
+    Contextual,
+    ShortcutOverlay,
+    QuitReminder,
+    EscHint,
 }
 
 #[derive(Debug, Clone)]
@@ -169,12 +135,17 @@ struct App {
     turns_used: u64,
     running: bool,
     run_started: Option<Instant>,
+    status_header: String,
+    status_header_started: Instant,
     active_turn_req: Option<u64>,
     cells: Vec<Cell>,
     approvals: VecDeque<PendingApproval>,
     approval_sel: usize,
     composer: Composer,
     expand_tools: bool,
+    motion: MotionMode,
+    footer_mode: FooterMode,
+    footer_mode_at: Instant,
     search_open: bool,
     search_query: String,
     search_match_idx: usize,
@@ -182,7 +153,6 @@ struct App {
     scroll: u16,
     max_scroll: u16,
     auto_follow: bool,
-    tick: usize,
     last_ctrl_c: Option<Instant>,
     copy_cycle: usize,
     last_copy_at: Option<Instant>,
@@ -199,6 +169,7 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| repo.to_owned());
         let repo_path = shorten_home(&canonical.display().to_string());
+        let now = Instant::now();
         Self {
             repo_path,
             repo_label,
@@ -210,12 +181,17 @@ impl App {
             turns_used: 0,
             running: false,
             run_started: None,
+            status_header: String::from("Working"),
+            status_header_started: now,
             active_turn_req: None,
             cells: Vec::new(),
             approvals: VecDeque::new(),
             approval_sel: 0,
             composer: Composer::new(repo),
             expand_tools: false,
+            motion: MotionMode::from_env(),
+            footer_mode: FooterMode::Contextual,
+            footer_mode_at: now,
             search_open: false,
             search_query: String::new(),
             search_match_idx: 0,
@@ -223,12 +199,24 @@ impl App {
             scroll: 0,
             max_scroll: 0,
             auto_follow: true,
-            tick: 0,
             last_ctrl_c: None,
             copy_cycle: 0,
             last_copy_at: None,
             status_flash: None,
         }
+    }
+
+    /// Codex `status_indicator_widget.rs` invariant: only restart shimmer timer when header changes.
+    fn update_status_header(&mut self, next: String) {
+        if self.status_header != next {
+            self.status_header = next;
+            self.status_header_started = Instant::now();
+        }
+    }
+
+    fn set_footer_mode(&mut self, mode: FooterMode) {
+        self.footer_mode = mode;
+        self.footer_mode_at = Instant::now();
     }
 
     fn flash(&mut self, msg: impl Into<String>) {
@@ -240,6 +228,38 @@ impl App {
             kind,
             text: text.into(),
         });
+    }
+
+    /// Codex-style adaptive frame interval: 32ms (~30fps) only while shimmer or star is actively animating.
+    fn next_poll_interval(&self) -> Duration {
+        if self.running && self.approvals.is_empty() && self.motion == MotionMode::Animated {
+            let sweep_active =
+                shimmer_is_sweeping(self.status_header_started.elapsed(), self.motion);
+            if sweep_active {
+                return Duration::from_millis(32);
+            }
+            return Duration::from_millis(100);
+        }
+        Duration::from_millis(200)
+    }
+
+    fn sync_status_header(&mut self) {
+        if !self.running {
+            return;
+        }
+        if let Some(Cell::Tool(tool)) = self
+            .cells
+            .iter()
+            .rev()
+            .find(|c| matches!(c, Cell::Tool(t) if !t.finished))
+        {
+            self.update_status_header(format!("Running {}", title_tool_name(&tool.name)));
+            return;
+        }
+        let secs = self.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        // Rotate gently every 8s (matches 2 full 4s Codex shimmer cycles).
+        let idx = ((secs / 8) as usize) % ACTIVITY_VERBS.len();
+        self.update_status_header(ACTIVITY_VERBS[idx].to_owned());
     }
 
     fn apply_server_msg(&mut self, msg: ServerMsg) {
@@ -316,6 +336,7 @@ impl App {
                 self.running = true;
                 if self.run_started.is_none() {
                     self.run_started = Some(Instant::now());
+                    self.update_status_header(String::from("Thinking"));
                 }
                 if let Some(m) = ev["model"].as_str() {
                     self.model = m.to_owned();
@@ -340,6 +361,7 @@ impl App {
                 let name = ev["tool"].as_str().unwrap_or("tool").to_owned();
                 let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
                 let summary = summarize_tool_args(&name, &ev["args"]);
+                self.update_status_header(format!("Running {}", title_tool_name(&name)));
                 self.cells.push(Cell::Tool(ToolCell {
                     id,
                     name,
@@ -528,7 +550,7 @@ impl App {
                     }
                     if self.running {
                         self.last_ctrl_c = Some(Instant::now());
-                        self.flash("Interrupting active turn… (Ctrl+C again to quit)");
+                        self.set_footer_mode(FooterMode::QuitReminder);
                         return Action::Cancel;
                     }
                     if self
@@ -540,7 +562,7 @@ impl App {
                     }
                     self.composer.set("");
                     self.last_ctrl_c = Some(Instant::now());
-                    self.flash("Cleared draft (Ctrl+C again to quit)");
+                    self.set_footer_mode(FooterMode::QuitReminder);
                     return Action::None;
                 }
                 KeyCode::Char('d') if self.composer.is_empty() => return Action::Quit,
@@ -655,7 +677,30 @@ impl App {
             }
         }
 
-        // Scroll controls.
+        // Codex `bottom_pane/footer.rs`: `?` when composer is empty toggles the 2-column shortcut overlay.
+        if matches!(key.code, KeyCode::Char('?'))
+            && key.modifiers.is_empty()
+            && self.composer.is_empty()
+        {
+            let next = if self.footer_mode == FooterMode::ShortcutOverlay {
+                FooterMode::Contextual
+            } else {
+                FooterMode::ShortcutOverlay
+            };
+            self.set_footer_mode(next);
+            return Action::None;
+        }
+
+        // Any other key dismisses transient shortcut/quit overlays cleanly.
+        if matches!(
+            self.footer_mode,
+            FooterMode::ShortcutOverlay | FooterMode::QuitReminder
+        ) && !matches!(key.code, KeyCode::Esc)
+        {
+            self.set_footer_mode(FooterMode::Contextual);
+        }
+
+        // Scroll & Esc controls.
         match key.code {
             KeyCode::PageUp => {
                 self.auto_follow = false;
@@ -677,12 +722,23 @@ impl App {
                 return Action::None;
             }
             KeyCode::Esc => {
+                if self.footer_mode == FooterMode::ShortcutOverlay {
+                    self.set_footer_mode(FooterMode::Contextual);
+                    return Action::None;
+                }
                 if self.running {
                     self.flash("Interrupting active turn…");
                     return Action::Cancel;
                 }
                 if !self.composer.is_empty() {
-                    self.composer.set("");
+                    if self.footer_mode == FooterMode::EscHint
+                        && self.footer_mode_at.elapsed() < Duration::from_secs(2)
+                    {
+                        self.composer.set("");
+                        self.set_footer_mode(FooterMode::Contextual);
+                    } else {
+                        self.set_footer_mode(FooterMode::EscHint);
+                    }
                 }
                 return Action::None;
             }
@@ -796,6 +852,7 @@ impl App {
         if trimmed.is_empty() {
             return Action::None;
         }
+        self.set_footer_mode(FooterMode::Contextual);
         if trimmed == "/quit" || trimmed == "/exit" {
             return Action::Quit;
         }
@@ -829,10 +886,7 @@ impl App {
             return Action::None;
         }
         if trimmed == "/help" {
-            self.push_notice(
-                NoticeKind::Info,
-                "Enter send (or steer while running) · Shift+Enter newline · @ file · Ctrl+O tool tree · Ctrl+F find · Ctrl+G $EDITOR · Alt+Y copy code · Esc cancel · Ctrl+C quit",
-            );
+            self.set_footer_mode(FooterMode::ShortcutOverlay);
             return Action::None;
         }
         if let Some(rest) = trimmed.strip_prefix("/steer ") {
@@ -871,22 +925,9 @@ impl App {
         self.cells.push(Cell::User(text.clone()));
         self.running = true;
         self.run_started = Some(Instant::now());
+        self.update_status_header(String::from("Thinking"));
         self.auto_follow = true;
         Action::SendTurn(text)
-    }
-
-    fn active_activity_label(&self) -> String {
-        if let Some(Cell::Tool(tool)) = self
-            .cells
-            .iter()
-            .rev()
-            .find(|c| matches!(c, Cell::Tool(t) if !t.finished))
-        {
-            return format!("Running {}…", title_tool_name(&tool.name));
-        }
-        // Rotate gently every ~3 seconds (60 ticks at 50ms).
-        let idx = (self.tick / 60) % ACTIVITY_VERBS.len();
-        ACTIVITY_VERBS[idx].to_owned()
     }
 
     fn build_transcript_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -915,7 +956,7 @@ impl App {
                 ),
             ]));
             lines.push(Line::from(vec![
-                Span::styled("    ", Style::default()),
+                Span::raw("    "),
                 Span::styled(self.model.clone(), Style::default().fg(ACCENT_PEAK)),
                 Span::styled(" · ", Style::default().fg(MUTED)),
                 Span::styled(
@@ -929,7 +970,7 @@ impl App {
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                "  Tips: Enter send/steer · @ file · Ctrl+O tool tree · Ctrl+F find · Ctrl+G editor · Alt+Y copy code",
+                "  Press ? for shortcuts · @ to reference files · / for commands",
                 Style::default().fg(MUTED),
             )));
             return lines;
@@ -989,15 +1030,18 @@ impl App {
                     lines.push(Line::from(""));
                 }
                 Cell::Tool(tool) => {
-                    let elapsed = tool
-                        .elapsed
-                        .unwrap_or_else(|| tool.started_at.elapsed())
-                        .as_secs_f32();
+                    let elapsed_dur = tool.elapsed.unwrap_or_else(|| tool.started_at.elapsed());
                     let (icon, icon_color) = if !tool.finished {
-                        (
-                            STAR_SPINNER[(self.tick / 2) % STAR_SPINNER.len()],
-                            ACCENT,
-                        )
+                        // Codex `motion.rs`: suppress jarring spinner flash under 200ms.
+                        if self.motion == MotionMode::Reduced {
+                            ("◌", ACCENT)
+                        } else if elapsed_dur < SPINNER_DELAY {
+                            ("·", MUTED)
+                        } else {
+                            let idx = (elapsed_dur.as_millis() / SPINNER_FRAME_MS) as usize
+                                % STAR_SPINNER.len();
+                            (STAR_SPINNER[idx], ACCENT)
+                        }
                     } else if tool.exit_code.is_none() || tool.exit_code == Some(0) {
                         ("⏺", SAGE)
                     } else {
@@ -1025,14 +1069,14 @@ impl App {
                             Style::default().fg(AMBER),
                         ));
                     }
-                    let mut meta = format!("  {elapsed:.1}s");
+                    let mut meta = format!("  {}", fmt_elapsed_compact(elapsed_dur.as_secs()));
                     if let Some(code) = tool.exit_code.filter(|&c| c != 0) {
                         meta.push_str(&format!(" · exit {code}"));
                     }
                     header.push(Span::styled(meta, Style::default().fg(MUTED)));
                     lines.push(Line::from(header));
 
-                    // Claude-style `⎿` hanging child output tree.
+                    // Claude-style `⎿` hanging child output tree + Codex unified diff gutter.
                     let out_lines: Vec<&str> = tool.output.lines().collect();
                     if !out_lines.is_empty() {
                         let show_lines = if self.expand_tools {
@@ -1069,25 +1113,27 @@ impl App {
                             lines.push(Line::from(spans));
                         } else {
                             let mut first_row = true;
+                            let mut gutter = DiffGutterState::default();
                             if skip > 0 {
                                 lines.push(Line::from(vec![
                                     Span::styled("   ⎿  ", Style::default().fg(MUTED)),
                                     Span::styled(
-                                        format!("… ({skip} earlier lines hidden · ctrl+o to expand)"),
+                                        format!(
+                                            "… ({skip} earlier lines hidden · ctrl+o to expand)"
+                                        ),
                                         Style::default().fg(MUTED),
                                     ),
                                 ]));
                                 first_row = false;
                             }
                             for raw in &out_lines[skip..] {
-                                let style = style_output_line(raw);
-                                for wrapped in wrap_plain(raw, inner.saturating_sub(7)) {
+                                for row_spans in gutter.render_line(raw, inner.saturating_sub(7)) {
                                     let branch = if first_row { "   ⎿  " } else { "      " };
                                     first_row = false;
-                                    lines.push(Line::from(vec![
-                                        Span::styled(branch, Style::default().fg(MUTED)),
-                                        Span::styled(wrapped, style),
-                                    ]));
+                                    let mut spans =
+                                        vec![Span::styled(branch, Style::default().fg(MUTED))];
+                                    spans.extend(row_spans);
+                                    lines.push(Line::from(spans));
                                 }
                             }
                         }
@@ -1118,7 +1164,24 @@ impl App {
         lines
     }
 
+    fn footer_height(&self) -> u16 {
+        match self.footer_mode {
+            FooterMode::ShortcutOverlay => 5,
+            FooterMode::Contextual | FooterMode::QuitReminder | FooterMode::EscHint => 1,
+        }
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
+        self.sync_status_header();
+        // Expire transient footer reminders after 2.5 seconds (Codex `footer.rs` pattern).
+        if matches!(
+            self.footer_mode,
+            FooterMode::QuitReminder | FooterMode::EscHint
+        ) && self.footer_mode_at.elapsed() >= Duration::from_millis(2500)
+        {
+            self.footer_mode = FooterMode::Contextual;
+        }
+
         let area = frame.area();
         let has_approval = !self.approvals.is_empty();
         let activity_h: u16 = if self.running && !has_approval { 1 } else { 0 };
@@ -1128,6 +1191,7 @@ impl App {
         } else {
             self.composer.desired_height(area.width as usize)
         };
+        let footer_h = self.footer_height();
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1136,7 +1200,7 @@ impl App {
                 Constraint::Length(activity_h),
                 Constraint::Length(search_h),
                 Constraint::Length(bottom_panel_h),
-                Constraint::Length(1),
+                Constraint::Length(footer_h),
             ])
             .split(area);
 
@@ -1144,7 +1208,7 @@ impl App {
         let transcript_area = chunks[0];
         let mut lines = self.build_transcript_lines(transcript_area.width as usize);
 
-        // Apply live Ctrl+F search matches & highlights.
+        // Live Ctrl+F transcript search matches & highlights.
         if self.search_open && !self.search_query.is_empty() {
             let needle = self.search_query.to_lowercase();
             self.search_matches = lines
@@ -1205,22 +1269,27 @@ impl App {
             );
         }
 
-        // 2. Claude star + Codex TrueColor Shimmer activity row
+        // 2. Codex `status_indicator_widget.rs` + `summary_shimmer.rs` activity row
         if activity_h > 0 {
-            let star = STAR_SPINNER[(self.tick / 2) % STAR_SPINNER.len()];
-            let verb = self.active_activity_label();
-            let phase = (self.tick as f32) * 0.045;
-            let secs = self
-                .run_started
-                .map(|t| t.elapsed().as_secs_f32())
-                .unwrap_or(0.0);
+            let run_elapsed = self.run_started.map(|t| t.elapsed()).unwrap_or_default();
+            let star = if self.motion == MotionMode::Reduced {
+                "•"
+            } else {
+                let idx = (run_elapsed.as_millis() / SPINNER_FRAME_MS) as usize % STAR_SPINNER.len();
+                STAR_SPINNER[idx]
+            };
+            let pretty_elapsed = fmt_elapsed_compact(run_elapsed.as_secs());
             let mut spans = vec![Span::styled(
                 format!(" {star} "),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )];
-            spans.extend(shimmer_spans(&verb, phase));
+            spans.extend(summary_shimmer(
+                &self.status_header,
+                self.status_header_started.elapsed(),
+                self.motion,
+            ));
             spans.push(Span::styled(
-                format!("  ({secs:.1}s · esc to interrupt · enter to steer)"),
+                format!(" ({pretty_elapsed} • esc to interrupt · enter to steer)"),
                 Style::default().fg(MUTED),
             ));
             frame.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
@@ -1256,7 +1325,7 @@ impl App {
             }
         }
 
-        // 4. Bottom pane: either Codex/Claude approval selector OR hairline borderless composer
+        // 4. Bottom pane: Codex/Claude approval selector OR hairline borderless composer
         if let Some(pending) = self.approvals.front() {
             self.render_approval_panel(frame, chunks[3], pending);
         } else {
@@ -1264,7 +1333,7 @@ impl App {
                 (
                     ACCENT,
                     AMBER,
-                    "Type steering guidance and press Enter (or Esc to cancel)…",
+                    "Type steering guidance and press Enter (or Esc to interrupt)…",
                 )
             } else {
                 (
@@ -1287,7 +1356,7 @@ impl App {
             }
         }
 
-        // 5. Compact `omp`-inspired warm telemetry footer
+        // 5. Codex `FooterMode` bottom bar / `?` 2-column shortcut overlay
         self.render_footer(frame, chunks[4]);
     }
 
@@ -1315,7 +1384,8 @@ impl App {
             let bg = if active { SURFACE_HI } else { Color::Reset };
             let marker = if active { " ❯ " } else { "   " };
             let fg = if active { IVORY } else { STONE };
-            let pad = (area.width as usize).saturating_sub(display_width(marker) + display_width(label));
+            let pad = (area.width as usize)
+                .saturating_sub(display_width(marker) + display_width(label));
             Line::from(vec![
                 Span::styled(
                     marker,
@@ -1336,7 +1406,10 @@ impl App {
             ])
         };
 
-        let preview_line = format!("   $ {}", clip_str(&cmd_preview, area.width.saturating_sub(6) as usize));
+        let preview_line = format!(
+            "   $ {}",
+            clip_str(&cmd_preview, area.width.saturating_sub(6) as usize)
+        );
         let preview_pad = (area.width as usize).saturating_sub(display_width(&preview_line));
 
         let rows = vec![
@@ -1358,6 +1431,58 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        match self.footer_mode {
+            FooterMode::ShortcutOverlay => {
+                let row = |k1: &str, d1: &str, k2: &str, d2: &str| -> Line<'static> {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("  {k1:<13}"),
+                            Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("{d1:<24}"), Style::default().fg(STONE)),
+                        Span::styled(
+                            format!("{k2:<13}"),
+                            Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(d2.to_owned(), Style::default().fg(STONE)),
+                    ])
+                };
+                let rows = vec![
+                    row("Enter", "send / steer while busy", "Shift+Enter", "insert newline"),
+                    row("Esc", "interrupt / press×2 clear", "@  /  Tab", "file & slash completion"),
+                    row("Ctrl+O", "expand/collapse tools", "Ctrl+F", "search transcript"),
+                    row("Ctrl+G", "compose in $EDITOR", "Alt+Y", "copy latest code block"),
+                    Line::from(Span::styled(
+                        "  ? or Esc to close shortcuts · PgUp/PgDn/wheel scroll · Ctrl+C quit",
+                        Style::default().fg(MUTED),
+                    )),
+                ];
+                frame.render_widget(Paragraph::new(rows), area);
+                return;
+            }
+            FooterMode::QuitReminder => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "  Press Ctrl+C again to quit",
+                        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                    )),
+                    area,
+                );
+                return;
+            }
+            FooterMode::EscHint => {
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "  Press Esc again to clear draft",
+                        Style::default().fg(AMBER),
+                    )),
+                    area,
+                );
+                return;
+            }
+            FooterMode::Contextual => {}
+        }
+
         let flash = self
             .status_flash
             .as_ref()
@@ -1416,10 +1541,14 @@ impl App {
             "↑/↓ select · Enter confirm · Esc deny "
         } else if self.search_open {
             "Enter next · Esc close "
+        } else if !self.composer.is_empty() && self.running {
+            "Enter steer · Shift+Enter newline "
+        } else if !self.composer.is_empty() {
+            "Enter send · Shift+Enter newline · ^G edit "
         } else if self.expand_tools {
-            "tools:expanded · ^O compact · ^F find · ^G edit "
+            "tools:expanded · ^O compact · ? shortcuts "
         } else {
-            "^O expand · ^F find · ^G edit · Alt+Y copy "
+            "? for shortcuts · ^O tools · ^F find "
         };
         let right_w = (display_width(right_hint) as u16).min(area.width / 2);
         let cols = Layout::default()
@@ -1449,7 +1578,7 @@ impl App {
             let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
             draw_res.map_err(|e| format!("draw tui: {e}"))?;
 
-            if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
+            if event::poll(self.next_poll_interval()).map_err(|e| e.to_string())? {
                 match event::read().map_err(|e| e.to_string())? {
                     Event::Paste(data) => self.handle_paste(&data),
                     Event::Key(key) => match self.handle_key(key) {
@@ -1503,7 +1632,6 @@ impl App {
                     _ => {}
                 }
             }
-            self.tick = self.tick.wrapping_add(1);
         }
     }
 }
@@ -1536,94 +1664,6 @@ fn summarize_tool_args(name: &str, args: &Value) -> String {
         _ => "",
     };
     clip_str(&raw.replace('\n', " "), 92)
-}
-
-fn detect_git_branch(repo: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!name.is_empty()).then_some(name)
-}
-
-fn shorten_home(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        if let Some(rest) = path.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
-    }
-    path.to_owned()
-}
-
-fn edit_in_external_editor(initial: &str) -> Result<String, String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
-    let path = std::env::temp_dir().join(format!("twig-prompt-{}.md", std::process::id()));
-    std::fs::write(&path, initial).map_err(|e| e.to_string())?;
-    let parts = shlex::split(&editor).unwrap_or_else(|| vec![editor]);
-    let (bin, args) = parts
-        .split_first()
-        .ok_or_else(|| "empty $EDITOR".to_owned())?;
-    let status = Command::new(bin)
-        .args(args)
-        .arg(&path)
-        .status()
-        .map_err(|e| format!("spawn {bin}: {e}"))?;
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&path);
-    if !status.success() {
-        return Err(format!("{bin} exited with {status}"));
-    }
-    Ok(content)
-}
-
-/// Copy text to system clipboard via OSC 52 (works in Kitty/Ghostty/WezTerm/tmux)
-/// and best-effort `wl-copy` on Wayland.
-fn copy_to_clipboard(text: &str) {
-    let b64 = encode_base64(text.as_bytes());
-    let mut stdout = io::stdout();
-    let _ = write!(stdout, "\x1b]52;c;{b64}\x07");
-    let _ = stdout.flush();
-    if let Ok(mut child) = Command::new("wl-copy")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    }
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 63) as usize] as char);
-        out.push(TABLE[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 fn run_tui(repo: &str, resume: Option<&str>) -> Result<(), String> {
@@ -1678,6 +1718,37 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_toggles_codex_shortcut_overlay_and_esc_twice_clears_draft() {
+        let mut app = App::new(".");
+        app.handle_key(press(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.footer_mode, FooterMode::ShortcutOverlay);
+
+        let backend = TestBackend::new(92, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let frame_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(frame_text.contains("compose in $EDITOR"));
+
+        // Esc closes shortcut overlay
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.footer_mode, FooterMode::Contextual);
+
+        // Esc once shows EscHint; Esc twice clears draft
+        app.handle_key(press(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.footer_mode, FooterMode::EscHint);
+        assert!(!app.composer.is_empty());
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.composer.is_empty());
+    }
+
+    #[test]
     fn approval_selector_supports_arrows_numbers_and_hotkeys() {
         let mut app = App::new(".");
         app.apply_event(&json!({
@@ -1686,7 +1757,6 @@ mod tests {
             "name": "bash",
             "args": {"command": "git reset --hard"}
         }));
-        // Default option 0 = allow
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
             Action::ResolveApproval {
@@ -1694,7 +1764,6 @@ mod tests {
                 allow: true
             }
         );
-        // Move down to option 1 = deny
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1703,7 +1772,6 @@ mod tests {
                 allow: false
             }
         );
-        // Quick number key 1
         assert_eq!(
             app.handle_key(press(KeyCode::Char('1'), KeyModifiers::NONE)),
             Action::ResolveApproval {
@@ -1728,7 +1796,6 @@ mod tests {
             Action::CopyCode("let a = 1;".into())
         );
 
-        // Open Ctrl+F search and type query
         app.handle_key(press(KeyCode::Char('f'), KeyModifiers::CONTROL));
         for ch in "let b".chars() {
             app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -1740,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_claude_warm_minimal_tui_with_tools_shimmer_and_approval() {
+    fn renders_claude_warm_minimal_tui_with_codex_shimmer_diff_and_approval() {
         let mut app = App::new("/tmp/demo");
         app.apply_server_msg(ServerMsg::Reply {
             id: 1,
@@ -1756,10 +1823,9 @@ mod tests {
             "args": {"command": "git diff"},
             "tier": "auto"
         }));
-        app.apply_event(&json!({"ev": "tool.output", "id": "t1", "text": "-old\n+new\n"}));
-        app.apply_event(&json!({"ev": "tool.completed", "id": "t1", "bytes": 10, "exit_code": 0}));
+        app.apply_event(&json!({"ev": "tool.output", "id": "t1", "text": "@@ -1,1 +1,1 @@\n-old\n+new\n"}));
+        app.apply_event(&json!({"ev": "tool.completed", "id": "t1", "bytes": 24, "exit_code": 0}));
 
-        // First render while running (shows shimmer activity row + ⏺/⎿ tool tree)
         let backend = TestBackend::new(92, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -1775,7 +1841,6 @@ mod tests {
         assert!(active_frame.contains("Bash"));
         assert!(active_frame.contains("esc to interrupt"));
 
-        // Now trigger approval overlay and verify bottom selector
         app.apply_event(&json!({
             "ev": "approval.requested",
             "id": "t2",
@@ -1793,11 +1858,5 @@ mod tests {
         assert!(approval_frame.contains("Approve Bash?"));
         assert!(approval_frame.contains("1. Yes, allow once"));
         assert!(approval_frame.contains("rm -rf /"));
-    }
-
-    #[test]
-    fn base64_encoder_matches_rfc4648() {
-        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
-        assert_eq!(encode_base64(b"twig"), "dHdpZw==");
     }
 }

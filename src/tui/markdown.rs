@@ -1,33 +1,157 @@
-//! Stateless warm-terracotta rendering primitives for `twig chat`:
-//! - Claude Code warm palette tokens
-//! - Codex-style TrueColor cosine shimmer wave
-//! - CJK/emoji display-width wrapping
-//! - Markdown + unified diff highlighting + fenced code block extraction
-//! - Transcript search highlighting
+//! Rendering & motion primitives combining:
+//! - Claude Code warm terracotta palette (`#D97757`) & typography
+//! - OpenAI Codex (`codex-rs/tui`) upstream algorithms:
+//!   - `color.rs`: RGB linear alpha `blend()` and BT.601 `is_light()`
+//!   - `summary_shimmer.rs`: cadenced 600ms-delay / 1s-sweep / 4s-interval column-centered cosine shimmer
+//!   - `diff_render.rs`: dark TrueColor diff backgrounds (`#213A2B` / `#4A221D`) & line-number gutter parsing
+//!   - `motion.rs`: explicit `MotionMode` (`Animated` / `Reduced`) and 200ms spinner delay
+
+use std::time::Duration;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Claude Code inspired warm terracotta minimalist palette.
-pub const ACCENT: Color = Color::Rgb(217, 119, 87); // #D97757 terracotta
-pub const ACCENT_PEAK: Color = Color::Rgb(246, 190, 158); // #F6BE9E shimmer highlight
-pub const AMBER: Color = Color::Rgb(230, 173, 95); // #E6AD5F warn / steer / approval
-pub const SAGE: Color = Color::Rgb(126, 189, 134); // #7EBD86 success / diff +
-pub const ROSE: Color = Color::Rgb(224, 108, 117); // #E06C75 error / diff -
-pub const IVORY: Color = Color::Rgb(236, 232, 224); // #ECE8E0 primary text
-pub const STONE: Color = Color::Rgb(166, 158, 148); // #A69E94 secondary text
-pub const MUTED: Color = Color::Rgb(112, 106, 99); // #706A63 hints / dim connectors
-pub const HAIRLINE: Color = Color::Rgb(74, 70, 66); // #4A4642 hairline horizontal rules
-pub const SURFACE: Color = Color::Rgb(38, 35, 32); // #262320 warm subtle surface
-pub const SURFACE_HI: Color = Color::Rgb(54, 48, 43); // #36302B selected popup/option row
-pub const DIFF_ADD_BG: Color = Color::Rgb(26, 46, 33); // subtle sage tint
-pub const DIFF_DEL_BG: Color = Color::Rgb(54, 27, 30); // subtle rose tint
-pub const SEARCH_BG: Color = Color::Rgb(92, 66, 32); // search match highlight
-pub const SEARCH_ACTIVE_BG: Color = Color::Rgb(217, 119, 87);
+/// Claude Code warm terracotta minimalist palette (RGB tuples for `blend()` math).
+pub const ACCENT_RGB: (u8, u8, u8) = (217, 119, 87); // #D97757 terracotta
+pub const ACCENT_PEAK_RGB: (u8, u8, u8) = (248, 206, 178); // #F8CEB2 warm shimmer peak
+pub const BASE_SHIMMER_RGB: (u8, u8, u8) = (156, 118, 100); // warm muted terracotta base
+pub const AMBER_RGB: (u8, u8, u8) = (230, 173, 95); // #E6AD5F warn / steer / approval
+pub const SAGE_RGB: (u8, u8, u8) = (126, 189, 134); // #7EBD86 success / diff +
+pub const ROSE_RGB: (u8, u8, u8) = (224, 108, 117); // #E06C75 error / diff -
+pub const IVORY_RGB: (u8, u8, u8) = (236, 232, 224); // #ECE8E0 primary text
+pub const STONE_RGB: (u8, u8, u8) = (166, 158, 148); // #A69E94 secondary text
+pub const MUTED_RGB: (u8, u8, u8) = (112, 106, 99); // #706A63 hints / dim connectors
+pub const HAIRLINE_RGB: (u8, u8, u8) = (74, 70, 66); // #4A4642 hairline horizontal rules
+pub const SURFACE_RGB: (u8, u8, u8) = (38, 35, 32); // #262320 subtle warm surface
+pub const SURFACE_HI_RGB: (u8, u8, u8) = (54, 48, 43); // #36302B active row surface
+
+/// Codex `diff_render.rs` exact dark TrueColor diff background tints.
+const DARK_TC_ADD_LINE_BG: Color = Color::Rgb(33, 58, 43); // #213A2B
+const DARK_TC_DEL_LINE_BG: Color = Color::Rgb(74, 34, 29); // #4A221D
+
+pub const ACCENT: Color = Color::Rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2);
+pub const ACCENT_PEAK: Color = Color::Rgb(ACCENT_PEAK_RGB.0, ACCENT_PEAK_RGB.1, ACCENT_PEAK_RGB.2);
+pub const AMBER: Color = Color::Rgb(AMBER_RGB.0, AMBER_RGB.1, AMBER_RGB.2);
+pub const SAGE: Color = Color::Rgb(SAGE_RGB.0, SAGE_RGB.1, SAGE_RGB.2);
+pub const ROSE: Color = Color::Rgb(ROSE_RGB.0, ROSE_RGB.1, ROSE_RGB.2);
+pub const IVORY: Color = Color::Rgb(IVORY_RGB.0, IVORY_RGB.1, IVORY_RGB.2);
+pub const STONE: Color = Color::Rgb(STONE_RGB.0, STONE_RGB.1, STONE_RGB.2);
+pub const MUTED: Color = Color::Rgb(MUTED_RGB.0, MUTED_RGB.1, MUTED_RGB.2);
+pub const HAIRLINE: Color = Color::Rgb(HAIRLINE_RGB.0, HAIRLINE_RGB.1, HAIRLINE_RGB.2);
+pub const SURFACE: Color = Color::Rgb(SURFACE_RGB.0, SURFACE_RGB.1, SURFACE_RGB.2);
+pub const SURFACE_HI: Color = Color::Rgb(SURFACE_HI_RGB.0, SURFACE_HI_RGB.1, SURFACE_HI_RGB.2);
+pub const SEARCH_BG: Color = Color::Rgb(92, 66, 32);
+pub const SEARCH_ACTIVE_BG: Color = ACCENT;
+
+/// Codex `summary_shimmer.rs` exact desktop-matched cadence timings.
+const SHIMMER_START_DELAY: Duration = Duration::from_millis(600);
+const SHIMMER_SWEEP_SECS: f64 = 1.0;
+const SHIMMER_INTERVAL_SECS: f64 = 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionMode {
+    Animated,
+    Reduced,
+}
+
+impl MotionMode {
+    pub fn from_env() -> Self {
+        let reduced = std::env::var("TWIG_REDUCED_MOTION")
+            .or_else(|_| std::env::var("REDUCED_MOTION"))
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        if reduced {
+            Self::Reduced
+        } else {
+            Self::Animated
+        }
+    }
+}
+
+/// Ported directly from `codex-rs/tui/src/color.rs`: alpha blend `fg` over `bg`.
+pub fn blend(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: f32) -> (u8, u8, u8) {
+    let a = alpha.clamp(0.0, 1.0);
+    let r = (fg.0 as f32 * a + bg.0 as f32 * (1.0 - a)).round() as u8;
+    let g = (fg.1 as f32 * a + bg.1 as f32 * (1.0 - a)).round() as u8;
+    let b = (fg.2 as f32 * a + bg.2 as f32 * (1.0 - a)).round() as u8;
+    (r, g, b)
+}
 
 pub fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
+}
+
+/// Ported directly from `codex-rs/tui/src/status_indicator_widget.rs`:
+/// compact human elapsed formatting (`0s`, `59s`, `1m 00s`, `1h 02m 03s`).
+pub fn fmt_elapsed_compact(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        return format!("{elapsed_secs}s");
+    }
+    if elapsed_secs < 3600 {
+        let minutes = elapsed_secs / 60;
+        let seconds = elapsed_secs % 60;
+        return format!("{minutes}m {seconds:02}s");
+    }
+    let hours = elapsed_secs / 3600;
+    let minutes = (elapsed_secs % 3600) / 60;
+    let seconds = elapsed_secs % 60;
+    format!("{hours}h {minutes:02}m {seconds:02}s")
+}
+
+/// Returns `true` when the cadenced shimmer wave is actively sweeping (so the event loop
+/// can run at 32ms during the 1s sweep and drop to calmer polling during the 3s rest).
+pub fn shimmer_is_sweeping(elapsed: Duration, motion: MotionMode) -> bool {
+    if motion == MotionMode::Reduced || elapsed < SHIMMER_START_DELAY {
+        return false;
+    }
+    let cycle = elapsed.saturating_sub(SHIMMER_START_DELAY).as_secs_f64() % SHIMMER_INTERVAL_SECS;
+    cycle <= SHIMMER_SWEEP_SECS + 0.08
+}
+
+/// Ported directly from `codex-rs/tui/src/summary_shimmer.rs` with warm terracotta palette:
+/// - Waits 600ms after a new status header appears
+/// - Sweeps for 1.0s every 4.0s (calm rest in between, zero agent-fatigue jitter)
+/// - Uses display-column centers (`UnicodeWidthChar`) so CJK sweeps at identical visual speed
+/// - Minimum half-width of 3.0 columns (6-col wave) so short words never flicker per-letter
+pub fn summary_shimmer(text: &str, elapsed: Duration, motion: MotionMode) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if motion == MotionMode::Reduced {
+        return vec![Span::styled(text.to_owned(), Style::default().fg(ACCENT))];
+    }
+    let width = display_width(text) as f64;
+    let half_width = (width * 0.1).max(3.0);
+    let sweep = if elapsed < SHIMMER_START_DELAY {
+        0.0
+    } else {
+        (elapsed.saturating_sub(SHIMMER_START_DELAY).as_secs_f64() % SHIMMER_INTERVAL_SECS)
+            .min(SHIMMER_SWEEP_SECS)
+    };
+    let active_band = elapsed >= SHIMMER_START_DELAY && sweep < SHIMMER_SWEEP_SECS;
+    let position = sweep / SHIMMER_SWEEP_SECS * (width + 2.0 * half_width) - half_width;
+    let mut column = 0.0f64;
+
+    text.chars()
+        .map(|ch| {
+            let glyph_w = UnicodeWidthChar::width(ch).unwrap_or(1) as f64;
+            let center = column + glyph_w / 2.0;
+            column += glyph_w;
+            let intensity = if active_band {
+                let distance = ((center - position).abs() / half_width).min(1.0);
+                0.5 * (1.0 + (std::f64::consts::PI * distance).cos())
+            } else {
+                0.0
+            };
+            let alpha = (0.35 + 0.65 * intensity) as f32;
+            let (r, g, b) = blend(ACCENT_PEAK_RGB, BASE_SHIMMER_RGB, alpha);
+            let mut style = Style::default().fg(Color::Rgb(r, g, b));
+            if intensity > 0.55 {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            Span::styled(ch.to_string(), style)
+        })
+        .collect()
 }
 
 /// Wrap plain text by terminal cell width (CJK/emoji safe), preserving explicit newlines.
@@ -59,54 +183,136 @@ pub fn wrap_plain(text: &str, max_width: usize) -> Vec<String> {
     out
 }
 
-/// Codex-style TrueColor cosine shimmer sweep across `text` in warm terracotta tones.
-pub fn shimmer_spans(text: &str, phase: f32) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return Vec::new();
-    }
-    let span_len = chars.len() as f32;
-    let center = (phase.rem_euclid(1.4) - 0.2) * (span_len + 6.0) - 3.0;
-    let band = 4.2f32;
+/// Tracks hunk line numbers for unified diff rendering (inspired by Codex `diff_render.rs`).
+#[derive(Default)]
+pub struct DiffGutterState {
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+}
 
-    chars
-        .into_iter()
-        .enumerate()
-        .map(|(i, ch)| {
-            let dist = ((i as f32) - center).abs();
-            let t = if dist < band {
-                0.5 * (1.0 + (std::f32::consts::PI * dist / band).cos())
-            } else {
-                0.0
-            };
-            // Base warm terracotta-stone blend -> luminous cream peak
-            let r = lerp_u8(178, 248, t);
-            let g = lerp_u8(126, 208, t);
-            let b = lerp_u8(104, 178, t);
-            let mut style = Style::default().fg(Color::Rgb(r, g, b));
-            if t > 0.65 {
-                style = style.add_modifier(Modifier::BOLD);
+impl DiffGutterState {
+    /// Render one line from tool output or a `diff` block with optional right-aligned line numbers
+    /// and Codex's exact `#213A2B` / `#4A221D` TrueColor diff backgrounds.
+    pub fn render_line(&mut self, raw: &str, max_width: usize) -> Vec<Vec<Span<'static>>> {
+        if let Some((old_n, new_n)) = parse_hunk_header(raw) {
+            self.old_line = Some(old_n);
+            self.new_line = Some(new_n);
+            return wrap_plain(raw, max_width)
+                .into_iter()
+                .map(|w| vec![Span::styled(w, Style::default().fg(AMBER))])
+                .collect();
+        }
+        if raw.starts_with("diff --git ") || raw.starts_with("+++ ") || raw.starts_with("--- ") {
+            self.old_line = None;
+            self.new_line = None;
+            return wrap_plain(raw, max_width)
+                .into_iter()
+                .map(|w| {
+                    vec![Span::styled(
+                        w,
+                        Style::default().fg(STONE).add_modifier(Modifier::BOLD),
+                    )]
+                })
+                .collect();
+        }
+
+        let in_hunk = self.old_line.is_some() && self.new_line.is_some();
+        let (gutter_num, sign, body, line_style) = if let Some(rest) = raw.strip_prefix('+') {
+            let num = self.new_line.inspect(|&n| {
+                self.new_line = Some(n + 1);
+            });
+            (
+                num,
+                Some('+'),
+                rest,
+                Style::default().fg(SAGE).bg(DARK_TC_ADD_LINE_BG),
+            )
+        } else if let Some(rest) = raw.strip_prefix('-') {
+            let num = self.old_line.inspect(|&n| {
+                self.old_line = Some(n + 1);
+            });
+            (
+                num,
+                Some('-'),
+                rest,
+                Style::default().fg(ROSE).bg(DARK_TC_DEL_LINE_BG),
+            )
+        } else if in_hunk && raw.starts_with(' ') {
+            let num = self.new_line.inspect(|&n| {
+                self.new_line = Some(n + 1);
+            });
+            if let Some(o) = self.old_line {
+                self.old_line = Some(o + 1);
             }
-            Span::styled(ch.to_string(), style)
-        })
-        .collect()
+            (num, Some(' '), &raw[1..], Style::default().fg(STONE))
+        } else {
+            return wrap_plain(raw, max_width)
+                .into_iter()
+                .map(|w| vec![Span::styled(w, Style::default().fg(STONE))])
+                .collect();
+        };
+
+        let prefix_w = if gutter_num.is_some() { 7 } else { 2 };
+        let content_w = max_width.saturating_sub(prefix_w).max(8);
+        let sign_ch = sign.unwrap_or(' ');
+        let gutter_bg = line_style.bg.unwrap_or(Color::Reset);
+        let gutter_style = Style::default().fg(MUTED).bg(gutter_bg);
+
+        wrap_plain(body, content_w)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, segment)| {
+                let mut spans = Vec::with_capacity(3);
+                if let Some(n) = gutter_num {
+                    let num_str = if idx == 0 {
+                        format!("{n:>4} ")
+                    } else {
+                        "     ".to_owned()
+                    };
+                    spans.push(Span::styled(num_str, gutter_style));
+                }
+                spans.push(Span::styled(
+                    if idx == 0 {
+                        format!("{sign_ch} ")
+                    } else {
+                        "  ".to_owned()
+                    },
+                    line_style,
+                ));
+                let pad = content_w.saturating_sub(display_width(&segment));
+                spans.push(Span::styled(
+                    if line_style.bg.is_some() {
+                        format!("{segment}{}", " ".repeat(pad))
+                    } else {
+                        segment
+                    },
+                    line_style,
+                ));
+                spans
+            })
+            .collect()
+    }
 }
 
-fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
-    let clamped = t.clamp(0.0, 1.0);
-    (a as f32 + (b as f32 - a as f32) * clamped).round() as u8
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old_part, after_old) = rest.split_once(" +")?;
+    let new_part = after_old.split_once(" @@")?.0;
+    let old_start = old_part.split(',').next()?.parse().ok()?;
+    let new_start = new_part.split(',').next()?.parse().ok()?;
+    Some((old_start, new_start))
 }
 
-/// Style a single tool-output or diff line with automatic unified-diff colorization.
+/// Style a single compact preview line with unified-diff colorization.
 pub fn style_output_line(line: &str) -> Style {
     if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("diff --git ") {
         Style::default().fg(STONE).add_modifier(Modifier::BOLD)
     } else if line.starts_with("@@ ") {
         Style::default().fg(AMBER)
     } else if line.starts_with('+') {
-        Style::default().fg(SAGE).bg(DIFF_ADD_BG)
+        Style::default().fg(SAGE).bg(DARK_TC_ADD_LINE_BG)
     } else if line.starts_with('-') {
-        Style::default().fg(ROSE).bg(DIFF_DEL_BG)
+        Style::default().fg(ROSE).bg(DARK_TC_DEL_LINE_BG)
     } else {
         Style::default().fg(STONE)
     }
@@ -169,12 +375,12 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
 }
 
 /// Render streaming assistant markdown into wrapped styled Ratatui lines.
-/// Applies Claude Code warm terracotta typography and unified-diff highlighting.
 pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let width = max_width.max(12);
     let mut out = Vec::new();
     let mut in_code = false;
     let mut is_diff_block = false;
+    let mut diff_gutter = DiffGutterState::default();
     let body = Style::default().fg(IVORY);
 
     for raw in text.split('\n') {
@@ -185,7 +391,9 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             in_code = !in_code;
             if in_code {
                 let lang = fence.trim();
-                is_diff_block = lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
+                is_diff_block =
+                    lang.eq_ignore_ascii_case("diff") || lang.eq_ignore_ascii_case("patch");
+                diff_gutter = DiffGutterState::default();
                 let label = if lang.is_empty() {
                     "─── code ".to_string()
                 } else {
@@ -206,16 +414,20 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
         }
 
         if in_code {
-            let line_style = if is_diff_block {
-                style_output_line(line)
+            if is_diff_block {
+                for row in diff_gutter.render_line(line, width.saturating_sub(2)) {
+                    let mut spans = vec![Span::styled("│ ", Style::default().fg(HAIRLINE))];
+                    spans.extend(row);
+                    out.push(Line::from(spans));
+                }
             } else {
-                Style::default().fg(ACCENT_PEAK)
-            };
-            for wrapped in wrap_plain(line, width.saturating_sub(2)) {
-                out.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(HAIRLINE)),
-                    Span::styled(wrapped, line_style),
-                ]));
+                let code_style = Style::default().fg(ACCENT_PEAK);
+                for wrapped in wrap_plain(line, width.saturating_sub(2)) {
+                    out.push(Line::from(vec![
+                        Span::styled("│ ", Style::default().fg(HAIRLINE)),
+                        Span::styled(wrapped, code_style),
+                    ]));
+                }
             }
             continue;
         }
@@ -358,20 +570,48 @@ mod tests {
     }
 
     #[test]
-    fn renders_code_blocks_diffs_and_extracts_blocks() {
-        let md = "# Title\n- check `foo` and **bar**\n```diff\n-old\n+new\n```\n```rust\nlet x = 1;\n```";
-        let rendered = render_markdown(md, 48);
-        assert!(rendered[0].to_string().contains("Title"));
-        assert!(rendered[1].to_string().contains("• check"));
-        assert!(rendered.iter().any(|l| l.to_string().contains("+new")));
+    fn codex_shimmer_cadence_and_elapsed_formatting_match_upstream() {
+        assert_eq!(fmt_elapsed_compact(0), "0s");
+        assert_eq!(fmt_elapsed_compact(59), "59s");
+        assert_eq!(fmt_elapsed_compact(65), "1m 05s");
+        assert_eq!(fmt_elapsed_compact(3661), "1h 01m 01s");
 
-        let blocks = extract_code_blocks(md);
-        assert_eq!(blocks, vec!["-old\n+new", "let x = 1;"]);
+        // Before 600ms start delay, shimmer rests calmly.
+        assert!(!shimmer_is_sweeping(
+            Duration::from_millis(200),
+            MotionMode::Animated
+        ));
+        // Inside 1s sweep window after 600ms delay, shimmer actively sweeps.
+        assert!(shimmer_is_sweeping(
+            Duration::from_millis(900),
+            MotionMode::Animated
+        ));
+        // During 3s rest window (e.g. 2.5s elapsed -> 1.9s into cycle), shimmer rests.
+        assert!(!shimmer_is_sweeping(
+            Duration::from_millis(2500),
+            MotionMode::Animated
+        ));
+        // Reduced motion returns a single static span.
+        assert_eq!(
+            summary_shimmer("Reasoning…", Duration::from_secs(1), MotionMode::Reduced).len(),
+            1
+        );
+        assert_eq!(
+            summary_shimmer("Reasoning…", Duration::from_secs(1), MotionMode::Animated).len(),
+            "Reasoning…".chars().count()
+        );
     }
 
     #[test]
-    fn shimmer_produces_one_span_per_char() {
-        let spans = shimmer_spans("Reasoning…", 0.5);
-        assert_eq!(spans.len(), "Reasoning…".chars().count());
+    fn renders_code_blocks_hunk_diff_gutter_and_extracts_blocks() {
+        let md = "# Title\n- check `foo` and **bar**\n```diff\n@@ -10,2 +10,2 @@\n-old\n+new\n```\n```rust\nlet x = 1;\n```";
+        let rendered = render_markdown(md, 52);
+        assert!(rendered[0].to_string().contains("Title"));
+        assert!(rendered[1].to_string().contains("• check"));
+        assert!(rendered.iter().any(|l| l.to_string().contains("10 - old")));
+        assert!(rendered.iter().any(|l| l.to_string().contains("10 + new")));
+
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks, vec!["@@ -10,2 +10,2 @@\n-old\n+new", "let x = 1;"]);
     }
 }
