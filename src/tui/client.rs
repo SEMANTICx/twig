@@ -512,7 +512,8 @@ pub fn extract_inline_images(repo: &str, text: &str) -> Vec<(String, String)> {
 /// Prompt sent by `/evolve` for human-reviewed session self-improvement.
 pub const EVOLVE_PROMPT: &str = "\
 Reflect on this session's friction, repeated errors, tool papercuts, or repo-specific conventions you discovered. \
-Propose ONE concise, high-leverage improvement to `.twig/preferences.md` or a project skill under `.twig/skills/<name>/SKILL.md`. \
+Propose ONE concise, high-leverage improvement to `.twig/preferences.md` or a project skill under `.twig/skills/<name>/SKILL.md` \
+(keep skills <500 lines with crisp triggers and verify with `twig skill doctor` once approved). \
 Do NOT edit Rust source code or locked harness files, and do NOT modify files yet—present the proposed change as a clear unified diff with a brief rationale so I can review and approve applying it.";
 
 /// Format an `mcp.list` RPC reply cleanly for the transcript (tools, prompts/skills, and resources).
@@ -918,21 +919,6 @@ pub fn build_turn_params(
         .map(|(label, url)| json!({"label": label, "url": url}))
         .collect();
     (json!({"input": text, "images": payload}), labels)
-}
-
-/// Format `/skills` overview combining playbooks and project/global skills.
-pub fn format_skills_notice(playbooks: &[String], skills_meta: &str) -> String {
-    let books = if playbooks.is_empty() {
-        "bug-fix, feature, autonomous-run".to_owned()
-    } else {
-        playbooks.join(", ")
-    };
-    let skills = if skills_meta.trim().is_empty() {
-        "none in .twig/skills or ~/.config/twig/skills".to_owned()
-    } else {
-        skills_meta.to_owned()
-    };
-    format!("playbooks: {books} · skills: {skills}")
 }
 
 #[derive(Debug)]

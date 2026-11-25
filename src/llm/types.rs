@@ -104,6 +104,11 @@ impl Roles {
     pub fn get(&self, role: &str) -> &str {
         self.0
             .get(role)
+            .or_else(|| match role {
+                "scout" => self.0.get("filter"),
+                "reviewer" => self.0.get("judge"),
+                _ => None,
+            })
             .or_else(|| self.0.get("code"))
             .map(String::as_str)
             .unwrap_or("aihub/gpt-6.1-sol")
@@ -266,5 +271,17 @@ mod tests {
         assert_eq!(no_cache["complete"], true);
         assert_eq!(no_cache["cached_input_tokens"], Value::Null);
         assert_eq!(no_cache["cache_reported_calls"], 0);
+    }
+
+    #[test]
+    fn roles_map_subagent_aliases_to_filter_and_judge() {
+        let mut map = HashMap::new();
+        map.insert("code".into(), "main-model".into());
+        map.insert("filter".into(), "fast-model".into());
+        map.insert("judge".into(), "review-model".into());
+        let roles = Roles(map);
+        assert_eq!(roles.get("scout"), "fast-model");
+        assert_eq!(roles.get("reviewer"), "review-model");
+        assert_eq!(roles.get("code"), "main-model");
     }
 }

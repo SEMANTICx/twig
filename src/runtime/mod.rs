@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use self::context::Context;
 use self::guard::Guard;
-use self::guidance::{inject_playbook, route, Playbook};
+use self::guidance::{inject_playbook, route, Playbook, SkillStore};
 use self::policy::{Policy, Tier};
 use self::tools::Tools;
 use self::turn::{execute_recorded_call, run_turn_live, ExecEnv, TurnCtx};
@@ -608,6 +608,10 @@ impl<'a> Daemon<'a> {
                 self.messages.truncate(keep_len);
                 self.pending.clear();
                 self.deferred_calls.clear();
+                self.guard.reset_transient();
+                if self.messages.is_empty() {
+                    self.todos.clear();
+                }
                 self.record
                     .append("session.rewound", json!({"turns": rewound_turns}))
                     .map_err(|e| e.to_string())?;
@@ -617,6 +621,7 @@ impl<'a> Daemon<'a> {
                 Ok(json!({
                     "rewound_turns": rewound_turns,
                     "messages": self.messages,
+                    "todos": self.todos,
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
                     "running_tasks": self.tools.running_tasks_count(),
@@ -625,6 +630,37 @@ impl<'a> Daemon<'a> {
 
             "mcp.list" => Ok(self.tools.list_mcp()),
             "tasks.list" => Ok(self.tools.list_tasks()),
+            "skill.manage" => {
+                let store = SkillStore::default_for(Some(&self.worktree));
+                let action = params["action"].as_str().unwrap_or("list");
+                let project = params["project"].as_bool().unwrap_or(false);
+                match action {
+                    "list" => Ok(json!({"action": "list", "ok": true, "report": store.list_report()})),
+                    "doctor" => {
+                        let (ok, report) = store.doctor_report();
+                        Ok(json!({"action": "doctor", "ok": ok, "report": report}))
+                    }
+                    "enable" => {
+                        let name = params["name"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or("enable requires a skill name")?;
+                        let msg = store.enable(name, project)?;
+                        self.tools.reload_skills();
+                        Ok(json!({"action": "enable", "ok": true, "report": msg}))
+                    }
+                    "disable" => {
+                        let name = params["name"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .ok_or("disable requires a skill name")?;
+                        let msg = store.disable(name, project)?;
+                        self.tools.reload_skills();
+                        Ok(json!({"action": "disable", "ok": true, "report": msg}))
+                    }
+                    other => Err(format!("unknown skill action: {other}")),
+                }
+            }
 
             "mode.set" => {
                 let next = params
@@ -739,13 +775,21 @@ impl<'a> Daemon<'a> {
                         .append("acceptance.configured", json!({"check": check}))
                         .map_err(|e| e.to_string())?;
                 }
+                self.tools.reload_skills();
                 let mut system = self.system.clone();
                 if let Some(book) = route(input, &self.playbooks) {
                     inject_playbook(&mut system, book, "");
                     emit(json!({"ev": "playbook.selected", "name": book.name, "steps": book.steps}));
                 }
                 append_repo_instructions(&self.worktree, &mut system);
-                system.push_str(&self.tools.system_addendum());
+                system.push_str(&self.tools.system_addendum_for(input));
+                let skill_store = SkillStore::default_for(Some(&self.worktree));
+                for (name, scope, body) in skill_store.resolve_explicit_invocations(input) {
+                    system.push_str(&format!(
+                        "\n\n## Explicitly invoked skill: ${name} ({scope})\n{body}"
+                    ));
+                    emit(json!({"ev": "skill.loaded", "name": name, "scope": scope}));
+                }
 
                 let mut verify_rounds = 0u32;
                 loop {
@@ -971,7 +1015,7 @@ impl<'a> Daemon<'a> {
                 // the command never started, so execute once on allow or record denial.
                 let name = pending["name"].as_str().unwrap_or("bash").to_owned();
                 let args = pending["args"].clone();
-                if allow && remember && name == "bash" {
+                if allow && remember && matches!(name.as_str(), "bash" | "task") {
                     let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
                     let pattern = self.policy.allow_for_session(cmd);
                     self.record

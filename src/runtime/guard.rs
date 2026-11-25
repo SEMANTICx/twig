@@ -103,6 +103,12 @@ impl Guard {
         None
     }
 
+    /// Clear transient loop-breaker and stall counters (e.g. after `/rewind`).
+    pub fn reset_transient(&mut self) {
+        self.last_failed_call = None;
+        self.stall = 0;
+    }
+
     pub fn ignoring(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.ignore = paths
             .into_iter()

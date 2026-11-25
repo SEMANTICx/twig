@@ -341,30 +341,41 @@ impl SkillIndex {
     }
 
     /// Progressive-disclosure Layer 1 system prompt addendum.
-    /// Keeps system prompt bounded once more than 15 skills are active by
-    /// switching to on-demand `skill(query=...)` search.
-    pub fn system_prompt_block(&self) -> String {
+    /// When <= 15 skills are enabled, emits the full compact metadata list.
+    /// When > 15 skills are enabled, runs a zero-RTT local keyword pre-ranker
+    /// on the current user input and exposes only the top-5 candidates alongside
+    /// `skill(query=...)` so Layer 1 token cost stays O(1).
+    pub fn system_prompt_block_for(&self, input: &str) -> String {
         if self.entries.is_empty() {
             return String::new();
         }
         if self.entries.len() <= 15 {
-            format!(
+            return format!(
                 "\nAvailable project/global skills (load body via skill tool only when relevant): {}",
                 self.summary_json()
+            );
+        }
+        let top = self.search_top(input, 5);
+        if top.is_empty() {
+            format!(
+                "\n{} skills installed (Layer 1 compacted). Call skill(query=\"<keywords>\") to search or skill(name=\"<name>\") to load.",
+                self.entries.len()
             )
         } else {
+            let shortlist = serde_json::to_string(&top).unwrap_or_default();
             format!(
-                "\n{} skills are installed (Layer 1 compacted to avoid context bloat). Call skill(query=\"<keywords>\") to discover relevant skills or skill(name=\"<name>\") to load one.",
-                self.entries.len()
+                "\n{} skills installed (showing top {} matches for this turn; call skill(query=\"...\") to search others): {}",
+                self.entries.len(),
+                top.len(),
+                shortlist
             )
         }
     }
 
-    /// Lightweight token-overlap search over skill names (3x weight) and descriptions (1x weight).
-    pub fn search_json(&self, query: &str) -> String {
+    fn search_top(&self, query: &str, limit: usize) -> Vec<&SkillMetadata> {
         let q_tokens = tokenize_keywords(query);
         if q_tokens.is_empty() {
-            return self.summary_json();
+            return Vec::new();
         }
         let mut scored: Vec<(usize, &SkillMetadata)> = self
             .entries
@@ -385,7 +396,15 @@ impl SkillIndex {
             })
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
-        let top: Vec<&SkillMetadata> = scored.into_iter().take(8).map(|(_, m)| m).collect();
+        scored.into_iter().take(limit).map(|(_, m)| m).collect()
+    }
+
+    /// Lightweight token-overlap search over skill names (3x weight) and descriptions (1x weight).
+    pub fn search_json(&self, query: &str) -> String {
+        let top = self.search_top(query, 8);
+        if top.is_empty() {
+            return self.summary_json();
+        }
         serde_json::to_string(&top).unwrap_or_default()
     }
 
@@ -574,6 +593,86 @@ impl SkillStore {
             out.push((folder, skill_file, parsed));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// List all discoverable skills across project, global, and vault (for TUI `$skill` popup).
+    /// Returns `(name, scope_tag, short_description)` deduplicated by precedence.
+    pub fn catalog_for_autocomplete(&self) -> Vec<(String, String, String)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let mut push_dir = |dir: &Path, tag: &str| {
+            for (_, _, parsed) in Self::scan_entries(dir) {
+                if let Ok(h) = parsed {
+                    if seen.insert(h.name.clone()) {
+                        out.push((h.name, tag.to_owned(), truncate_one_line(&h.description, 56)));
+                    }
+                }
+            }
+        };
+        if let Some(proj) = &self.project_dir {
+            push_dir(proj, "project");
+        }
+        push_dir(&self.global_dir, "global");
+        push_dir(&self.vault_dir, "vault");
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Load a single skill body by name searching project -> global -> cold vault.
+    pub fn load_any(&self, name: &str) -> Result<(String, &'static str), String> {
+        if !valid_skill_name(name) {
+            return Err(format!("invalid skill name {name:?}"));
+        }
+        let candidates: Vec<(PathBuf, &'static str, bool)> = [
+            self.project_dir.as_ref().map(|d| (d.clone(), "project", true)),
+            Some((self.global_dir.clone(), "global", false)),
+            Some((self.vault_dir.clone(), "vault", false)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        for (root, scope, strict) in candidates {
+            let folder_md = root.join(name).join("SKILL.md");
+            let single_md = root.join(format!("{name}.md"));
+            let path = if folder_md.exists() {
+                folder_md
+            } else if single_md.exists() {
+                single_md
+            } else {
+                continue;
+            };
+            let canon = path.canonicalize().map_err(|e| e.to_string())?;
+            if strict {
+                let canon_root = root.canonicalize().map_err(|e| e.to_string())?;
+                if !canon.starts_with(&canon_root) {
+                    return Err("skill escapes project root".into());
+                }
+            }
+            let body = read_bounded(&canon, MAX_SKILL_BYTES).map_err(|e| e.to_string())?;
+            return Ok((body, scope));
+        }
+        Err(format!("unknown skill {name:?}"))
+    }
+
+    /// Extract explicit `$skill-name` invocations from a user prompt and load
+    /// their bodies directly (including cold-vault skills!) for zero-RTT routing.
+    pub fn resolve_explicit_invocations(&self, input: &str) -> Vec<(String, &'static str, String)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for token in input.split_whitespace() {
+            let Some(raw) = token.strip_prefix('$') else {
+                continue;
+            };
+            let name = raw.trim_end_matches([',', '.', ';', ':', ')', ']', '!', '?']);
+            if !valid_skill_name(name) || !seen.insert(name.to_owned()) {
+                continue;
+            }
+            if let Ok((body, scope)) = self.load_any(name) {
+                out.push((name.to_owned(), scope, body));
+            }
+        }
         out
     }
 
@@ -1102,12 +1201,19 @@ when: bug, broken, crash, regression
         SkillIndex::scan_root(&global, "global", false, &mut entries).unwrap();
         let index = SkillIndex { entries };
         assert!(index.search_json("root causes").contains("systematic-debugging"));
-        assert!(index.system_prompt_block().contains("systematic-debugging"));
+        assert!(index
+            .system_prompt_block_for("fix root causes")
+            .contains("systematic-debugging"));
 
-        // Disable leaves vault copy intact.
+        // Explicit `$skill` invocation resolves even from cold vault after disabling globally.
         store.disable("systematic-debugging", false).unwrap();
         assert!(vault.join("systematic-debugging/SKILL.md").exists());
         assert!(!global.join("systematic-debugging").exists());
+        let explicit = store.resolve_explicit_invocations("$systematic-debugging trace crash");
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(explicit[0].0, "systematic-debugging");
+        assert_eq!(explicit[0].1, "vault");
+        assert!(explicit[0].2.contains("Reproduce first"));
 
         // Project enable copies rather than symlinks so strict confinement passes.
         store.enable("systematic-debugging", true).unwrap();

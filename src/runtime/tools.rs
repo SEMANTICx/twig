@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::guidance::SkillIndex;
+use super::guidance::{SkillIndex, SkillStore};
 use super::mcp::McpRegistry;
 use super::subagent::{Role, SubagentConfig, SubagentPool};
 use super::tasks::TaskManager;
@@ -98,6 +98,11 @@ impl Tools {
         self
     }
 
+    /// Re-scan project & global skills on disk (e.g. after `/skills enable` or `/evolve`).
+    pub fn reload_skills(&mut self) {
+        self.skills = SkillIndex::discover_default(&self.worktree);
+    }
+
     pub fn worktree(&self) -> &Path {
         &self.worktree
     }
@@ -122,11 +127,15 @@ impl Tools {
         self.read_only_mask != 0
     }
 
-    /// System prompt instructions owned by the active tool configuration (skills + plan mode).
-    pub fn system_addendum(&self) -> String {
-        let mut out = String::new();
+    /// System prompt instructions owned by the active tool configuration
+    /// (harness self-awareness, hybrid Layer-1 skills, MCP, and plan mode).
+    pub fn system_addendum_for(&self, input: &str) -> String {
+        let mut out = String::from(
+            "\nHarness tools: prefer read/edit/write/grep/glob over shell cat/sed/grep; use task for long background commands and subagent batches for parallel exploration/review. \
+             Skills use 3 tiers (project .twig/skills > global ~/.config/twig/skills, vault ~/.local/share/twig-skills-vault); manage via `twig skill <list|enable|disable|add|doctor>`, and load `skill-creator` when authoring skills.",
+        );
         if let Some(skills) = &self.skills {
-            out.push_str(&skills.system_prompt_block());
+            out.push_str(&skills.system_prompt_block_for(input));
         }
         if let Some(mcp) = &self.mcp {
             out.push_str(&format!(
@@ -152,7 +161,7 @@ impl Tools {
                                "required": ["command"]}}}),
             json!({"type": "function", "function": {
                 "name": "read",
-                "description": format!("{} Returns at most {} lines. Optional 1-based start_line and limit paginate large files.",
+                "description": format!("{} Returns at most {} lines. Optional 1-based start_line and limit paginate large files or `artifact:<file>` side-channel outputs.",
                                        self.read_description, self.read_max_lines),
                 "parameters": {"type": "object",
                                "properties": {
@@ -415,18 +424,27 @@ impl Tools {
                     "invalid papercut: each required field must contain 1..4000 bytes".into()
                 }
             }
-            "skill" => match &self.skills {
-                Some(index) => match call.args["name"].as_str() {
-                    Some(name) => index
-                        .load(name)
-                        .unwrap_or_else(|e| format!("skill error: {e}")),
-                    None => match call.args["query"].as_str() {
+            "skill" => {
+                if let Some(name) = call.args["name"].as_str() {
+                    if let Some(index) = &self.skills {
+                        if let Ok(body) = index.load(name) {
+                            return body;
+                        }
+                    }
+                    // Allow explicit loading from the cold vault without requiring global enable.
+                    SkillStore::default_for(Some(&self.worktree))
+                        .load_any(name)
+                        .map(|(body, _)| body)
+                        .unwrap_or_else(|e| format!("skill error: {e}"))
+                } else if let Some(index) = &self.skills {
+                    match call.args["query"].as_str() {
                         Some(q) if !q.trim().is_empty() => index.search_json(q),
                         _ => index.summary_json(),
-                    },
-                },
-                None => "No project or global skills found".into(),
-            },
+                    }
+                } else {
+                    "No project or global skills enabled; check `twig skill list` for cold-vault skills.".into()
+                }
+            }
             "todo" => self.update_todo(&call.args, emit),
             "mcp" => match &mut self.mcp {
                 Some(reg) => {

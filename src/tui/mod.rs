@@ -32,11 +32,10 @@ use serde_json::{json, Value};
 use self::client::{
     archive_session_file, build_turn_params, chat_plain, copy_to_clipboard, detect_git_branch,
     edit_file_in_external_editor, edit_in_external_editor, ensure_memory_file,
-    format_config_report, format_init_report, format_mcp_report, format_skills_notice,
-    format_tasks_report, format_verify_report, init_project_files, list_sessions,
-    load_image_data_url, notify_osc99, paste_clipboard_image, read_memory_preview, run_git_diff,
-    shorten_home, write_export_file, LocalMsg, LocalWorkers, ServeClient, ServerMsg,
-    TerminalGuard, EVOLVE_PROMPT,
+    format_config_report, format_init_report, format_mcp_report, format_tasks_report,
+    format_verify_report, init_project_files, list_sessions, load_image_data_url, notify_osc99,
+    paste_clipboard_image, read_memory_preview, run_git_diff, shorten_home, write_export_file,
+    LocalMsg, LocalWorkers, ServeClient, ServerMsg, TerminalGuard, EVOLVE_PROMPT,
 };
 use self::composer::{parse_slash, Composer, SlashCommand};
 use self::markdown::{
@@ -105,8 +104,6 @@ struct App {
     plan_mode: bool,
     playbook: Option<String>,
     guard_level: Option<String>,
-    playbooks_meta: Vec<String>,
-    skills_meta: String,
     turns_used: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -127,6 +124,7 @@ struct App {
     rewind_prefill: Option<String>,
     mcp_req: Option<u64>,
     tasks_req: Option<u64>,
+    skills_req: Option<u64>,
     running_tasks: usize,
     todos: Vec<TodoEntry>,
     pending_images: Vec<(String, String)>,
@@ -173,8 +171,6 @@ impl App {
             plan_mode: false,
             playbook: None,
             guard_level: None,
-            playbooks_meta: Vec::new(),
-            skills_meta: String::new(),
             turns_used: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -195,6 +191,7 @@ impl App {
             rewind_prefill: None,
             mcp_req: None,
             tasks_req: None,
+            skills_req: None,
             running_tasks: 0,
             todos: Vec::new(),
             pending_images: Vec::new(),
@@ -236,6 +233,7 @@ impl App {
         self.rewind_prefill = None;
         self.mcp_req = None;
         self.tasks_req = None;
+        self.skills_req = None;
         self.running_tasks = 0;
         self.todos.clear();
         self.pending_images.clear();
@@ -337,15 +335,6 @@ impl App {
                 if let Some(turns) = result.get("turns").and_then(Value::as_u64) {
                     self.turns_used = turns;
                 }
-                if let Some(books) = result.get("playbooks").and_then(Value::as_array) {
-                    self.playbooks_meta = books
-                        .iter()
-                        .filter_map(|b| b["name"].as_str().map(str::to_owned))
-                        .collect();
-                }
-                if let Some(skills) = result.get("skills").and_then(Value::as_str) {
-                    self.skills_meta = skills.to_owned();
-                }
                 if self.history_req == Some(id) {
                     self.history_req = None;
                     if let Some(messages) = result.get("messages").and_then(Value::as_array) {
@@ -413,6 +402,27 @@ impl App {
                         self.transcript
                             .push_notice(NoticeKind::Playbook, "background tasks");
                         self.transcript.push_assistant(report);
+                    }
+                }
+                if self.skills_req == Some(id) {
+                    self.skills_req = None;
+                    let action = result["action"].as_str().unwrap_or("list");
+                    let ok = result["ok"] != false;
+                    let report = result["report"].as_str().unwrap_or("").trim_end();
+                    if matches!(action, "enable" | "disable") {
+                        self.composer.refresh_skills(&self.repo_raw);
+                        self.flash(report);
+                        self.transcript
+                            .push_notice(NoticeKind::Success, report.to_owned());
+                    } else {
+                        self.transcript.push_notice(
+                            if ok { NoticeKind::Playbook } else { NoticeKind::Warn },
+                            format!("skills · {action}"),
+                        );
+                        if !report.is_empty() {
+                            self.transcript
+                                .push_assistant(format!("```text\n{report}\n```"));
+                        }
                     }
                 }
                 if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
@@ -612,6 +622,14 @@ impl App {
                     self.playbook = Some(name.to_owned());
                     self.transcript.push_notice(NoticeKind::Playbook, format!("playbook routed · {name}"));
                 }
+            }
+            Some("skill.loaded") => {
+                let name = ev["name"].as_str().unwrap_or("skill");
+                let scope = ev["scope"].as_str().unwrap_or("global");
+                self.transcript.push_notice(
+                    NoticeKind::Playbook,
+                    format!("skill loaded · ${name} ({scope})"),
+                );
             }
             Some("guard.tripped") => {
                 if let Some(level) = ev["level"].as_str() {
@@ -1092,13 +1110,6 @@ impl App {
                     self.flash("Cleared pending images");
                     Action::None
                 }
-                SlashCommand::ShowSkills => {
-                    self.transcript.push_notice(
-                        NoticeKind::Playbook,
-                        format_skills_notice(&self.playbooks_meta, &self.skills_meta),
-                    );
-                    Action::None
-                }
                 SlashCommand::ShowMemory => {
                     match read_memory_preview(&self.repo_raw) {
                         Ok(Some(body)) if !body.trim().is_empty() => {
@@ -1309,7 +1320,7 @@ impl App {
                 (
                     HAIRLINE,
                     ACCENT,
-                    "Ask twig anything… (/ command · @ file · ! shell)",
+                    "Ask twig anything… (/ command · @ file · $ skill · ! shell)",
                 )
             };
             self.composer.render(
@@ -1613,6 +1624,14 @@ impl App {
             }
             SlashCommand::ListTasks => {
                 self.tasks_req = self.send_rpc(client, "tasks.list", json!({}), "Listing background tasks…");
+            }
+            SlashCommand::ManageSkills { action, name, project } => {
+                self.skills_req = self.send_rpc(
+                    client,
+                    "skill.manage",
+                    json!({"action": action, "name": name, "project": project}),
+                    &format!("Skills: {action}…"),
+                );
             }
             SlashCommand::ListMcp => {
                 self.mcp_req = self.send_rpc(client, "mcp.list", json!({}), "Checking MCP servers…");

@@ -38,7 +38,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tasks", "list asynchronous background shell tasks"),
     ("/mcp", "list configured MCP servers, prompts, and resources"),
     ("/evolve", "propose human-reviewed .twig/preferences or skill upgrade"),
-    ("/skills", "list available playbooks and project/global skills"),
+    ("/skills", "list/manage skills (/skills enable|disable|doctor, or $name)"),
     ("/memory", "edit .twig/preferences.md project memory in $EDITOR"),
     ("/init", "initialize .twig/preferences.md and .twig/project.json"),
     ("/doctor", "run twig environment & dependency diagnostics"),
@@ -85,7 +85,11 @@ pub enum SlashCommand {
     ListTasks,
     ListMcp,
     EvolveSession,
-    ShowSkills,
+    ManageSkills {
+        action: String,
+        name: Option<String>,
+        project: bool,
+    },
     EditMemory,
     ShowMemory,
     InitProject,
@@ -129,7 +133,16 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/tasks" => Some(SlashCommand::ListTasks),
         "/mcp" => Some(SlashCommand::ListMcp),
         "/evolve" => Some(SlashCommand::EvolveSession),
-        "/skills" | "/playbooks" => Some(SlashCommand::ShowSkills),
+        "/skills" | "/playbooks" => Some(SlashCommand::ManageSkills {
+            action: "list".into(),
+            name: None,
+            project: false,
+        }),
+        "/skills doctor" => Some(SlashCommand::ManageSkills {
+            action: "doctor".into(),
+            name: None,
+            project: false,
+        }),
         "/memory" => Some(SlashCommand::EditMemory),
         "/memory show" => Some(SlashCommand::ShowMemory),
         "/init" => Some(SlashCommand::InitProject),
@@ -210,6 +223,38 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
             });
         }
     }
+    if let Some(arg) = trimmed.strip_prefix("/skills ") {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        let project = parts.contains(&"--project");
+        let pos: Vec<&str> = parts
+            .into_iter()
+            .filter(|p| *p != "--project")
+            .collect();
+        match pos.as_slice() {
+            ["list"] => {
+                return Some(SlashCommand::ManageSkills {
+                    action: "list".into(),
+                    name: None,
+                    project,
+                });
+            }
+            ["doctor"] => {
+                return Some(SlashCommand::ManageSkills {
+                    action: "doctor".into(),
+                    name: None,
+                    project,
+                });
+            }
+            [act @ ("enable" | "disable"), name] => {
+                return Some(SlashCommand::ManageSkills {
+                    action: (*act).to_owned(),
+                    name: Some((*name).to_owned()),
+                    project,
+                });
+            }
+            _ => {}
+        }
+    }
     if let Some(arg) = trimmed.strip_prefix("/deny ") {
         let a = arg.trim();
         if !a.is_empty() {
@@ -228,6 +273,10 @@ pub enum PopupKind {
         at_byte: usize,
         items: Vec<String>,
     },
+    Skill {
+        dollar_byte: usize,
+        items: Vec<(String, String, String)>,
+    },
 }
 
 pub enum PopupAccept {
@@ -245,11 +294,15 @@ pub struct Composer {
     pastes: HashMap<String, String>,
     next_paste_id: usize,
     repo_files: Vec<String>,
+    skill_catalog: Vec<(String, String, String)>,
     popup_sel: usize,
 }
 
 impl Composer {
     pub fn new(repo: &str) -> Self {
+        let skill_catalog =
+            crate::runtime::guidance::SkillStore::default_for(Some(Path::new(repo)))
+                .catalog_for_autocomplete();
         Self {
             text: String::new(),
             cursor: 0,
@@ -259,8 +312,15 @@ impl Composer {
             pastes: HashMap::new(),
             next_paste_id: 1,
             repo_files: list_repo_files(repo),
+            skill_catalog,
             popup_sel: 0,
         }
+    }
+
+    pub fn refresh_skills(&mut self, repo: &str) {
+        self.skill_catalog =
+            crate::runtime::guidance::SkillStore::default_for(Some(Path::new(repo)))
+                .catalog_for_autocomplete();
     }
 
     pub fn history(&self) -> &[String] {
@@ -501,6 +561,7 @@ impl Composer {
         let len = match &popup {
             PopupKind::Slash(v) => v.len(),
             PopupKind::Mention { items, .. } => items.len(),
+            PopupKind::Skill { items, .. } => items.len(),
         };
         if len == 0 {
             return false;
@@ -548,6 +609,16 @@ impl Composer {
                     let replacement = format!("@{path} ");
                     self.text.replace_range(at_byte..self.cursor, &replacement);
                     self.cursor = at_byte + replacement.len();
+                    self.popup_sel = 0;
+                    return PopupAccept::Filled;
+                }
+            }
+            PopupKind::Skill { dollar_byte, items } => {
+                let idx = self.popup_sel.min(items.len().saturating_sub(1));
+                if let Some((name, _, _)) = items.get(idx) {
+                    let replacement = format!("${name} ");
+                    self.text.replace_range(dollar_byte..self.cursor, &replacement);
+                    self.cursor = dollar_byte + replacement.len();
                     self.popup_sel = 0;
                     return PopupAccept::Filled;
                 }
@@ -666,6 +737,34 @@ impl Composer {
                 if !items.is_empty() {
                     return Some(PopupKind::Mention {
                         at_byte: token_start,
+                        items,
+                    });
+                }
+            }
+        }
+        if let Some(query) = token.strip_prefix('$') {
+            if !self.skill_catalog.is_empty() {
+                let q = query.to_lowercase();
+                let mut scored: Vec<(usize, &(String, String, String))> = self
+                    .skill_catalog
+                    .iter()
+                    .filter_map(|item| {
+                        let low = item.0.to_lowercase();
+                        if q.is_empty() || low.starts_with(&q) {
+                            Some((0, item))
+                        } else if low.contains(&q) || item.2.to_lowercase().contains(&q) {
+                            Some((1, item))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                scored.sort_by_key(|(rank, item)| (*rank, item.0.as_str()));
+                let items: Vec<(String, String, String)> =
+                    scored.into_iter().take(10).map(|(_, it)| it.clone()).collect();
+                if !items.is_empty() {
+                    return Some(PopupKind::Skill {
+                        dollar_byte: token_start,
                         items,
                     });
                 }
@@ -886,6 +985,55 @@ impl Composer {
                     })
                     .collect()
             }
+            PopupKind::Skill { items, .. } => {
+                let sel = self.popup_sel.min(items.len().saturating_sub(1));
+                let start = sel.saturating_sub(max_rows.saturating_sub(1));
+                let end = (start + max_rows).min(items.len());
+                items[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (name, scope, desc))| {
+                        let active = start + offset == sel;
+                        let bg = if active { sel_bg } else { Color::Reset };
+                        let marker = if active { " › $" } else { "   $" };
+                        let tag = if scope == "vault" { " [vault] " } else { " " };
+                        let name_col = format!("{name}{tag}");
+                        let used = display_width(marker) + display_width(&name_col);
+                        let desc_clipped: String = desc
+                            .chars()
+                            .take(popup_w.saturating_sub(used + 1))
+                            .collect();
+                        let pad = popup_w.saturating_sub(used + display_width(&desc_clipped));
+                        Line::from(vec![
+                            Span::styled(
+                                marker,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { ACCENT })
+                                    .bg(bg)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                name_col,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { IVORY })
+                                    .bg(bg)
+                                    .add_modifier(if active {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                desc_clipped,
+                                Style::default()
+                                    .fg(if active { sel_fg } else { STONE })
+                                    .bg(bg),
+                            ),
+                            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+                        ])
+                    })
+                    .collect()
+            }
         };
 
         let popup_h = rows.len() as u16;
@@ -990,6 +1138,30 @@ mod tests {
         assert_eq!(
             parse_slash("/image shot.png", false),
             Some(SlashCommand::AttachImage(Some("shot.png".into())))
+        );
+        assert_eq!(
+            parse_slash("/skills", false),
+            Some(SlashCommand::ManageSkills {
+                action: "list".into(),
+                name: None,
+                project: false,
+            })
+        );
+        assert_eq!(
+            parse_slash("/skills enable ponytail --project", false),
+            Some(SlashCommand::ManageSkills {
+                action: "enable".into(),
+                name: Some("ponytail".into()),
+                project: true,
+            })
+        );
+        assert_eq!(
+            parse_slash("/skills doctor", false),
+            Some(SlashCommand::ManageSkills {
+                action: "doctor".into(),
+                name: None,
+                project: false,
+            })
         );
     }
 }

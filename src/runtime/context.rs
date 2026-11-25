@@ -108,6 +108,27 @@ impl Context {
         bytes(messages)
     }
 
+    fn all_artifact_refs(&self) -> Vec<String> {
+        let mut refs = self.artifact_refs.clone();
+        if let Ok(entries) = std::fs::read_dir(&self.artifact_dir) {
+            let mut tool_files: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    (name.starts_with("tool-") && name.ends_with(".txt"))
+                        .then(|| format!("artifact:{name}"))
+                })
+                .collect();
+            tool_files.sort();
+            for r in tool_files {
+                if !refs.contains(&r) {
+                    refs.push(r);
+                }
+            }
+        }
+        refs
+    }
+
     /// Uses the existing chat representation. On failure the live context is unchanged.
     /// The first user request and every system message remain verbatim, alongside
     /// explicit constraints, a recent complete tool-group suffix and recovery refs.
@@ -172,11 +193,12 @@ impl Context {
                 "context budget cannot hold pinned constraints and recent tool pairs".into(),
             );
         }
+        let artifact_refs = self.all_artifact_refs();
         let archive = json!({
             "version": 1,
             "messages": messages,
             "constraints": self.constraints,
-            "artifact_refs": self.artifact_refs
+            "artifact_refs": artifact_refs
         });
         let archive_bytes = serde_json::to_vec(&archive).map_err(|e| e.to_string())?;
         let artifact = self.artifact_dir.join(format!(
@@ -208,7 +230,7 @@ impl Context {
                 summary,
                 self.constraints.join("\n"),
                 artifact.display(),
-                self.artifact_refs.join("\n")
+                artifact_refs.join("\n")
             )
         });
         let mut compacted: Vec<Value> = messages
@@ -271,6 +293,9 @@ mod tests {
     #[test]
     fn compaction_keeps_constraints_pairs_and_recovery() {
         let dir = std::env::temp_dir().join(format!("twig-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool-c99.txt"), "full clipped output\n").unwrap();
         let mut context = Context::new(2000, dir.clone());
         context.add_constraint("Never push");
         context.add_artifact_ref("evidence/check.json");
@@ -287,10 +312,10 @@ mod tests {
             .unwrap();
         assert!(event.after_bytes <= 2000);
         validate_tool_pairs(&messages).unwrap();
-        assert!(serde_json::to_string(&messages).unwrap().contains("Never push"));
-        assert!(serde_json::to_string(&messages)
-            .unwrap()
-            .contains("evidence/check.json"));
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(serialized.contains("Never push"));
+        assert!(serialized.contains("evidence/check.json"));
+        assert!(serialized.contains("artifact:tool-c99.txt"));
         let archive: Value =
             serde_json::from_slice(&std::fs::read(event.artifact).unwrap()).unwrap();
         assert_eq!(archive["messages"].as_array().unwrap().len(), 5);
