@@ -5,6 +5,7 @@ use twig::automation::{Automation, AutomationConfig, Review, ShippingPermissions
 fn temp() -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path=std::env::temp_dir().join(format!("twig-automation-{}-{}",std::process::id(),NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)));
+    let _=std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap(); path
 }
 fn git(cwd:&Path,args:&[&str]) { let out=Command::new("git").arg("-C").arg(cwd).args(args).output().unwrap(); assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr)); }

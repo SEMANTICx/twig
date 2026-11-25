@@ -548,7 +548,9 @@ impl<'a> Daemon<'a> {
                     .model_override
                     .clone()
                     .unwrap_or_else(|| self.llm.roles().get("code").to_string());
-                Ok(json!({"model": active}))
+                let env_override = std::env::var_os("TWIG_MODEL").is_some()
+                    || std::env::var_os("TWIG_ROLES").is_some();
+                Ok(json!({"model": active, "env_override": env_override}))
             }
 
             "effort.set" => {

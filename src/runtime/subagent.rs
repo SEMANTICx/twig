@@ -196,13 +196,22 @@ impl SubagentPool {
         }
         let result =
             self.run_in_worktree(role, task, &worktree, &run_dir, model_override, effort_override);
-        if result.is_err() {
+        let should_clean_worktree = result.is_err()
+            || role.read_only()
+            || Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&worktree)
+                .output()
+                .is_ok_and(|o| o.status.success() && o.stdout.is_empty());
+        if should_clean_worktree {
             let _ = Command::new("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(&worktree)
                 .current_dir(&repo)
                 .output();
             let _ = std::fs::remove_dir_all(&worktree);
+        }
+        if result.is_err() {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
         result
@@ -310,9 +319,19 @@ impl SubagentPool {
         }
         if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
             command.env("TWIG_MODEL", m);
+        } else if std::env::var_os("TWIG_MODEL").is_none()
+            && std::env::var_os("TWIG_ROLES").is_none()
+        {
+            if let Some(saved) = crate::llm::Provider::saved_model() {
+                command.env("TWIG_MODEL", saved);
+            }
         }
         if let Some(e) = effort_override.map(str::trim).filter(|s| !s.is_empty()) {
             command.env("TWIG_EFFORT", e);
+        } else if std::env::var_os("TWIG_EFFORT").is_none() {
+            if let Some(saved) = crate::llm::Provider::saved_effort() {
+                command.env("TWIG_EFFORT", saved);
+            }
         }
         let request = format!(
             "{}\n",

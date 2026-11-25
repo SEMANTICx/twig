@@ -313,6 +313,12 @@ impl App {
                 if let Some(model) = result.get("model").and_then(Value::as_str) {
                     self.model = model.to_owned();
                 }
+                if result.get("env_override") == Some(&Value::Bool(true)) {
+                    self.transcript.push_notice(
+                        NoticeKind::Warn,
+                        "model saved for this session; note: TWIG_MODEL/TWIG_ROLES in shell env overrides saved model on restart",
+                    );
+                }
                 if let Some(val) = result.get("effort") {
                     self.effort = val.as_str().map(str::to_owned);
                 }

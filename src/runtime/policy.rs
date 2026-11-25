@@ -349,10 +349,97 @@ impl Policy {
         key
     }
 
+/// Token-level destructive command check so flag reordering, extra whitespace, or
+/// short flags (e.g. `rm -fr /`, `git push -f`, `git push origin main --force`,
+/// `git clean -xdf`) cannot slip past substring rules.
+fn matches_semantic_deny(cmd: &str) -> bool {
+    let Some(tokens) = lex_shell(cmd) else {
+        return false;
+    };
+    let mut seg: Vec<&str> = Vec::new();
+    let check_seg = |raw: &[&str]| -> bool {
+        let mut s = raw;
+        while let Some(first) = s.first() {
+            if matches!(*first, "sudo" | "env" | "command" | "builtin" | "noglob")
+                || (first.contains('=') && !first.starts_with('-'))
+            {
+                s = &s[1..];
+            } else {
+                break;
+            }
+        }
+        let Some(&prog) = s.first() else {
+            return false;
+        };
+        let rest = &s[1..];
+        let has_short = |ch: char| {
+            rest.iter().any(|t| {
+                t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
+            })
+        };
+        match prog {
+            "shutdown" | "reboot" | "poweroff" | "halt" => true,
+            p if p == "mkfs" || p.starts_with("mkfs.") => true,
+            "dd" => rest.iter().any(|t| t.starts_with("of=/dev/")),
+            "chmod" => {
+                let recursive = has_short('R') || rest.contains(&"--recursive");
+                recursive && rest.contains(&"777") && rest.contains(&"/")
+            }
+            "rm" => {
+                let recursive =
+                    has_short('r') || has_short('R') || rest.contains(&"--recursive");
+                let force = has_short('f') || rest.contains(&"--force");
+                let dangerous_target = rest.iter().any(|t| {
+                    matches!(
+                        *t,
+                        "/" | "/*" | "~" | "~/" | "~/*" | "$HOME" | "${HOME}" | "*" | "." | ".."
+                    )
+                });
+                recursive && force && dangerous_target
+            }
+            "git" => match rest.first().copied() {
+                Some("push") => rest[1..].iter().any(|t| {
+                    *t == "-f"
+                        || *t == "--force"
+                        || t.starts_with("--force-")
+                        || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('f'))
+                }),
+                Some("reset") => rest[1..].contains(&"--hard"),
+                Some("clean") => {
+                    let sub = &rest[1..];
+                    let sub_short = |ch: char| {
+                        sub.iter().any(|t| {
+                            t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
+                        })
+                    };
+                    let force = sub_short('f') || sub.contains(&"--force");
+                    let dirs_or_ignored = sub_short('d') || sub_short('x') || sub_short('X');
+                    force && dirs_or_ignored
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    for tok in &tokens {
+        match tok {
+            Token::Word(w) => seg.push(w.as_str()),
+            Token::Op(_) => {
+                if check_seg(&seg) {
+                    return true;
+                }
+                seg.clear();
+            }
+            Token::Unsafe => {}
+        }
+    }
+    check_seg(&seg)
+}
+
     /// Deny rules read the real command; allow rules read the folded shape.
     pub fn classify(&self, cmd: &str) -> Tier {
         let sh = shape(cmd);
-        if HARD_DENY.iter().any(|d| cmd.contains(d)) {
+        if HARD_DENY.iter().any(|d| cmd.contains(d)) || Self::matches_semantic_deny(cmd) {
             let allows = self.session_allows.lock().expect("policy session allows");
             if allows.contains(&sh) || allows.contains(cmd.trim()) {
                 return Tier::Audit;
@@ -521,6 +608,18 @@ mod tests {
         let p = Policy::new();
         assert_eq!(shape("rm -rf /"), "rm -rf *");
         assert_eq!(p.classify("rm -rf /"), Tier::Deny);
+        assert_eq!(p.classify("rm -fr /"), Tier::Deny);
+        assert_eq!(p.classify("rm -r -f ~"), Tier::Deny);
+        assert_eq!(p.classify("rm  -rf /*"), Tier::Deny);
+        assert_eq!(p.classify("git push -f"), Tier::Deny);
+        assert_eq!(p.classify("git push origin main --force"), Tier::Deny);
+        assert_eq!(p.classify("git push --force-with-lease origin main"), Tier::Deny);
+        assert_eq!(p.classify("git clean -xdf"), Tier::Deny);
+        assert_eq!(p.classify("sudo git reset --hard HEAD~1"), Tier::Deny);
+        // Safe variants remain Audit (never falsely denied).
+        assert_eq!(p.classify("rm -rf target/tmp"), Tier::Audit);
+        assert_eq!(p.classify("git push origin main"), Tier::Audit);
+        assert_eq!(p.classify("git clean -n"), Tier::Audit);
     }
 
     #[test]

@@ -307,19 +307,86 @@ fn main() {
             }
         }
         "doctor" => {
+            let mut failed = false;
             println!(
-                "config: {}\nstate: {}",
+                "config_path: {}\nstate_dir:   {}",
                 paths::config_path().display(),
                 paths::state_dir().display()
             );
+            match HarnessConfig::resolve() {
+                Ok((_, src)) => println!("config:      ok ({src})"),
+                Err(e) => {
+                    println!("config:      FAIL ({e})");
+                    failed = true;
+                }
+            }
+            let provider = Provider::new();
+            let env_model = std::env::var_os("TWIG_MODEL").is_some();
+            let env_roles = std::env::var_os("TWIG_ROLES").is_some();
+            let saved_model = Provider::saved_model();
+            let model_src = if env_model {
+                "env TWIG_MODEL"
+            } else if env_roles {
+                "env TWIG_ROLES"
+            } else if saved_model.is_some() {
+                "saved model.txt"
+            } else {
+                "default"
+            };
+            println!(
+                "model:       {} ({model_src}) · effort: {}",
+                provider.roles().get("code"),
+                provider.effort().as_deref().unwrap_or("off")
+            );
+            if (env_model || env_roles) && saved_model.is_some() {
+                println!(
+                    "  warn: saved model ({}) is overridden by shell env (TWIG_MODEL/TWIG_ROLES)",
+                    saved_model.as_deref().unwrap_or("")
+                );
+            }
             for exe in ["git", "gh", "bwrap"] {
                 let ok = std::process::Command::new(exe)
                     .arg("--version")
                     .output()
                     .is_ok_and(|o| o.status.success());
-                println!("{exe}: {}", if ok { "available" } else { "missing" });
+                println!("{exe:<12} {}", if ok { "available" } else { "missing" });
+                if exe == "git" && !ok {
+                    failed = true;
+                }
             }
-            println!("magpie: set TWIG_BASE_URL/TWIG_MODEL or TWIG_ROLES. Default gateway http://127.0.0.1:3425/v1");
+            let bwrap_ns_ok = std::process::Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "--", "/bin/true"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            println!(
+                "bwrap_ns:    {}",
+                if bwrap_ns_ok {
+                    "ok (user namespaces enabled)"
+                } else {
+                    "unavailable (sandbox/subagent bwrap restricted in this environment)"
+                }
+            );
+            match provider.list_models() {
+                Ok(models) => println!(
+                    "magpie:      ok ({} models at {})",
+                    models.len(),
+                    provider.base()
+                ),
+                Err(e) => println!("magpie:      unreachable ({e})"),
+            }
+            let repo_opt = Path::new(".twig/skills").is_dir().then(|| PathBuf::from("."));
+            let store = twig::playbook::SkillStore::default_for(repo_opt.as_deref());
+            let (skills_ok, skills_report) = store.doctor_report();
+            println!(
+                "skills:      {}",
+                if skills_ok { "ok" } else { "WARN" }
+            );
+            for line in skills_report.lines() {
+                println!("  {line}");
+            }
+            if failed {
+                std::process::exit(1);
+            }
         }
         "config" => {
             let path = paths::config_path();
