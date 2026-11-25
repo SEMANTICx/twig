@@ -2,7 +2,13 @@
 name = "twig"
 version = "0.2.0"
 edition = "2021"
-description = "A thin agent harness: magpie provides models, this provides the loop."
+description = "A thin, high-discipline coding-agent harness in Rust with a borderless TUI, tiered policy, isolated subagents, and curated skills."
+license = "MIT"
+repository = "https://github.com/SEMANTICx/twig"
+homepage = "https://github.com/SEMANTICx/twig"
+readme = "README.md"
+keywords = ["ai", "agent", "tui", "cli", "coding"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -19,3 +25,4 @@ unicode-width = "0.2"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
