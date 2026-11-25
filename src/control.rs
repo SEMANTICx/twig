@@ -8,7 +8,7 @@ pub struct Control {
     cancelled: AtomicBool,
     closed: AtomicBool,
     steering: Mutex<VecDeque<String>>,
-    approvals: Mutex<HashMap<String, bool>>,
+    approvals: Mutex<HashMap<String, (bool, bool)>>,
     waiting: Mutex<Option<String>>,
     wake: Condvar,
 }
@@ -19,13 +19,22 @@ impl Control {
     pub fn reset(&self) { self.cancelled.store(false, Ordering::Relaxed); }
     pub fn steer(&self, text: String) { self.steering.lock().expect("steering").push_back(text); }
     pub fn take_steering(&self) -> Vec<String> { self.steering.lock().expect("steering").drain(..).collect() }
-    pub fn resolve(&self, id: String, allow: bool) { self.approvals.lock().expect("approvals").insert(id, allow); self.wake.notify_all(); }
+    pub fn resolve(&self, id: String, allow: bool) {
+        self.resolve_with_scope(id, allow, false);
+    }
+    pub fn resolve_with_scope(&self, id: String, allow: bool, remember: bool) {
+        self.approvals.lock().expect("approvals").insert(id, (allow, remember));
+        self.wake.notify_all();
+    }
     pub fn begin_approval(&self, id: &str) { *self.waiting.lock().expect("waiting")=Some(id.into()); }
     pub fn approval(&self, id: &str) -> Option<bool> {
+        self.approval_decision(id).map(|(allow, _)| allow)
+    }
+    pub fn approval_decision(&self, id: &str) -> Option<(bool, bool)> {
         *self.waiting.lock().expect("waiting") = Some(id.to_string());
         let mut pending = self.approvals.lock().expect("approvals");
         loop {
-            if let Some(allow) = pending.remove(id) { *self.waiting.lock().unwrap()=None; return Some(allow); }
+            if let Some(decision) = pending.remove(id) { *self.waiting.lock().unwrap()=None; return Some(decision); }
             if self.closed.load(Ordering::Relaxed) || self.cancelled() { *self.waiting.lock().unwrap()=None; return None; }
             pending = self.wake.wait_timeout(pending, Duration::from_millis(100)).expect("approval wait").0;
         }

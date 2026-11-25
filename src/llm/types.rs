@@ -176,6 +176,10 @@ pub fn parse_reply(body: &Value) -> Result<Reply, String> {
 pub trait Llm: Sync {
     fn roles(&self) -> &Roles;
     fn calls(&self) -> u64;
+    fn effort(&self) -> Option<String> {
+        None
+    }
+    fn set_effort(&self, _effort: Option<&str>) {}
     fn complete(
         &self,
         model: &str,

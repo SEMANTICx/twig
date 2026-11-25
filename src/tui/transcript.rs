@@ -1,7 +1,7 @@
 //! Deep transcript module owning conversation cells, history replay, smooth scrolling,
 //! tool tree rendering, inline `Ctrl+F` search, and `Alt+Y` / `Alt+Shift+Y` clipboard extraction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -263,6 +263,29 @@ impl Transcript {
                     if let Some(content) = msg["content"].as_str() {
                         if !content.trim().is_empty() {
                             self.cells.push(Cell::User(content.to_owned()));
+                        }
+                    } else if let Some(parts) = msg["content"].as_array() {
+                        let mut text_parts = Vec::new();
+                        let mut img_count = 0usize;
+                        for part in parts {
+                            match part["type"].as_str() {
+                                Some("text") => {
+                                    if let Some(t) = part["text"].as_str() {
+                                        if !t.trim().is_empty() {
+                                            text_parts.push(t.to_owned());
+                                        }
+                                    }
+                                }
+                                Some("image_url") => img_count += 1,
+                                _ => {}
+                            }
+                        }
+                        if img_count > 0 {
+                            text_parts.push(format!("[Image ×{img_count}]"));
+                        }
+                        let joined = text_parts.join(" ");
+                        if !joined.trim().is_empty() {
+                            self.cells.push(Cell::User(joined));
                         }
                     }
                 }
@@ -811,8 +834,133 @@ impl Transcript {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    id: String,
+    name: String,
+    args: Value,
+    recovered: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApprovalKeyResult {
+    Ignored,
+    Consumed,
+    Resolve {
+        id: String,
+        allow: bool,
+        remember: bool,
+    },
+}
+
+/// Self-contained pending approval queue with borderless 3-option warm-amber selector.
+#[derive(Default)]
+pub struct ApprovalQueue {
+    items: VecDeque<PendingApproval>,
+    sel: usize,
+}
+
+impl ApprovalQueue {
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.sel = 0;
+    }
+
+    pub fn push_from_value(&mut self, v: &Value) -> Option<(String, String)> {
+        let id = v["id"].as_str().unwrap_or("").to_owned();
+        if id.is_empty() || self.items.iter().any(|a| a.id == id) {
+            return None;
+        }
+        let name = v["name"].as_str().unwrap_or("bash").to_owned();
+        let summary = summarize_tool_args(&name, &v["args"]);
+        self.items.push_back(PendingApproval {
+            id,
+            name: name.clone(),
+            args: v["args"].clone(),
+            recovered: v["recovered"] == true,
+        });
+        self.sel = 0;
+        Some((name, summary))
+    }
+
+    pub fn resolve_id(&mut self, id: &str) {
+        self.items.retain(|a| a.id != id);
+        self.sel = 0;
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> ApprovalKeyResult {
+        let Some(pending) = self.items.front() else {
+            return ApprovalKeyResult::Ignored;
+        };
+        let id = pending.id.clone();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sel = self.sel.saturating_sub(1);
+                ApprovalKeyResult::Consumed
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.sel = (self.sel + 1).min(2);
+                ApprovalKeyResult::Consumed
+            }
+            KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                ApprovalKeyResult::Resolve {
+                    id,
+                    allow: true,
+                    remember: false,
+                }
+            }
+            KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
+                ApprovalKeyResult::Resolve {
+                    id,
+                    allow: true,
+                    remember: true,
+                }
+            }
+            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                ApprovalKeyResult::Resolve {
+                    id,
+                    allow: false,
+                    remember: false,
+                }
+            }
+            KeyCode::Enter => {
+                let (allow, remember) = match self.sel {
+                    0 => (true, false),
+                    1 => (true, true),
+                    _ => (false, false),
+                };
+                ApprovalKeyResult::Resolve {
+                    id,
+                    allow,
+                    remember,
+                }
+            }
+            _ => ApprovalKeyResult::Ignored,
+        }
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let Some(pending) = self.items.front() else {
+            return;
+        };
+        render_approval_panel(
+            frame,
+            area,
+            &pending.id,
+            &pending.name,
+            &pending.args,
+            pending.recovered,
+            self.sel,
+        );
+    }
+}
+
 /// Borderless warm-amber hairline approval selector rendered above the footer.
-pub fn render_approval_panel(
+fn render_approval_panel(
     frame: &mut Frame,
     area: Rect,
     id: &str,
@@ -877,20 +1025,104 @@ pub fn render_approval_panel(
         ]),
         Line::from(""),
         opt(0, "1. Yes, allow once (y / Enter)"),
-        opt(1, "2. No, deny and tell agent (n / Esc)"),
+        opt(1, "2. Always allow this pattern for this session (a)"),
+        opt(2, "3. No, deny and tell agent (n / Esc)"),
         Line::from(Span::styled(rule, Style::default().fg(AMBER))),
     ];
     frame.render_widget(Paragraph::new(rows), area);
 }
+
+#[derive(Debug, Clone)]
+pub struct TodoEntry {
+    content: String,
+    status: String,
+}
+
+pub fn parse_todos(items: &[Value]) -> Vec<TodoEntry> {
+    items
+        .iter()
+        .filter_map(|v| {
+            let content = v["content"].as_str()?.trim();
+            (!content.is_empty()).then(|| TodoEntry {
+                content: content.to_owned(),
+                status: v["status"].as_str().unwrap_or("pending").to_owned(),
+            })
+        })
+        .collect()
+}
+
+pub fn todo_strip_height(todos: &[TodoEntry]) -> u16 {
+    if todos.is_empty() {
+        return 0;
+    }
+    (todos.len().min(3) as u16) + 1
+}
+
+/// Compact borderless task progress strip rendered above the composer when `todo` items exist.
+pub fn render_todo_strip(frame: &mut Frame, area: Rect, todos: &[TodoEntry]) {
+    if todos.is_empty() || area.height == 0 || area.width < 16 {
+        return;
+    }
+    let done = todos.iter().filter(|t| t.status == "completed").count();
+    let mut rows = vec![Line::from(vec![
+        Span::styled(
+            "  ☑ ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("Plan progress  {done}/{}", todos.len()),
+            Style::default().fg(STONE).add_modifier(Modifier::BOLD),
+        ),
+    ])];
+    let inner = area.width.saturating_sub(8) as usize;
+    let max_items = area.height.saturating_sub(1) as usize;
+    let focus = todos
+        .iter()
+        .position(|t| t.status == "in_progress")
+        .or_else(|| todos.iter().position(|t| t.status != "completed"))
+        .unwrap_or(0);
+    let start = focus.saturating_sub(1).min(todos.len().saturating_sub(max_items));
+    for item in todos.iter().skip(start).take(max_items) {
+        let (glyph, color) = match item.status.as_str() {
+            "completed" => ("✓", SAGE),
+            "in_progress" => ("●", ACCENT),
+            _ => ("○", MUTED),
+        };
+        rows.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(
+                clip_str(&item.content, inner),
+                Style::default().fg(if item.status == "in_progress" {
+                    IVORY
+                } else if item.status == "completed" {
+                    MUTED
+                } else {
+                    STONE
+                }),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+const EFFORT_LEVELS: &[(&str, &str)] = &[
+    ("off", "model default reasoning"),
+    ("low", "fast & concise reasoning"),
+    ("medium", "balanced depth and latency"),
+    ("high", "deep reasoning for complex tasks"),
+    ("xhigh", "maximum reasoning depth"),
+];
 
 pub enum PickerOutcome {
     None,
     Close,
     SelectSession(String),
     SelectModel(String),
+    SelectEffort(String),
 }
 
-/// Borderless Codex-style interactive overlay picker shared by `/resume` and `/model`.
+/// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, and `/effort`.
 pub enum OverlayPicker {
     Resume {
         sessions: Vec<super::client::SessionSummary>,
@@ -900,6 +1132,10 @@ pub enum OverlayPicker {
         all: Vec<String>,
         filter: String,
         active: String,
+        sel: usize,
+    },
+    Effort {
+        active: Option<String>,
         sel: usize,
     },
 }
@@ -919,10 +1155,20 @@ impl OverlayPicker {
         }
     }
 
+    pub fn effort(active: Option<String>) -> Self {
+        let target = active.as_deref().unwrap_or("off");
+        let sel = EFFORT_LEVELS
+            .iter()
+            .position(|(k, _)| *k == target)
+            .unwrap_or(0);
+        Self::Effort { active, sel }
+    }
+
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Resume { .. } => "↑/↓ select · Enter open · Esc close  ",
             Self::Model { .. } => "type to filter · ↑/↓ select · Enter apply · Esc close  ",
+            Self::Effort { .. } => "↑/↓ select · Enter apply · Esc close  ",
         }
     }
 
@@ -930,6 +1176,7 @@ impl OverlayPicker {
         let count = match self {
             Self::Resume { sessions, .. } => sessions.len(),
             Self::Model { all, filter, .. } => filtered_models(all, filter).len(),
+            Self::Effort { .. } => EFFORT_LEVELS.len(),
         };
         (count.clamp(1, 8) as u16) + 3
     }
@@ -950,6 +1197,19 @@ impl OverlayPicker {
                     .get(*sel)
                     .map(|s| PickerOutcome::SelectSession(s.sid.clone()))
                     .unwrap_or(PickerOutcome::Close),
+                _ => PickerOutcome::None,
+            },
+            Self::Effort { sel, .. } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => PickerOutcome::Close,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *sel = sel.saturating_sub(1);
+                    PickerOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(EFFORT_LEVELS.len() - 1);
+                    PickerOutcome::None
+                }
+                KeyCode::Enter => PickerOutcome::SelectEffort(EFFORT_LEVELS[*sel].0.to_owned()),
                 _ => PickerOutcome::None,
             },
             Self::Model {
@@ -995,8 +1255,78 @@ impl OverlayPicker {
                 active,
                 sel,
             } => render_model_picker(frame, area, all, filter, active, *sel),
+            Self::Effort { active, sel } => {
+                render_effort_picker(frame, area, active.as_deref(), *sel);
+            }
         }
     }
+}
+
+fn render_effort_picker(frame: &mut Frame, area: Rect, active: Option<&str>, sel: usize) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+    let current = active.unwrap_or("off");
+
+    let mut rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
+        Line::from(Span::styled(
+            "  Reasoning effort  (↑/↓ select · Enter apply · Esc cancel)",
+            Style::default()
+                .fg(ACCENT_PEAK)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for (idx, (level, desc)) in EFFORT_LEVELS.iter().enumerate() {
+        let is_sel = idx == sel;
+        let bg = if is_sel { ACCENT } else { Color::Reset };
+        let marker = if is_sel { " › " } else { "   " };
+        let col = format!("{level:<8}");
+        let badge = if *level == current { "  (active)" } else { "" };
+        let used = display_width(marker) + display_width(&col) + display_width(badge);
+        let d = clip_str(desc, row_w.saturating_sub(used + 2));
+        let pad = row_w.saturating_sub(used + display_width(&d));
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { ACCENT })
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                col,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { IVORY })
+                    .bg(bg)
+                    .add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(
+                d,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { STONE })
+                    .bg(bg),
+            ),
+            Span::styled(
+                badge,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { SAGE })
+                    .bg(bg),
+            ),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]));
+    }
+    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 fn filtered_models<'a>(all: &'a [String], filter: &str) -> Vec<&'a str> {
@@ -1179,6 +1509,15 @@ pub fn title_tool_name(name: &str) -> String {
 }
 
 pub fn summarize_tool_args(name: &str, args: &Value) -> String {
+    if name == "todo" {
+        let n = args["items"].as_array().map_or(0, Vec::len);
+        return format!("{n} items");
+    }
+    if name == "mcp" {
+        let srv = args["server"].as_str().unwrap_or("");
+        let tool = args["tool"].as_str().unwrap_or("list");
+        return clip_str(&format!("{srv}/{tool}"), 92);
+    }
     let raw = match name {
         "bash" => args["command"].as_str().unwrap_or(""),
         "read" | "edit" | "write" => args["path"].as_str().unwrap_or(""),

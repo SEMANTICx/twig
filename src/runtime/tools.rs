@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use super::guidance::SkillIndex;
+use super::mcp::McpRegistry;
 use super::subagent::{Role, SubagentConfig, SubagentPool};
 use crate::config::{paths, HarnessConfig};
 use crate::control::Control;
@@ -51,6 +52,7 @@ pub struct Tools {
     isolation: bool,
     network: bool,
     skills: Option<SkillIndex>,
+    mcp: Option<McpRegistry>,
     agent_pool: Option<SubagentPool>,
     agent_concurrency: usize,
     undo_stack: Vec<FileSnapshot>,
@@ -64,6 +66,7 @@ impl Tools {
     pub fn with_config(worktree: impl Into<PathBuf>, cfg: &HarnessConfig) -> Self {
         let worktree: PathBuf = worktree.into();
         let skills = SkillIndex::discover_default(&worktree);
+        let mcp = McpRegistry::discover(&worktree);
         Self {
             worktree,
             read_only_mask: 0,
@@ -77,6 +80,7 @@ impl Tools {
             isolation: cfg.isolation,
             network: cfg.network,
             skills,
+            mcp,
             agent_pool: None,
             agent_concurrency: cfg.subagent_concurrency,
             undo_stack: Vec::new(),
@@ -116,6 +120,12 @@ impl Tools {
                 "\nAvailable project skills (load body via skill tool only when relevant): {metadata}"
             ));
         }
+        if let Some(mcp) = &self.mcp {
+            out.push_str(&format!(
+                "\nConfigured MCP servers (use mcp tool to list or invoke tools): {}",
+                mcp.server_names_summary()
+            ));
+        }
         if (self.read_only_mask & PLAN_RO) != 0 {
             out.push_str(
                 "\nPlan mode is active (read-only). Explore the codebase, analyze requirements, and propose a concrete step-by-step plan. Do not modify files or run mutating commands.",
@@ -125,14 +135,14 @@ impl Tools {
     }
 
     pub fn schema(&self) -> Value {
-        json!([
-            {"type": "function", "function": {
+        let mut list = vec![
+            json!({"type": "function", "function": {
                 "name": "bash",
                 "description": self.bash_description,
                 "parameters": {"type": "object",
                                "properties": {"command": {"type": "string"}},
-                               "required": ["command"]}}},
-            {"type": "function", "function": {
+                               "required": ["command"]}}}),
+            json!({"type": "function", "function": {
                 "name": "read",
                 "description": format!("{} Returns at most {} lines. Optional 1-based start_line and limit paginate large files.",
                                        self.read_description, self.read_max_lines),
@@ -142,8 +152,8 @@ impl Tools {
                                    "start_line": {"type": "integer"},
                                    "limit": {"type": "integer"}
                                },
-                               "required": ["path"]}}},
-            {"type": "function", "function": {
+                               "required": ["path"]}}}),
+            json!({"type": "function", "function": {
                 "name": "edit",
                 "description": "Replace an exact substring inside an existing file in the worktree. Fails unless old_string matches uniquely (or replace_all is true). Returns a unified diff.",
                 "parameters": {"type": "object",
@@ -153,8 +163,8 @@ impl Tools {
                                    "new_string": {"type": "string"},
                                    "replace_all": {"type": "boolean"}
                                },
-                               "required": ["path", "old_string", "new_string"]}}},
-            {"type": "function", "function": {
+                               "required": ["path", "old_string", "new_string"]}}}),
+            json!({"type": "function", "function": {
                 "name": "write",
                 "description": "Create or overwrite a file inside the worktree. Prefer edit for surgical changes to existing files.",
                 "parameters": {"type": "object",
@@ -162,8 +172,8 @@ impl Tools {
                                    "path": {"type": "string"},
                                    "content": {"type": "string"}
                                },
-                               "required": ["path", "content"]}}},
-            {"type": "function", "function": {
+                               "required": ["path", "content"]}}}),
+            json!({"type": "function", "function": {
                 "name": "grep",
                 "description": "Search text across files in the worktree (skips .git, target, node_modules). Returns path:line: text matches.",
                 "parameters": {"type": "object",
@@ -173,8 +183,8 @@ impl Tools {
                                    "glob": {"type": "string"},
                                    "ignore_case": {"type": "boolean"}
                                },
-                               "required": ["pattern"]}}},
-            {"type": "function", "function": {
+                               "required": ["pattern"]}}}),
+            json!({"type": "function", "function": {
                 "name": "glob",
                 "description": "Find files matching a glob pattern (*, **, ?) inside the worktree.",
                 "parameters": {"type": "object",
@@ -182,8 +192,26 @@ impl Tools {
                                    "pattern": {"type": "string"},
                                    "path": {"type": "string"}
                                },
-                               "required": ["pattern"]}}},
-            {"type": "function", "function": {
+                               "required": ["pattern"]}}}),
+            json!({"type": "function", "function": {
+                "name": "todo",
+                "description": "Update the live multi-step task progress checklist shown to the user.",
+                "parameters": {"type": "object",
+                               "properties": {
+                                   "items": {
+                                       "type": "array",
+                                       "items": {
+                                           "type": "object",
+                                           "properties": {
+                                               "content": {"type": "string"},
+                                               "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                                           },
+                                           "required": ["content", "status"]
+                                       }
+                                   }
+                               },
+                               "required": ["items"]}}}),
+            json!({"type": "function", "function": {
                 "name": "papercut",
                 "description": "Report a concrete tool, skill or harness defect you encountered. Give what you tried, expected, observed, and a recovery or proposed fix. Report once per issue, then continue working.",
                 "parameters": {"type":"object", "additionalProperties": false,
@@ -191,12 +219,38 @@ impl Tools {
                         "component":{"type":"string"}, "attempted":{"type":"string"},
                         "expected":{"type":"string"}, "actual":{"type":"string"},
                         "recovery":{"type":"string"}},
-                    "required":["component","attempted","expected","actual","recovery"]}}},
-            {"type":"function","function":{"name":"skill","description":"List project skill metadata, or load one named skill only when needed.",
-                "parameters":{"type":"object","properties":{"name":{"type":"string"}}}}},
-            {"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in a fresh isolated Git worktree; reviewer/scout are OS read-only. Returned worktree changes are not automatically applied.",
-                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","reviewer"]},"task":{"type":"string"}},"required":["role","task"]}}}
-        ])
+                    "required":["component","attempted","expected","actual","recovery"]}}}),
+            json!({"type":"function","function":{"name":"skill","description":"List project/global skill metadata, or load one named skill only when needed.",
+                "parameters":{"type":"object","properties":{"name":{"type":"string"}}}}}),
+            json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in a fresh isolated Git worktree; reviewer/scout are OS read-only. Returned worktree changes are not automatically applied.",
+                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","reviewer"]},"task":{"type":"string"}},"required":["role","task"]}}}),
+        ];
+        if self.mcp.is_some() {
+            list.push(json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp",
+                    "description": "List tools on a configured MCP server (omit tool) or invoke a tool on that MCP server.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "server": {"type": "string"},
+                            "tool": {"type": "string"},
+                            "arguments": {"type": "object"}
+                        },
+                        "required": ["server"]
+                    }
+                }
+            }));
+        }
+        Value::Array(list)
+    }
+
+    pub fn list_mcp(&mut self) -> Value {
+        match &mut self.mcp {
+            Some(reg) => reg.list_report(),
+            None => json!({"servers": []}),
+        }
     }
 
     /// Clip at the tool boundary: head and tail survive, the middle is elided.
@@ -319,7 +373,23 @@ impl Tools {
                 },
                 None => "No project skills found under .twig/skills".into(),
             },
-            "subagent" => self.delegate(&call.args),
+            "todo" => self.update_todo(&call.args, emit),
+            "mcp" => match &mut self.mcp {
+                Some(reg) => {
+                    let server = call.args["server"].as_str().unwrap_or("");
+                    let tool = call.args["tool"].as_str().unwrap_or("");
+                    let args = call.args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    match reg.call(server, tool, args) {
+                        Ok(out) => {
+                            self.last_exit_code = Some(0);
+                            out
+                        }
+                        Err(e) => format!("mcp error: {e}"),
+                    }
+                }
+                None => "no MCP servers configured in .twig/mcp.json or ~/.config/twig/mcp.json".into(),
+            },
+            "subagent" => self.delegate(&call.args, emit),
             other => format!("no such tool {other:?}"),
         }
     }
@@ -373,11 +443,38 @@ impl Tools {
         }
     }
 
-    fn delegate(&mut self, args: &Value) -> String {
+    fn update_todo(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
+        let Some(items) = args.get("items").and_then(Value::as_array) else {
+            return "invalid todo: expected items array".into();
+        };
+        let mut normalized = Vec::new();
+        let mut completed = 0usize;
+        for item in items.iter().take(32) {
+            let content = item["content"].as_str().unwrap_or("").trim();
+            if content.is_empty() {
+                continue;
+            }
+            let status = match item["status"].as_str().unwrap_or("pending") {
+                "completed" => {
+                    completed += 1;
+                    "completed"
+                }
+                "in_progress" => "in_progress",
+                _ => "pending",
+            };
+            normalized.push(json!({"content": content, "status": status}));
+        }
+        emit(json!({"ev": "todo.updated", "items": normalized}));
+        self.last_exit_code = Some(0);
+        format!("todo updated ({completed}/{} completed)", normalized.len())
+    }
+
+    fn delegate(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
         if std::env::var_os("TWIG_SUBAGENT").is_some() {
             return "subagent recursion is disabled; return a result to the parent".into();
         }
-        let role = match args["role"].as_str().unwrap_or("code") {
+        let role_name = args["role"].as_str().unwrap_or("code");
+        let role = match role_name {
             "code" => Role::Code,
             "test" => Role::Test,
             "scout" => Role::Scout,
@@ -407,14 +504,31 @@ impl Tools {
                 Err(e) => return format!("subagent setup: {e}"),
             }
         }
-        match self
-            .agent_pool
-            .as_ref()
-            .unwrap()
-            .run(role, args["task"].as_str().unwrap_or(""))
-        {
-            Ok(r) => serde_json::to_string(&r).unwrap_or_default(),
-            Err(e) => format!("subagent error: {e}"),
+        let task = args["task"].as_str().unwrap_or("");
+        let started = std::time::Instant::now();
+        emit(json!({"ev": "subagent.started", "role": role_name, "task": task}));
+        let res = self.agent_pool.as_ref().unwrap().run(role, task);
+        let elapsed_secs = started.elapsed().as_secs();
+        match res {
+            Ok(r) => {
+                emit(json!({
+                    "ev": "subagent.completed",
+                    "role": role_name,
+                    "ok": true,
+                    "elapsed_secs": elapsed_secs
+                }));
+                self.last_exit_code = Some(0);
+                serde_json::to_string(&r).unwrap_or_default()
+            }
+            Err(e) => {
+                emit(json!({
+                    "ev": "subagent.completed",
+                    "role": role_name,
+                    "ok": false,
+                    "elapsed_secs": elapsed_secs
+                }));
+                format!("subagent error: {e}")
+            }
         }
     }
 

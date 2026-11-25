@@ -8,7 +8,7 @@
 //! (including without whitespace, e.g. `cat a;python3 b.py`), and treats
 //! command/process substitution (`$(...)`, backticks, `<(...)`) as non-auto.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -310,6 +310,7 @@ pub fn shape(cmd: &str) -> String {
 
 pub struct Policy {
     cache: Mutex<HashMap<String, Tier>>,
+    session_allows: Mutex<HashSet<String>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -324,17 +325,40 @@ impl Policy {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            session_allows: Mutex::new(HashSet::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
+    /// Remember a user-approved command shape for the remainder of this session.
+    /// Moves future matching commands from `Deny` to `Audit` (still recorded, no repeat prompt).
+    pub fn allow_for_session(&self, cmd: &str) -> String {
+        let sh = shape(cmd);
+        let key = if sh.is_empty() || sh == "<unsafe>" {
+            cmd.trim().to_owned()
+        } else {
+            sh
+        };
+        if !key.is_empty() {
+            self.session_allows
+                .lock()
+                .expect("policy session allows")
+                .insert(key.clone());
+        }
+        key
+    }
+
     /// Deny rules read the real command; allow rules read the folded shape.
     pub fn classify(&self, cmd: &str) -> Tier {
+        let sh = shape(cmd);
         if HARD_DENY.iter().any(|d| cmd.contains(d)) {
+            let allows = self.session_allows.lock().expect("policy session allows");
+            if allows.contains(&sh) || allows.contains(cmd.trim()) {
+                return Tier::Audit;
+            }
             return Tier::Deny;
         }
-        let sh = shape(cmd);
         if let Some(tier) = self.cache.lock().expect("policy cache").get(&sh) {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return *tier;

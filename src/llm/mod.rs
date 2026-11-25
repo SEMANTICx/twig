@@ -9,6 +9,7 @@ pub mod types;
 pub use types::{parse_reply, summarize_usage, Llm, Reply, Roles, ToolCall, Usage};
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -27,8 +28,19 @@ pub struct Provider {
     base: String,
     key: String,
     roles: Roles,
+    effort: Mutex<Option<String>>,
     calls: AtomicU64,
     timeout: Duration,
+}
+
+pub fn normalize_effort(raw: &str) -> Result<Option<String>, String> {
+    match raw.trim().to_lowercase().as_str() {
+        "" | "off" | "none" | "default" | "reset" => Ok(None),
+        level @ ("low" | "medium" | "high" | "xhigh") => Ok(Some(level.to_owned())),
+        other => Err(format!(
+            "invalid effort {other:?}; expected off, low, medium, high, or xhigh"
+        )),
+    }
 }
 
 impl Provider {
@@ -43,12 +55,40 @@ impl Provider {
                 }
             }
         }
+        let effort = std::env::var("TWIG_EFFORT")
+            .ok()
+            .and_then(|v| normalize_effort(&v).ok().flatten())
+            .or_else(Self::saved_effort);
         Self {
             base: base.trim_end_matches('/').to_string(),
             key,
             roles,
+            effort: Mutex::new(effort),
             calls: AtomicU64::new(0),
             timeout: Duration::from_secs(600),
+        }
+    }
+
+    pub fn saved_effort() -> Option<String> {
+        let text = std::fs::read_to_string(paths::state_dir().join("effort.txt")).ok()?;
+        normalize_effort(&text).ok().flatten()
+    }
+
+    pub fn save_effort(effort: Option<&str>) -> Result<(), String> {
+        let path = paths::state_dir().join("effort.txt");
+        match effort.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(level) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&path, format!("{level}\n")).map_err(|e| e.to_string())
+            }
+            None => {
+                if path.exists() {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -130,6 +170,16 @@ impl Llm for Provider {
         self.calls.load(Ordering::Relaxed)
     }
 
+    fn effort(&self) -> Option<String> {
+        self.effort.lock().ok().and_then(|e| e.clone())
+    }
+
+    fn set_effort(&self, effort: Option<&str>) {
+        if let Ok(mut guard) = self.effort.lock() {
+            *guard = effort.map(str::to_owned);
+        }
+    }
+
     fn complete(
         &self,
         model: &str,
@@ -145,6 +195,9 @@ impl Llm for Provider {
             "messages": msgs,
             "temperature": 0.0,
         });
+        if let Some(level) = self.effort() {
+            payload["reasoning_effort"] = json!(level);
+        }
         if let Some(tools) = tools {
             payload["tools"] = tools.clone();
             payload["tool_choice"] = json!("auto");
@@ -203,6 +256,9 @@ impl Llm for Provider {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
+        if let Some(level) = self.effort() {
+            payload["reasoning_effort"] = json!(level);
+        }
         if let Some(t) = tools {
             payload["tools"] = t.clone();
         }

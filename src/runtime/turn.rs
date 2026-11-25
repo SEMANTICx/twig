@@ -86,6 +86,13 @@ pub fn execute_recorded_call(
             .map_err(|e| e.to_string())?;
         emit(json!({"ev": "papercut.filed", "report": call.args}));
     }
+    if call.name == "todo" && output.starts_with("todo updated") {
+        if let Some(items) = call.args.get("items") {
+            record
+                .append("todo.updated", json!({"items": items}))
+                .map_err(|e| e.to_string())?;
+        }
+    }
     emit(json!({"ev": "tool.completed", "id": call.id, "bytes": output.len(), "exit_code": exit_code}));
     if tier == Tier::Audit {
         audit_sink(call, &output);
@@ -277,12 +284,12 @@ pub fn run_turn_live(
                     json!({"messages": messages, "pending_call": {"id": call.id, "name": call.name, "args": call.args}}),
                 )
                 .map_err(|e| e.to_string())?;
-            let approved = if interactive {
-                control.approval(&call.id)
+            let decision = if interactive {
+                control.approval_decision(&call.id)
             } else {
                 None
             };
-            if approved.is_none() {
+            let Some((allow, remember)) = decision else {
                 return Ok(TurnResult {
                     done: true,
                     reason: "awaiting_approval",
@@ -290,12 +297,26 @@ pub fn run_turn_live(
                     applied_steering,
                     deferred_calls: iter.collect(),
                 });
+            };
+            if allow && remember && call.name == "bash" {
+                let cmd = call
+                    .args
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let pattern = policy.allow_for_session(cmd);
+                record
+                    .append("policy.allowed", json!({"pattern": pattern}))
+                    .map_err(|e| e.to_string())?;
+                emit(json!({"ev": "policy.allowed", "pattern": pattern}));
             }
-            let allow = approved == Some(true);
             record
-                .append("approval.resolved", json!({"id": call.id, "allow": allow}))
+                .append(
+                    "approval.resolved",
+                    json!({"id": call.id, "allow": allow, "remember": remember}),
+                )
                 .map_err(|e| e.to_string())?;
-            emit(json!({"ev": "approval.resolved", "id": call.id, "allow": allow}));
+            emit(json!({"ev": "approval.resolved", "id": call.id, "allow": allow, "remember": remember}));
             if !allow {
                 record
                     .append(

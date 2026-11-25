@@ -12,7 +12,6 @@ mod composer;
 mod markdown;
 mod transcript;
 
-use std::collections::VecDeque;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -34,21 +33,23 @@ use serde_json::{json, Value};
 use self::client::{
     archive_session_file, chat_plain, copy_to_clipboard, detect_git_branch,
     edit_file_in_external_editor, edit_in_external_editor, ensure_memory_file,
-    fetch_magpie_models, format_verify_report, init_project_files, list_sessions, notify_osc99,
-    run_doctor, run_git_diff, run_independent_review, run_local_shell, shorten_home,
-    write_export_file, ServeClient, ServerMsg, TerminalGuard,
+    extract_inline_images, fetch_magpie_models, format_config_report, format_init_report,
+    format_mcp_report, format_verify_report, init_project_files, list_sessions,
+    load_image_data_url, notify_osc99, paste_clipboard_image, read_memory_preview, run_doctor,
+    run_git_diff, run_independent_review, run_local_shell, shorten_home, write_export_file,
+    ServeClient, ServerMsg, TerminalGuard,
 };
-use self::composer::{Composer, PopupAccept};
+use self::composer::{parse_slash, Composer, SlashCommand};
 use self::markdown::{
-    active_rule_color, breathing_star, fmt_elapsed_compact, fmt_tokens_compact, render_footer,
+    active_rule_color, breathing_star, fmt_elapsed_compact, format_status_notice, render_footer,
     shimmer_is_sweeping, summary_shimmer, FooterMode, FooterView, MotionMode, ACCENT, AMBER,
     HAIRLINE, HAIRLINE_FOCUS, MUTED,
 };
 use self::transcript::{
-    render_approval_panel, summarize_tool_args, title_tool_name, NoticeKind, OverlayPicker,
-    PickerOutcome, RenderOpts, Transcript,
+    parse_todos, render_todo_strip, summarize_tool_args, title_tool_name, todo_strip_height,
+    ApprovalKeyResult, ApprovalQueue, NoticeKind, OverlayPicker, PickerOutcome, RenderOpts,
+    TodoEntry, Transcript,
 };
-use crate::config::HarnessConfig;
 use crate::llm::Provider;
 
 const ACTIVITY_VERBS: &[&str] = &[
@@ -66,14 +67,6 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
         return chat_plain(repo, resume);
     }
     run_tui(repo, resume)
-}
-
-#[derive(Debug, Clone)]
-struct PendingApproval {
-    id: String,
-    name: String,
-    args: Value,
-    recovered: bool,
 }
 
 enum LocalMsg {
@@ -94,27 +87,20 @@ enum Action {
     SendTurn(String),
     SendSteer(String),
     Cancel,
-    ResolveApproval { id: String, allow: bool },
+    ResolveApproval {
+        id: String,
+        allow: bool,
+        remember: bool,
+    },
     SetPlan(bool),
-    NewSession,
+    SetEffort(String),
     SwitchSession(String),
-    RenameSession(String),
-    ArchiveSession,
-    OpenModelPicker,
     SetModel(String),
-    UndoEdit,
-    CompactNow,
-    VerifySession,
-    EditMemory,
-    InitProject,
-    RunDoctor,
-    ExportTranscript(Option<String>),
     RunLocalShell(String),
-    RunDiff,
-    RunReview,
     ToggleMouse,
     OpenEditor,
     CopyCode(String),
+    Slash(SlashCommand),
     Quit,
 }
 
@@ -126,6 +112,7 @@ struct App {
     sid: String,
     title: Option<String>,
     model: String,
+    effort: Option<String>,
     plan_mode: bool,
     playbook: Option<String>,
     guard_level: Option<String>,
@@ -146,9 +133,13 @@ struct App {
     history_req: Option<u64>,
     verify_req: Option<u64>,
     undo_req: Option<u64>,
+    fork_req: Option<u64>,
+    rewind_req: Option<u64>,
+    mcp_req: Option<u64>,
+    todos: Vec<TodoEntry>,
+    pending_images: Vec<(String, String)>,
     transcript: Transcript,
-    approvals: VecDeque<PendingApproval>,
-    approval_sel: usize,
+    approvals: ApprovalQueue,
     overlay_picker: Option<OverlayPicker>,
     composer: Composer,
     mouse_enabled: bool,
@@ -184,6 +175,7 @@ impl App {
                 .ok()
                 .or_else(Provider::saved_model)
                 .unwrap_or_else(|| "magpie".into()),
+            effort: Provider::saved_effort(),
             plan_mode: false,
             playbook: None,
             guard_level: None,
@@ -204,9 +196,13 @@ impl App {
             history_req: None,
             verify_req: None,
             undo_req: None,
+            fork_req: None,
+            rewind_req: None,
+            mcp_req: None,
+            todos: Vec::new(),
+            pending_images: Vec::new(),
             transcript: Transcript::new(),
-            approvals: VecDeque::new(),
-            approval_sel: 0,
+            approvals: ApprovalQueue::default(),
             overlay_picker: None,
             composer: Composer::new(repo),
             mouse_enabled: true,
@@ -238,9 +234,13 @@ impl App {
         self.active_turn_req = None;
         self.verify_req = None;
         self.undo_req = None;
+        self.fork_req = None;
+        self.rewind_req = None;
+        self.mcp_req = None;
+        self.todos.clear();
+        self.pending_images.clear();
         self.transcript.clear();
         self.approvals.clear();
-        self.approval_sel = 0;
         self.overlay_picker = None;
     }
 
@@ -313,11 +313,17 @@ impl App {
                 if let Some(model) = result.get("model").and_then(Value::as_str) {
                     self.model = model.to_owned();
                 }
+                if let Some(val) = result.get("effort") {
+                    self.effort = val.as_str().map(str::to_owned);
+                }
                 if let Some(title) = result.get("title").and_then(Value::as_str) {
                     self.title = Some(title.to_owned());
                 }
                 if let Some(plan) = result.get("plan").and_then(Value::as_bool) {
                     self.plan_mode = plan;
+                }
+                if let Some(items) = result.get("todos").and_then(Value::as_array) {
+                    self.todos = parse_todos(items);
                 }
                 if let Some(cb) = result.get("context_bytes").and_then(Value::as_u64) {
                     self.context_bytes = cb as usize;
@@ -363,6 +369,31 @@ impl App {
                             .push_notice(NoticeKind::Success, format!("undo: {summary}"));
                     }
                 }
+                if self.rewind_req == Some(id) {
+                    self.rewind_req = None;
+                    let n = result["rewound_turns"].as_u64().unwrap_or(1);
+                    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+                        self.transcript.clear();
+                        self.transcript.replay_history(messages);
+                    }
+                    self.approvals.clear();
+                    self.flash(format!("Rewound {n} turn(s)"));
+                    self.transcript.push_notice(
+                        NoticeKind::Success,
+                        format!("rewound conversation by {n} turn(s)"),
+                    );
+                }
+                if self.mcp_req == Some(id) {
+                    self.mcp_req = None;
+                    let report = format_mcp_report(&result);
+                    if report.starts_with("no MCP") {
+                        self.transcript.push_notice(NoticeKind::Info, report);
+                    } else {
+                        self.transcript
+                            .push_notice(NoticeKind::Playbook, "configured MCP servers");
+                        self.transcript.push_assistant(report);
+                    }
+                }
                 if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
                     if !compacted {
                         self.transcript.push_notice(
@@ -373,16 +404,7 @@ impl App {
                 }
                 if let Some(pending) = result.get("pending").and_then(Value::as_array) {
                     for p in pending {
-                        let pid = p["id"].as_str().unwrap_or("").to_owned();
-                        if !pid.is_empty() && !self.approvals.iter().any(|a| a.id == pid) {
-                            self.approvals.push_back(PendingApproval {
-                                id: pid,
-                                name: p["name"].as_str().unwrap_or("bash").to_owned(),
-                                args: p["args"].clone(),
-                                recovered: p["recovered"] == true,
-                            });
-                            self.approval_sel = 0;
-                        }
+                        let _ = self.approvals.push_from_value(p);
                     }
                 }
                 if self.active_turn_req == Some(id) {
@@ -577,17 +599,7 @@ impl App {
                 );
             }
             Some("approval.requested") => {
-                let id = ev["id"].as_str().unwrap_or("").to_owned();
-                let name = ev["name"].as_str().unwrap_or("bash").to_owned();
-                let summary = summarize_tool_args(&name, &ev["args"]);
-                if !id.is_empty() && !self.approvals.iter().any(|a| a.id == id) {
-                    self.approvals.push_back(PendingApproval {
-                        id,
-                        name: name.clone(),
-                        args: ev["args"].clone(),
-                        recovered: ev["recovered"] == true,
-                    });
-                    self.approval_sel = 0;
+                if let Some((name, summary)) = self.approvals.push_from_value(ev) {
                     self.pending_notify = Some((
                         "twig · approval needed".into(),
                         format!("{name}: {summary}"),
@@ -597,8 +609,7 @@ impl App {
             Some("approval.resolved") => {
                 let id = ev["id"].as_str().unwrap_or("");
                 let allow = ev["allow"] == true;
-                self.approvals.retain(|a| a.id != id);
-                self.approval_sel = 0;
+                self.approvals.resolve_id(id);
                 self.transcript.push_notice(
                     if allow {
                         NoticeKind::Success
@@ -629,6 +640,41 @@ impl App {
                 if let Some(plan) = ev["plan"].as_bool() {
                     self.plan_mode = plan;
                 }
+            }
+            Some("todo.updated") => {
+                if let Some(items) = ev["items"].as_array() {
+                    self.todos = parse_todos(items);
+                }
+            }
+            Some("policy.allowed") => {
+                if let Some(pat) = ev["pattern"].as_str() {
+                    self.transcript.push_notice(
+                        NoticeKind::Success,
+                        format!("session rule added: always allow `{pat}`"),
+                    );
+                }
+            }
+            Some("subagent.started") => {
+                let role = ev["role"].as_str().unwrap_or("subagent");
+                let task = ev["task"].as_str().unwrap_or("");
+                self.update_status_header(format!("Subagent [{role}]"));
+                self.transcript.push_notice(
+                    NoticeKind::Playbook,
+                    format!("subagent[{role}] started · {}", task.chars().take(68).collect::<String>()),
+                );
+            }
+            Some("subagent.completed") => {
+                let role = ev["role"].as_str().unwrap_or("subagent");
+                let ok = ev["ok"] == true;
+                let secs = ev["elapsed_secs"].as_u64().unwrap_or(0);
+                self.transcript.push_notice(
+                    if ok { NoticeKind::Success } else { NoticeKind::Warn },
+                    format!(
+                        "subagent[{role}] {} ({})",
+                        if ok { "completed" } else { "failed" },
+                        fmt_elapsed_compact(secs)
+                    ),
+                );
             }
             Some("context.compacted") => {
                 let removed = ev["compaction"]["removed_messages"].as_u64().unwrap_or(0);
@@ -766,24 +812,8 @@ impl App {
                     self.transcript.clear();
                     return Action::None;
                 }
-                KeyCode::Char('a') => {
-                    self.composer.move_home();
-                    return Action::None;
-                }
-                KeyCode::Char('e') => {
-                    self.composer.move_end();
-                    return Action::None;
-                }
-                KeyCode::Char('u') => {
-                    self.composer.clear_to_start();
-                    return Action::None;
-                }
-                KeyCode::Char('w') => {
-                    self.composer.delete_word_back();
-                    return Action::None;
-                }
-                KeyCode::Char('j') => {
-                    self.composer.insert_char('\n');
+                KeyCode::Char('a' | 'e' | 'u' | 'w' | 'j') => {
+                    self.composer.handle_key(key);
                     return Action::None;
                 }
                 _ => {}
@@ -805,6 +835,10 @@ impl App {
                     self.overlay_picker = None;
                     Action::SetModel(model)
                 }
+                PickerOutcome::SelectEffort(level) => {
+                    self.overlay_picker = None;
+                    Action::SetEffort(level)
+                }
             };
         }
 
@@ -813,28 +847,19 @@ impl App {
             return Action::None;
         }
 
-        if let Some(pending) = self.approvals.front() {
-            let id = pending.id.clone();
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.approval_sel = self.approval_sel.saturating_sub(1);
-                    return Action::None;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.approval_sel = (self.approval_sel + 1).min(1);
-                    return Action::None;
-                }
-                KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    return Action::ResolveApproval { id, allow: true };
-                }
-                KeyCode::Char('2') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    return Action::ResolveApproval { id, allow: false };
-                }
-                KeyCode::Enter => {
-                    let allow = self.approval_sel == 0;
-                    return Action::ResolveApproval { id, allow };
-                }
-                _ => {}
+        match self.approvals.handle_key(key) {
+            ApprovalKeyResult::Ignored => {}
+            ApprovalKeyResult::Consumed => return Action::None,
+            ApprovalKeyResult::Resolve {
+                id,
+                allow,
+                remember,
+            } => {
+                return Action::ResolveApproval {
+                    id,
+                    allow,
+                    remember,
+                };
             }
         }
 
@@ -902,92 +927,22 @@ impl App {
             _ => {}
         }
 
-        if self.composer.has_popup() {
-            match key.code {
-                KeyCode::Up => {
-                    self.composer.popup_move(-1);
-                    return Action::None;
-                }
-                KeyCode::Down => {
-                    self.composer.popup_move(1);
-                    return Action::None;
-                }
-                KeyCode::Tab => {
-                    self.composer.accept_popup();
-                    return Action::None;
-                }
-                KeyCode::Enter if key.modifiers.is_empty() => {
-                    match self.composer.accept_popup_on_enter() {
-                        PopupAccept::Execute(cmd) => return self.dispatch_input(&cmd),
-                        PopupAccept::Filled => return Action::None,
-                        PopupAccept::None => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-
         match key.code {
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.composer.insert_char('\n');
-                Action::None
-            }
-            KeyCode::Enter => {
-                let raw = self.composer.take_submitted();
-                self.dispatch_input(&raw)
-            }
-            KeyCode::Tab => {
-                self.composer.accept_popup();
-                Action::None
-            }
-            KeyCode::Backspace => {
-                self.composer.backspace();
-                Action::None
-            }
-            KeyCode::Delete => {
-                self.composer.delete();
-                Action::None
-            }
-            KeyCode::Left => {
-                self.composer.move_left();
-                Action::None
-            }
-            KeyCode::Right => {
-                self.composer.move_right();
-                Action::None
-            }
-            KeyCode::Home => {
-                self.composer.move_home();
-                Action::None
-            }
-            KeyCode::End => {
-                self.composer.move_end();
-                Action::None
-            }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.transcript.scroll_by(-3);
-                Action::None
+                return Action::None;
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.transcript.scroll_by(3);
-                Action::None
+                return Action::None;
             }
-            KeyCode::Up => {
-                self.composer.history_up();
-                Action::None
-            }
-            KeyCode::Down => {
-                self.composer.history_down();
-                Action::None
-            }
-            KeyCode::Char(c) => {
-                self.composer.insert_char(c);
-                Action::None
-            }
-            _ => Action::None,
+            _ => {}
+        }
+
+        if let Some(submitted) = self.composer.handle_key(key) {
+            self.dispatch_input(&submitted)
+        } else {
+            Action::None
         }
     }
 
@@ -1014,47 +969,129 @@ impl App {
             return Action::None;
         }
 
-        match trimmed {
-            "/quit" | "/exit" => return Action::Quit,
-            "/plan" => return Action::SetPlan(!self.plan_mode),
-            "/plan on" => return Action::SetPlan(true),
-            "/plan off" => return Action::SetPlan(false),
-            "/new" => return Action::NewSession,
-            "/archive" => return Action::ArchiveSession,
-            "/cancel" => return Action::Cancel,
-            "/verify" => return Action::VerifySession,
-            "/memory" => return Action::EditMemory,
-            "/memory show" => {
-                let path = Path::new(&self.repo_raw).join(".twig/preferences.md");
-                match std::fs::read_to_string(&path) {
-                    Ok(body) if !body.trim().is_empty() => {
-                        self.transcript
-                            .push_notice(NoticeKind::Info, "project memory (.twig/preferences.md)");
-                        self.transcript.push_assistant(body);
-                    }
-                    Ok(_) => self
-                        .transcript
-                        .push_notice(NoticeKind::Info, ".twig/preferences.md is empty"),
-                    Err(_) => self.transcript.push_notice(
-                        NoticeKind::Info,
-                        "no .twig/preferences.md yet — run /memory or /init",
-                    ),
+        if let Some(cmd) = parse_slash(trimmed, self.plan_mode) {
+            return match cmd {
+                SlashCommand::Quit => Action::Quit,
+                SlashCommand::SetPlan(v) => Action::SetPlan(v),
+                SlashCommand::SetEffort(level) => Action::SetEffort(level),
+                SlashCommand::SetModel(m) => Action::SetModel(m),
+                SlashCommand::SwitchSession(sid) => Action::SwitchSession(sid),
+                SlashCommand::Cancel => Action::Cancel,
+                SlashCommand::OpenEditor => Action::OpenEditor,
+                SlashCommand::ToggleMouse => Action::ToggleMouse,
+                SlashCommand::Steer(text) => {
+                    self.transcript.push_steering(text.clone());
+                    Action::SendSteer(text)
                 }
-                return Action::None;
-            }
-            "/init" => return Action::InitProject,
-            "/doctor" => return Action::RunDoctor,
-            "/export" => return Action::ExportTranscript(None),
-            "/clear" => {
-                self.transcript.clear();
-                return Action::None;
-            }
-            "/expand" => {
-                self.transcript.toggle_expand();
-                return Action::None;
-            }
-            "/copy" => {
-                return match self.transcript.copy_latest_code_block() {
+                SlashCommand::ResolveApproval { id, allow } => Action::ResolveApproval {
+                    id,
+                    allow,
+                    remember: false,
+                },
+                SlashCommand::OpenEffortPicker => {
+                    self.overlay_picker = Some(OverlayPicker::effort(self.effort.clone()));
+                    Action::None
+                }
+                SlashCommand::OpenResume => {
+                    let sessions = list_sessions();
+                    if sessions.is_empty() {
+                        self.transcript
+                            .push_notice(NoticeKind::Info, "no saved sessions found");
+                    } else {
+                        self.overlay_picker = Some(OverlayPicker::resume(sessions));
+                    }
+                    Action::None
+                }
+                SlashCommand::AttachImage(opt_path) => {
+                    let loaded = match opt_path {
+                        Some(p) => load_image_data_url(&self.repo_raw, &p).map(Some),
+                        None => paste_clipboard_image(),
+                    };
+                    match loaded {
+                        Ok(Some((label, url))) => {
+                            self.pending_images.push((label.clone(), url));
+                            self.flash(format!("Attached image: {label}"));
+                            self.transcript.push_notice(
+                                NoticeKind::Success,
+                                format!("attached image `{label}` (will send with next message)"),
+                            );
+                        }
+                        Ok(None) => self.transcript.push_notice(
+                            NoticeKind::Info,
+                            "no image in clipboard — pass `/image path/to/file.png` or `@file.png`",
+                        ),
+                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                    }
+                    Action::None
+                }
+                SlashCommand::ClearImages => {
+                    self.pending_images.clear();
+                    self.flash("Cleared pending images");
+                    Action::None
+                }
+                SlashCommand::ShowSkills => {
+                    let books = if self.playbooks_meta.is_empty() {
+                        "bug-fix, feature, autonomous-run".to_owned()
+                    } else {
+                        self.playbooks_meta.join(", ")
+                    };
+                    let skills = if self.skills_meta.trim().is_empty() {
+                        "none in .twig/skills or ~/.config/twig/skills".to_owned()
+                    } else {
+                        self.skills_meta.clone()
+                    };
+                    self.transcript.push_notice(
+                        NoticeKind::Playbook,
+                        format!("playbooks: {books} · skills: {skills}"),
+                    );
+                    Action::None
+                }
+                SlashCommand::ShowMemory => {
+                    match read_memory_preview(&self.repo_raw) {
+                        Ok(Some(body)) if !body.trim().is_empty() => {
+                            self.transcript.push_notice(
+                                NoticeKind::Info,
+                                "project memory (.twig/preferences.md)",
+                            );
+                            self.transcript.push_assistant(body);
+                        }
+                        Ok(Some(_)) => self
+                            .transcript
+                            .push_notice(NoticeKind::Info, ".twig/preferences.md is empty"),
+                        Ok(None) => self.transcript.push_notice(
+                            NoticeKind::Info,
+                            "no .twig/preferences.md yet — run /memory or /init",
+                        ),
+                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                    }
+                    Action::None
+                }
+                SlashCommand::ShowStatus => {
+                    let msg = format_status_notice(
+                        &self.footer_view(None, ""),
+                        self.turns_used,
+                        self.context_bytes,
+                        self.context_max,
+                    );
+                    self.transcript.push_notice(NoticeKind::Info, msg);
+                    Action::None
+                }
+                SlashCommand::ShowConfig => {
+                    match format_config_report() {
+                        Ok(msg) => self.transcript.push_notice(NoticeKind::Info, msg),
+                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                    }
+                    Action::None
+                }
+                SlashCommand::ToggleExpand => {
+                    self.transcript.toggle_expand();
+                    Action::None
+                }
+                SlashCommand::OpenFind(q) => {
+                    self.transcript.search_open_with(&q);
+                    Action::None
+                }
+                SlashCommand::CopyCode => match self.transcript.copy_latest_code_block() {
                     Ok((text, msg)) => {
                         self.flash(msg);
                         Action::CopyCode(text)
@@ -1063,150 +1100,17 @@ impl App {
                         self.flash(e);
                         Action::None
                     }
-                };
-            }
-            "/editor" => return Action::OpenEditor,
-            "/mouse" => return Action::ToggleMouse,
-            "/diff" => return Action::RunDiff,
-            "/undo" => return Action::UndoEdit,
-            "/review" => return Action::RunReview,
-            "/compact" => return Action::CompactNow,
-            "/help" => {
-                self.set_footer_mode(FooterMode::ShortcutOverlay);
-                return Action::None;
-            }
-            "/resume" => {
-                let sessions = list_sessions();
-                if sessions.is_empty() {
-                    self.transcript
-                        .push_notice(NoticeKind::Info, "no saved sessions found");
-                } else {
-                    self.overlay_picker = Some(OverlayPicker::resume(sessions));
+                },
+                SlashCommand::ClearTranscript => {
+                    self.transcript.clear();
+                    Action::None
                 }
-                return Action::None;
-            }
-            "/status" => {
-                let ctx_pct = self
-                    .context_pct()
-                    .map(|p| format!("{p}%"))
-                    .unwrap_or_else(|| "—".into());
-                let total_tok = self.input_tokens + self.output_tokens;
-                let cache_pct = (self.cached_tokens * 100)
-                    .checked_div(self.input_tokens)
-                    .map(|p| format!(" · cache {p}%"))
-                    .unwrap_or_default();
-                let title = self
-                    .title
-                    .as_deref()
-                    .map(|t| format!(" · title:{t}"))
-                    .unwrap_or_default();
-                let mode = if self.plan_mode { "plan (RO)" } else { "edit" };
-                self.transcript.push_notice(
-                    NoticeKind::Info,
-                    format!(
-                        "sid:{} · model:{} · mode:{mode} · turns:{} · ctx:{ctx_pct} ({}/{}B) · {}{cache_pct}{title}",
-                        if self.sid.is_empty() { "—" } else { &self.sid },
-                        self.model,
-                        self.turns_used,
-                        self.context_bytes,
-                        self.context_max,
-                        fmt_tokens_compact(total_tok)
-                    ),
-                );
-                return Action::None;
-            }
-            "/skills" | "/playbooks" => {
-                let books = if self.playbooks_meta.is_empty() {
-                    "bug-fix, feature, port".to_owned()
-                } else {
-                    self.playbooks_meta.join(", ")
-                };
-                let skills = if self.skills_meta.trim().is_empty() {
-                    "none in .twig/skills or ~/.config/twig/skills".to_owned()
-                } else {
-                    self.skills_meta.clone()
-                };
-                self.transcript.push_notice(
-                    NoticeKind::Playbook,
-                    format!("playbooks: {books} · skills: {skills}"),
-                );
-                return Action::None;
-            }
-            "/config" => match HarnessConfig::resolve() {
-                Ok((cfg, src)) => self.transcript.push_notice(
-                    NoticeKind::Info,
-                    format!(
-                        "config:{src} · max_turns:{} · stall_turns:{} · context_max:{}KB · timeout:{}s · isolation:{}",
-                        cfg.max_turns,
-                        cfg.stall_turns,
-                        cfg.context_max_bytes / 1024,
-                        cfg.bash_timeout_secs,
-                        cfg.isolation
-                    ),
-                ),
-                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-            },
-            "/model" => return Action::OpenModelPicker,
-            "/find" => {
-                self.transcript.search_open_with("");
-                return Action::None;
-            }
-            _ => {}
-        }
-        if trimmed == "/config" {
-            return Action::None;
-        }
-
-        if let Some(path) = trimmed.strip_prefix("/export ") {
-            let path = path.trim();
-            return Action::ExportTranscript((!path.is_empty()).then(|| path.to_owned()));
-        }
-        if let Some(sid) = trimmed.strip_prefix("/resume ") {
-            let sid = sid.trim();
-            if !sid.is_empty() {
-                return Action::SwitchSession(sid.to_owned());
-            }
-            return Action::None;
-        }
-        if let Some(title) = trimmed.strip_prefix("/rename ") {
-            let title = title.trim();
-            if !title.is_empty() {
-                return Action::RenameSession(title.to_owned());
-            }
-            return Action::None;
-        }
-        if let Some(model) = trimmed.strip_prefix("/model ") {
-            let model = model.trim();
-            if !model.is_empty() {
-                return Action::SetModel(model.to_owned());
-            }
-            return Action::None;
-        }
-        if let Some(q) = trimmed.strip_prefix("/find ") {
-            self.transcript.search_open_with(q.trim());
-            return Action::None;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/steer ") {
-            let text = rest.trim().to_owned();
-            if !text.is_empty() {
-                self.transcript.push_steering(text.clone());
-                return Action::SendSteer(text);
-            }
-            return Action::None;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/approve ") {
-            let id = rest.trim().to_owned();
-            if !id.is_empty() {
-                return Action::ResolveApproval { id, allow: true };
-            }
-            return Action::None;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/deny ") {
-            let id = rest.trim().to_owned();
-            if !id.is_empty() {
-                return Action::ResolveApproval { id, allow: false };
-            }
-            return Action::None;
+                SlashCommand::ShowHelp => {
+                    self.set_footer_mode(FooterMode::ShortcutOverlay);
+                    Action::None
+                }
+                other => Action::Slash(other),
+            };
         }
 
         if self.running {
@@ -1225,6 +1129,29 @@ impl App {
 
     fn context_pct(&self) -> Option<usize> {
         (self.context_max > 0).then(|| ((self.context_bytes * 100) / self.context_max).min(100))
+    }
+
+    fn footer_view<'a>(&'a self, flash: Option<&'a str>, right_hint: &'a str) -> FooterView<'a> {
+        FooterView {
+            mode: self.footer_mode,
+            flash,
+            repo_label: &self.repo_label,
+            git_branch: self.git_branch.as_deref(),
+            model: &self.model,
+            effort: self.effort.as_deref(),
+            title: self.title.as_deref(),
+            sid: &self.sid,
+            plan_mode: self.plan_mode,
+            pending_images: self.pending_images.len(),
+            context_pct: self.context_pct(),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cached_tokens: self.cached_tokens,
+            playbook: self.playbook.as_deref(),
+            guard_level: self.guard_level.as_deref(),
+            mouse_enabled: self.mouse_enabled,
+            right_hint,
+        }
     }
 
     fn footer_height(&self) -> u16 {
@@ -1252,6 +1179,11 @@ impl App {
         let has_approval = !self.approvals.is_empty();
         let has_picker = self.overlay_picker.is_some();
         let search_open = self.transcript.search_is_open();
+        let todo_h: u16 = if !has_approval && !has_picker && area.height > 14 {
+            todo_strip_height(&self.todos)
+        } else {
+            0
+        };
         let activity_h: u16 = if self.running && !has_approval && !has_picker {
             1
         } else {
@@ -1261,7 +1193,7 @@ impl App {
         let bottom_panel_h: u16 = if let Some(picker) = &self.overlay_picker {
             picker.desired_height()
         } else if has_approval {
-            7
+            8
         } else {
             self.composer.desired_height(area.width as usize)
         };
@@ -1271,6 +1203,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(3),
+                Constraint::Length(todo_h),
                 Constraint::Length(activity_h),
                 Constraint::Length(search_h),
                 Constraint::Length(bottom_panel_h),
@@ -1295,6 +1228,10 @@ impl App {
             },
         );
 
+        if todo_h > 0 {
+            render_todo_strip(frame, chunks[1], &self.todos);
+        }
+
         if activity_h > 0 {
             let pretty_elapsed = fmt_elapsed_compact(run_elapsed.as_secs());
             let mut spans = vec![
@@ -1311,25 +1248,17 @@ impl App {
                 format!("  ({pretty_elapsed} · esc to interrupt · enter to steer)"),
                 Style::default().fg(MUTED),
             ));
-            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[1]);
+            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[2]);
         }
 
         if search_open {
-            self.transcript.render_search_bar(frame, chunks[2]);
+            self.transcript.render_search_bar(frame, chunks[3]);
         }
 
         if let Some(picker) = &self.overlay_picker {
-            picker.render(frame, chunks[3]);
-        } else if let Some(pending) = self.approvals.front() {
-            render_approval_panel(
-                frame,
-                chunks[3],
-                &pending.id,
-                &pending.name,
-                &pending.args,
-                pending.recovered,
-                self.approval_sel,
-            );
+            picker.render(frame, chunks[4]);
+        } else if has_approval {
+            self.approvals.render(frame, chunks[4]);
         } else {
             let (rule_color, prompt_color, placeholder) = if self.running {
                 (
@@ -1358,7 +1287,7 @@ impl App {
             };
             self.composer.render(
                 frame,
-                chunks[3],
+                chunks[4],
                 rule_color,
                 prompt_color,
                 placeholder,
@@ -1366,7 +1295,7 @@ impl App {
             );
             if !search_open {
                 self.composer
-                    .render_popup(frame, chunks[3], chunks[0].height);
+                    .render_popup(frame, chunks[4], chunks[0].height);
             }
         }
 
@@ -1378,7 +1307,7 @@ impl App {
         let right_hint = if let Some(picker) = &self.overlay_picker {
             picker.hint()
         } else if !self.approvals.is_empty() {
-            "↑/↓ select · Enter confirm · Esc deny  "
+            "↑/↓ select · Enter confirm · a always · Esc deny  "
         } else if self.transcript.search_is_open() {
             "Enter next · Esc close  "
         } else if !self.composer.is_empty() && self.running {
@@ -1392,28 +1321,7 @@ impl App {
         } else {
             "? shortcuts · Shift+Tab plan · ^F find  "
         };
-        render_footer(
-            frame,
-            chunks[4],
-            &FooterView {
-                mode: self.footer_mode,
-                flash,
-                repo_label: &self.repo_label,
-                git_branch: self.git_branch.as_deref(),
-                model: &self.model,
-                title: self.title.as_deref(),
-                sid: &self.sid,
-                plan_mode: self.plan_mode,
-                context_pct: self.context_pct(),
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                cached_tokens: self.cached_tokens,
-                playbook: self.playbook.as_deref(),
-                guard_level: self.guard_level.as_deref(),
-                mouse_enabled: self.mouse_enabled,
-                right_hint,
-            },
-        );
+        render_footer(frame, chunks[5], &self.footer_view(flash, right_hint));
     }
 
     fn connect_session(
@@ -1430,6 +1338,23 @@ impl App {
         Ok(client)
     }
 
+    fn replace_client(&mut self, client: &mut ServeClient, resume: Option<&str>) -> bool {
+        let cancel = self.running;
+        self.reset_session_view();
+        let repo = self.repo_raw.clone();
+        match self.connect_session(&repo, resume) {
+            Ok(new_client) => {
+                let old = std::mem::replace(client, new_client);
+                old.shutdown(cancel);
+                true
+            }
+            Err(e) => {
+                self.transcript.push_notice(NoticeKind::Error, e);
+                false
+            }
+        }
+    }
+
     fn run_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -1439,6 +1364,19 @@ impl App {
     ) -> Result<bool, String> {
         loop {
             while let Some(msg) = client.try_recv() {
+                if let ServerMsg::Reply { id, ref result } = msg {
+                    if self.fork_req == Some(id) {
+                        self.fork_req = None;
+                        if let Some(new_sid) = result.get("sid").and_then(Value::as_str) {
+                            let new_sid = new_sid.to_owned();
+                            if self.replace_client(client, Some(&new_sid)) {
+                                let short: String = new_sid.chars().take(10).collect();
+                                self.flash(format!("Forked session → {short}"));
+                            }
+                            continue;
+                        }
+                    }
+                }
                 self.apply_server_msg(msg);
             }
             while let Ok(msg) = local_rx.try_recv() {
@@ -1460,7 +1398,24 @@ impl App {
                         Event::Key(key) => match self.handle_key(key) {
                             Action::None => {}
                             Action::SendTurn(text) => {
-                                match client.send("turn", json!({"input": text})) {
+                                let mut imgs = std::mem::take(&mut self.pending_images);
+                                imgs.extend(extract_inline_images(&self.repo_raw, &text));
+                                let params = if imgs.is_empty() {
+                                    json!({"input": text})
+                                } else {
+                                    let labels: Vec<&str> =
+                                        imgs.iter().map(|(l, _)| l.as_str()).collect();
+                                    self.transcript.push_notice(
+                                        NoticeKind::Info,
+                                        format!("attached images: {}", labels.join(", ")),
+                                    );
+                                    let payload: Vec<Value> = imgs
+                                        .into_iter()
+                                        .map(|(label, url)| json!({"label": label, "url": url}))
+                                        .collect();
+                                    json!({"input": text, "images": payload})
+                                };
+                                match client.send("turn", params) {
                                     Ok(id) => self.active_turn_req = Some(id),
                                     Err(e) => {
                                         self.running = false;
@@ -1476,10 +1431,14 @@ impl App {
                             Action::Cancel => {
                                 let _ = client.send("cancel", json!({}));
                             }
-                            Action::ResolveApproval { id, allow } => {
+                            Action::ResolveApproval {
+                                id,
+                                allow,
+                                remember,
+                            } => {
                                 if let Err(e) = client.send(
                                     "approval.resolve",
-                                    json!({"id": id, "allow": allow}),
+                                    json!({"id": id, "allow": allow, "remember": remember}),
                                 ) {
                                     self.transcript.push_notice(NoticeKind::Error, e);
                                 }
@@ -1499,41 +1458,61 @@ impl App {
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
-                            Action::NewSession => {
-                                let cancel = self.running;
-                                self.reset_session_view();
-                                let repo = self.repo_raw.clone();
-                                match self.connect_session(&repo, None) {
-                                    Ok(new_client) => {
-                                        let old = std::mem::replace(client, new_client);
-                                        old.shutdown(cancel);
-                                        self.flash("Started new session");
-                                    }
+                            Action::SetEffort(level) => {
+                                match client.send("effort.set", json!({"effort": level})) {
+                                    Ok(_) => self.flash(format!("Reasoning effort → {level}")),
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
                             Action::SwitchSession(sid) => {
-                                let cancel = self.running;
-                                self.reset_session_view();
-                                let repo = self.repo_raw.clone();
-                                match self.connect_session(&repo, Some(&sid)) {
-                                    Ok(new_client) => {
-                                        let old = std::mem::replace(client, new_client);
-                                        old.shutdown(cancel);
-                                        self.flash(format!("Resumed session {sid}"));
+                                if self.replace_client(client, Some(&sid)) {
+                                    self.flash(format!("Resumed session {sid}"));
+                                }
+                            }
+                            Action::SetModel(model) => {
+                                match client.send("model.set", json!({"model": model})) {
+                                    Ok(_) => {
+                                        self.flash(format!("Switching model → {model} (saved)"))
                                     }
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
                             }
-                            Action::ArchiveSession => {
-                                let old_sid = self.sid.clone();
-                                let cancel = self.running;
-                                self.reset_session_view();
-                                let repo = self.repo_raw.clone();
-                                match self.connect_session(&repo, None) {
-                                    Ok(new_client) => {
-                                        let old = std::mem::replace(client, new_client);
-                                        old.shutdown(cancel);
+                            Action::Slash(cmd) => match cmd {
+                                SlashCommand::NewSession => {
+                                    if self.replace_client(client, None) {
+                                        self.flash("Started new session");
+                                    }
+                                }
+                                SlashCommand::ForkSession => {
+                                    match client.send("session.fork", json!({})) {
+                                        Ok(id) => {
+                                            self.fork_req = Some(id);
+                                            self.flash("Forking session…");
+                                        }
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                    }
+                                }
+                                SlashCommand::RewindSession(turns) => {
+                                    match client.send("session.rewind", json!({"turns": turns})) {
+                                        Ok(id) => {
+                                            self.rewind_req = Some(id);
+                                            self.flash(format!("Rewinding {turns} turn(s)…"));
+                                        }
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                    }
+                                }
+                                SlashCommand::RenameSession(title) => {
+                                    match client.send("session.rename", json!({"title": title})) {
+                                        Ok(_) => {
+                                            self.title = Some(title.clone());
+                                            self.flash(format!("Renamed session → {title}"));
+                                        }
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                    }
+                                }
+                                SlashCommand::ArchiveSession => {
+                                    let old_sid = self.sid.clone();
+                                    if self.replace_client(client, None) {
                                         match archive_session_file(&old_sid) {
                                             Ok(dst) => {
                                                 let short: String =
@@ -1549,122 +1528,148 @@ impl App {
                                             }
                                         }
                                     }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                 }
-                            }
-                            Action::RenameSession(title) => {
-                                match client.send("session.rename", json!({"title": title})) {
-                                    Ok(_) => {
-                                        self.title = Some(title.clone());
-                                        self.flash(format!("Renamed session → {title}"));
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                SlashCommand::OpenModelPicker => {
+                                    self.flash("Fetching models from magpie…");
+                                    let tx = local_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = tx.send(LocalMsg::Models(fetch_magpie_models()));
+                                    });
                                 }
-                            }
-                            Action::OpenModelPicker => {
-                                self.flash("Fetching models from magpie…");
-                                let tx = local_tx.clone();
-                                std::thread::spawn(move || {
-                                    let _ = tx.send(LocalMsg::Models(fetch_magpie_models()));
-                                });
-                            }
-                            Action::SetModel(model) => {
-                                match client.send("model.set", json!({"model": model})) {
-                                    Ok(_) => self.flash(format!("Switching model → {model} (saved)")),
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::UndoEdit => match client.send("edit.undo", json!({})) {
-                                Ok(id) => {
-                                    self.undo_req = Some(id);
-                                    self.flash("Reverting last edit…");
-                                }
-                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                            },
-                            Action::CompactNow => {
-                                match client.send("session.compact", json!({})) {
-                                    Ok(_) => self.flash("Compacting context…"),
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::VerifySession => {
-                                match client.send("session.verify", json!({})) {
-                                    Ok(id) => {
-                                        self.verify_req = Some(id);
-                                        self.flash("Verifying session hash chain…");
-                                    }
-                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                                }
-                            }
-                            Action::EditMemory => match ensure_memory_file(&self.repo_raw) {
-                                Ok((path, created)) => {
-                                    TerminalGuard::suspend();
-                                    let edited = edit_file_in_external_editor(&path);
-                                    TerminalGuard::resume(self.mouse_enabled)?;
-                                    terminal.clear().map_err(|e| e.to_string())?;
-                                    match edited {
-                                        Ok(lines) => {
-                                            let verb = if created { "Created" } else { "Saved" };
-                                            let msg = format!(
-                                                "{verb} .twig/preferences.md ({lines} lines) — auto-loaded on next turn"
-                                            );
-                                            self.flash(&msg);
-                                            self.transcript.push_notice(NoticeKind::Success, msg);
+                                SlashCommand::UndoEdit => {
+                                    match client.send("edit.undo", json!({})) {
+                                        Ok(id) => {
+                                            self.undo_req = Some(id);
+                                            self.flash("Reverting last edit…");
                                         }
-                                        Err(e) => self.flash(format!("Editor failed: {e}")),
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                     }
                                 }
-                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                            },
-                            Action::InitProject => match init_project_files(&self.repo_raw) {
-                                Ok((created, existing)) => {
-                                    let mut parts = Vec::new();
-                                    if !created.is_empty() {
-                                        parts.push(format!("created {}", created.join(", ")));
+                                SlashCommand::ListMcp => match client.send("mcp.list", json!({})) {
+                                    Ok(id) => {
+                                        self.mcp_req = Some(id);
+                                        self.flash("Checking MCP servers…");
                                     }
-                                    if !existing.is_empty() {
-                                        parts.push(format!("kept existing {}", existing.join(", ")));
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                },
+                                SlashCommand::CompactNow => {
+                                    match client.send("session.compact", json!({})) {
+                                        Ok(_) => self.flash("Compacting context…"),
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
                                     }
-                                    let msg = format!("twig init: {}", parts.join(" · "));
-                                    self.flash("Initialized .twig/");
-                                    self.transcript.push_notice(NoticeKind::Success, msg);
                                 }
-                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                            },
-                            Action::RunDoctor => {
-                                self.flash("Running twig doctor…");
-                                let tx = local_tx.clone();
-                                let repo = self.repo_raw.clone();
-                                std::thread::spawn(move || {
-                                    let _ = tx.send(LocalMsg::Doctor(run_doctor(&repo)));
-                                });
-                            }
-                            Action::ExportTranscript(custom) => {
-                                let md = self.transcript.export_markdown(
-                                    &self.sid,
-                                    self.title.as_deref(),
-                                    &self.model,
-                                    &self.repo_path,
-                                );
-                                match write_export_file(
-                                    &self.repo_raw,
-                                    &self.sid,
-                                    custom.as_deref(),
-                                    &md,
-                                ) {
-                                    Ok(pretty) => {
-                                        self.flash("Exported transcript to Markdown");
+                                SlashCommand::VerifySession => {
+                                    match client.send("session.verify", json!({})) {
+                                        Ok(id) => {
+                                            self.verify_req = Some(id);
+                                            self.flash("Verifying session hash chain…");
+                                        }
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                    }
+                                }
+                                SlashCommand::EditMemory => match ensure_memory_file(&self.repo_raw)
+                                {
+                                    Ok((path, created)) => {
+                                        TerminalGuard::suspend();
+                                        let edited = edit_file_in_external_editor(&path);
+                                        TerminalGuard::resume(self.mouse_enabled)?;
+                                        terminal.clear().map_err(|e| e.to_string())?;
+                                        match edited {
+                                            Ok(lines) => {
+                                                let verb = if created { "Created" } else { "Saved" };
+                                                let msg = format!(
+                                                    "{verb} .twig/preferences.md ({lines} lines) — auto-loaded on next turn"
+                                                );
+                                                self.flash(&msg);
+                                                self.transcript
+                                                    .push_notice(NoticeKind::Success, msg);
+                                            }
+                                            Err(e) => self.flash(format!("Editor failed: {e}")),
+                                        }
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                },
+                                SlashCommand::InitProject => match init_project_files(&self.repo_raw)
+                                {
+                                    Ok((created, existing)) => {
+                                        self.flash("Initialized .twig/");
                                         self.transcript.push_notice(
                                             NoticeKind::Success,
-                                            format!(
-                                                "exported transcript ({} bytes) → {pretty}",
-                                                md.len()
-                                            ),
+                                            format_init_report(&created, &existing),
                                         );
                                     }
                                     Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                },
+                                SlashCommand::RunDoctor => {
+                                    self.flash("Running twig doctor…");
+                                    let tx = local_tx.clone();
+                                    let repo = self.repo_raw.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = tx.send(LocalMsg::Doctor(run_doctor(&repo)));
+                                    });
                                 }
-                            }
+                                SlashCommand::ExportTranscript(custom) => {
+                                    let md = self.transcript.export_markdown(
+                                        &self.sid,
+                                        self.title.as_deref(),
+                                        &self.model,
+                                        &self.repo_path,
+                                    );
+                                    match write_export_file(
+                                        &self.repo_raw,
+                                        &self.sid,
+                                        custom.as_deref(),
+                                        &md,
+                                    ) {
+                                        Ok(pretty) => {
+                                            self.flash("Exported transcript to Markdown");
+                                            self.transcript.push_notice(
+                                                NoticeKind::Success,
+                                                format!(
+                                                    "exported transcript ({} bytes) → {pretty}",
+                                                    md.len()
+                                                ),
+                                            );
+                                        }
+                                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                    }
+                                }
+                                SlashCommand::RunDiff => match run_git_diff(&self.repo_raw) {
+                                    Ok(diff) if diff.trim().is_empty() => {
+                                        self.transcript.push_notice(
+                                            NoticeKind::Info,
+                                            "working tree clean — no diff",
+                                        );
+                                    }
+                                    Ok(diff) => {
+                                        let id = format!("diff-{}", self.next_local_id);
+                                        self.next_local_id += 1;
+                                        self.transcript.push_tool_snapshot(
+                                            id,
+                                            "diff".into(),
+                                            "git diff".into(),
+                                            "local".into(),
+                                            diff,
+                                            Some(0),
+                                        );
+                                    }
+                                    Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                                },
+                                SlashCommand::RunReview => {
+                                    self.transcript.push_notice(
+                                        NoticeKind::Playbook,
+                                        "starting independent read-only review on current git diff…",
+                                    );
+                                    self.transcript.follow_tail();
+                                    let tx = local_tx.clone();
+                                    let repo = self.repo_raw.clone();
+                                    std::thread::spawn(move || {
+                                        let _ = tx
+                                            .send(LocalMsg::Review(run_independent_review(&repo)));
+                                    });
+                                }
+                                _ => {}
+                            },
                             Action::RunLocalShell(cmd) => {
                                 let id = format!("local-{}", self.next_local_id);
                                 self.next_local_id += 1;
@@ -1684,40 +1689,6 @@ impl App {
                                         exit_code,
                                         elapsed,
                                     });
-                                });
-                            }
-                            Action::RunDiff => match run_git_diff(&self.repo_raw) {
-                                Ok(diff) if diff.trim().is_empty() => {
-                                    self.transcript.push_notice(
-                                        NoticeKind::Info,
-                                        "working tree clean — no diff",
-                                    );
-                                }
-                                Ok(diff) => {
-                                    let id = format!("diff-{}", self.next_local_id);
-                                    self.next_local_id += 1;
-                                    self.transcript.push_tool_snapshot(
-                                        id,
-                                        "diff".into(),
-                                        "git diff".into(),
-                                        "local".into(),
-                                        diff,
-                                        Some(0),
-                                    );
-                                }
-                                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                            },
-                            Action::RunReview => {
-                                self.transcript.push_notice(
-                                    NoticeKind::Playbook,
-                                    "starting independent read-only review on current git diff…",
-                                );
-                                self.transcript.follow_tail();
-                                let tx = local_tx.clone();
-                                let repo = self.repo_raw.clone();
-                                std::thread::spawn(move || {
-                                    let _ = tx
-                                        .send(LocalMsg::Review(run_independent_review(&repo)));
                                 });
                             }
                             Action::ToggleMouse => {
@@ -1836,7 +1807,7 @@ mod tests {
         }
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::NewSession
+            Action::Slash(SlashCommand::NewSession)
         );
         assert_eq!(
             app.handle_key(press(KeyCode::Char('m'), KeyModifiers::ALT)),
@@ -1890,12 +1861,29 @@ mod tests {
         }));
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::ResolveApproval { id: "call_1".into(), allow: true }
+            Action::ResolveApproval {
+                id: "call_1".into(),
+                allow: true,
+                remember: false
+            }
         );
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(
             app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::ResolveApproval { id: "call_1".into(), allow: false }
+            Action::ResolveApproval {
+                id: "call_1".into(),
+                allow: true,
+                remember: true
+            }
+        );
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::ResolveApproval {
+                id: "call_1".into(),
+                allow: false,
+                remember: false
+            }
         );
         app.approvals.clear();
 
@@ -1927,28 +1915,26 @@ mod tests {
             Action::SetPlan(true)
         );
         app.plan_mode = true;
-        assert_eq!(app.dispatch_input("/plan"), Action::SetPlan(false));
-        assert_eq!(app.dispatch_input("/plan on"), Action::SetPlan(true));
-        assert_eq!(app.dispatch_input("/memory"), Action::EditMemory);
-        assert_eq!(app.dispatch_input("/init"), Action::InitProject);
-        assert_eq!(app.dispatch_input("/doctor"), Action::RunDoctor);
-        assert_eq!(app.dispatch_input("/archive"), Action::ArchiveSession);
-        assert_eq!(app.dispatch_input("/verify"), Action::VerifySession);
-        assert_eq!(app.dispatch_input("/undo"), Action::UndoEdit);
-        assert_eq!(app.dispatch_input("/model"), Action::OpenModelPicker);
-        assert_eq!(app.dispatch_input("/export"), Action::ExportTranscript(None));
+        assert_eq!(app.dispatch_input("/effort high"), Action::SetEffort("high".into()));
         assert_eq!(
-            app.dispatch_input("/export out/chat.md"),
-            Action::ExportTranscript(Some("out/chat.md".into()))
+            app.dispatch_input("/fork"),
+            Action::Slash(SlashCommand::ForkSession)
         );
 
         app.apply_server_msg(ServerMsg::Reply {
             id: 1,
             result: json!({
                 "pong": true, "sid": "abc123456789", "model": "demo-model",
-                "plan": true, "context_bytes": 3400, "context_max": 10000
+                "effort": "high", "plan": true, "context_bytes": 3400, "context_max": 10000
             }),
         });
+        app.apply_event(&json!({
+            "ev": "todo.updated",
+            "items": [
+                {"content": "Inspect runtime", "status": "completed"},
+                {"content": "Wire Codex parity", "status": "in_progress"}
+            ]
+        }));
         app.apply_event(&json!({
             "ev": "model.usage",
             "usage": {"input_tokens": 1000, "output_tokens": 200, "cached_input_tokens": 800}
@@ -1972,6 +1958,8 @@ mod tests {
 
         let active_frame = render_frame_text(&mut app, 110, 28);
         assert!(active_frame.contains("◈ plan"));
+        assert!(active_frame.contains("high"));
+        assert!(active_frame.contains("Plan progress  1/2"));
         assert!(active_frame.contains("ctx 34%"));
         assert!(active_frame.contains("cache 80%"));
         assert!(active_frame.contains("blake3 chain: ok (12 entries)"));
@@ -1984,5 +1972,6 @@ mod tests {
         let approval_frame = render_frame_text(&mut app, 100, 28);
         assert!(approval_frame.contains("Approve Bash?"));
         assert!(approval_frame.contains("1. Yes, allow once"));
+        assert!(approval_frame.contains("2. Always allow this pattern"));
     }
 }

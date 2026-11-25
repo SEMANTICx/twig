@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -22,22 +23,27 @@ use super::markdown::{
 /// Codex & Claude Code parity slash command catalog.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan", "toggle read-only planning mode (Shift+Tab)"),
+    ("/effort", "set reasoning effort (off/low/medium/high/xhigh)"),
+    ("/model", "browse and switch active model via magpie"),
     ("/new", "start a new chat session"),
     ("/resume", "browse and resume a previous session"),
+    ("/fork", "fork current session into a new branch"),
+    ("/rewind ", "rewind conversation context by N turns (default 1)"),
     ("/rename ", "rename the current session"),
     ("/archive", "archive current session and start a new one"),
-    ("/status", "show session telemetry, usage, and context"),
-    ("/verify", "verify session hash chain, guard, and policy stats"),
-    ("/diff", "show current git diff with line numbers"),
     ("/undo", "revert the last edit or write tool change"),
+    ("/diff", "show current git diff with line numbers"),
     ("/review", "run independent read-only review on current changes"),
+    ("/image ", "attach image file or paste clipboard image"),
+    ("/mcp", "list configured MCP servers and tools"),
+    ("/skills", "list available playbooks and project/global skills"),
     ("/memory", "edit .twig/preferences.md project memory in $EDITOR"),
     ("/init", "initialize .twig/preferences.md and .twig/project.json"),
     ("/doctor", "run twig environment & dependency diagnostics"),
-    ("/export ", "export conversation transcript to Markdown"),
-    ("/skills", "list available playbooks and project/global skills"),
-    ("/model", "browse and switch active model via magpie"),
+    ("/status", "show session telemetry, usage, and context"),
+    ("/verify", "verify session hash chain, guard, and policy stats"),
     ("/compact", "compact conversation context now"),
+    ("/export ", "export conversation transcript to Markdown"),
     ("/config", "show effective harness configuration"),
     ("/steer ", "queue steering guidance for the active run"),
     ("/cancel", "interrupt active turn and child processes"),
@@ -52,6 +58,162 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show keyboard shortcuts (?)"),
     ("/quit", "exit twig chat"),
 ];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlashCommand {
+    Quit,
+    SetPlan(bool),
+    OpenEffortPicker,
+    SetEffort(String),
+    OpenModelPicker,
+    SetModel(String),
+    NewSession,
+    OpenResume,
+    SwitchSession(String),
+    ForkSession,
+    RewindSession(usize),
+    RenameSession(String),
+    ArchiveSession,
+    UndoEdit,
+    RunDiff,
+    RunReview,
+    AttachImage(Option<String>),
+    ClearImages,
+    ListMcp,
+    ShowSkills,
+    EditMemory,
+    ShowMemory,
+    InitProject,
+    RunDoctor,
+    ShowStatus,
+    VerifySession,
+    CompactNow,
+    ExportTranscript(Option<String>),
+    ShowConfig,
+    Steer(String),
+    Cancel,
+    ResolveApproval { id: String, allow: bool },
+    ToggleExpand,
+    OpenFind(String),
+    CopyCode,
+    OpenEditor,
+    ToggleMouse,
+    ClearTranscript,
+    ShowHelp,
+}
+
+/// Single source of truth for parsing `/` commands matching `SLASH_COMMANDS`.
+pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
+    let exact = match trimmed {
+        "/quit" | "/exit" => Some(SlashCommand::Quit),
+        "/plan" => Some(SlashCommand::SetPlan(!plan_mode)),
+        "/plan on" => Some(SlashCommand::SetPlan(true)),
+        "/plan off" => Some(SlashCommand::SetPlan(false)),
+        "/effort" => Some(SlashCommand::OpenEffortPicker),
+        "/model" => Some(SlashCommand::OpenModelPicker),
+        "/new" => Some(SlashCommand::NewSession),
+        "/resume" => Some(SlashCommand::OpenResume),
+        "/fork" => Some(SlashCommand::ForkSession),
+        "/rewind" => Some(SlashCommand::RewindSession(1)),
+        "/archive" => Some(SlashCommand::ArchiveSession),
+        "/undo" => Some(SlashCommand::UndoEdit),
+        "/diff" => Some(SlashCommand::RunDiff),
+        "/review" => Some(SlashCommand::RunReview),
+        "/image" => Some(SlashCommand::AttachImage(None)),
+        "/image clear" => Some(SlashCommand::ClearImages),
+        "/mcp" => Some(SlashCommand::ListMcp),
+        "/skills" | "/playbooks" => Some(SlashCommand::ShowSkills),
+        "/memory" => Some(SlashCommand::EditMemory),
+        "/memory show" => Some(SlashCommand::ShowMemory),
+        "/init" => Some(SlashCommand::InitProject),
+        "/doctor" => Some(SlashCommand::RunDoctor),
+        "/status" => Some(SlashCommand::ShowStatus),
+        "/verify" => Some(SlashCommand::VerifySession),
+        "/compact" => Some(SlashCommand::CompactNow),
+        "/export" => Some(SlashCommand::ExportTranscript(None)),
+        "/config" => Some(SlashCommand::ShowConfig),
+        "/cancel" => Some(SlashCommand::Cancel),
+        "/expand" => Some(SlashCommand::ToggleExpand),
+        "/find" => Some(SlashCommand::OpenFind(String::new())),
+        "/copy" => Some(SlashCommand::CopyCode),
+        "/editor" => Some(SlashCommand::OpenEditor),
+        "/mouse" => Some(SlashCommand::ToggleMouse),
+        "/clear" => Some(SlashCommand::ClearTranscript),
+        "/help" => Some(SlashCommand::ShowHelp),
+        _ => None,
+    };
+    if exact.is_some() {
+        return exact;
+    }
+    if let Some(arg) = trimmed.strip_prefix("/effort ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::SetEffort(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/model ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::SetModel(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/resume ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::SwitchSession(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/rewind ") {
+        let n = arg.trim().parse::<usize>().unwrap_or(1).max(1);
+        return Some(SlashCommand::RewindSession(n));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/rename ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::RenameSession(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/image ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::AttachImage(Some(a.to_owned())));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/export ") {
+        let a = arg.trim();
+        return Some(SlashCommand::ExportTranscript(
+            (!a.is_empty()).then(|| a.to_owned()),
+        ));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/find ") {
+        return Some(SlashCommand::OpenFind(arg.trim().to_owned()));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/steer ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::Steer(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/approve ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::ResolveApproval {
+                id: a.to_owned(),
+                allow: true,
+            });
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/deny ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::ResolveApproval {
+                id: a.to_owned(),
+                allow: false,
+            });
+        }
+    }
+    None
+}
 
 pub enum PopupKind {
     Slash(Vec<(String, String)>),
@@ -115,6 +277,95 @@ impl Composer {
         self.cursor += ch.len_utf8();
         self.history_idx = None;
         self.popup_sel = 0;
+    }
+
+    /// Handle readline shortcuts, popup navigation, editing, and submission.
+    /// Returns `Some(text)` when the user submits a prompt or executes a slash command.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a') => self.move_home(),
+                KeyCode::Char('e') => self.move_end(),
+                KeyCode::Char('u') => self.clear_to_start(),
+                KeyCode::Char('w') => self.delete_word_back(),
+                KeyCode::Char('j') => self.insert_char('\n'),
+                _ => {}
+            }
+            return None;
+        }
+        if self.has_popup() {
+            match key.code {
+                KeyCode::Up => {
+                    self.popup_move(-1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.popup_move(1);
+                    return None;
+                }
+                KeyCode::Tab => {
+                    self.accept_popup();
+                    return None;
+                }
+                KeyCode::Enter if key.modifiers.is_empty() => match self.accept_popup_on_enter() {
+                    PopupAccept::Execute(cmd) => return Some(cmd),
+                    PopupAccept::Filled => return None,
+                    PopupAccept::None => {}
+                },
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.insert_char('\n');
+                None
+            }
+            KeyCode::Enter => Some(self.take_submitted()),
+            KeyCode::Tab => {
+                self.accept_popup();
+                None
+            }
+            KeyCode::Backspace => {
+                self.backspace();
+                None
+            }
+            KeyCode::Delete => {
+                self.delete();
+                None
+            }
+            KeyCode::Left => {
+                self.move_left();
+                None
+            }
+            KeyCode::Right => {
+                self.move_right();
+                None
+            }
+            KeyCode::Home => {
+                self.move_home();
+                None
+            }
+            KeyCode::End => {
+                self.move_end();
+                None
+            }
+            KeyCode::Up => {
+                self.history_up();
+                None
+            }
+            KeyCode::Down => {
+                self.history_down();
+                None
+            }
+            KeyCode::Char(c) => {
+                self.insert_char(c);
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Codex-style paste handling: large or multiline pastes fold into an inline pill.
@@ -691,4 +942,40 @@ fn list_repo_files(repo: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_slash_covers_all_codex_and_twig_commands() {
+        assert_eq!(parse_slash("/plan", true), Some(SlashCommand::SetPlan(false)));
+        assert_eq!(parse_slash("/plan on", false), Some(SlashCommand::SetPlan(true)));
+        assert_eq!(parse_slash("/effort", false), Some(SlashCommand::OpenEffortPicker));
+        assert_eq!(
+            parse_slash("/effort high", false),
+            Some(SlashCommand::SetEffort("high".into()))
+        );
+        assert_eq!(parse_slash("/model", false), Some(SlashCommand::OpenModelPicker));
+        assert_eq!(parse_slash("/new", false), Some(SlashCommand::NewSession));
+        assert_eq!(parse_slash("/fork", false), Some(SlashCommand::ForkSession));
+        assert_eq!(parse_slash("/rewind 2", false), Some(SlashCommand::RewindSession(2)));
+        assert_eq!(parse_slash("/undo", false), Some(SlashCommand::UndoEdit));
+        assert_eq!(parse_slash("/mcp", false), Some(SlashCommand::ListMcp));
+        assert_eq!(parse_slash("/memory", false), Some(SlashCommand::EditMemory));
+        assert_eq!(parse_slash("/init", false), Some(SlashCommand::InitProject));
+        assert_eq!(parse_slash("/doctor", false), Some(SlashCommand::RunDoctor));
+        assert_eq!(parse_slash("/archive", false), Some(SlashCommand::ArchiveSession));
+        assert_eq!(parse_slash("/verify", false), Some(SlashCommand::VerifySession));
+        assert_eq!(parse_slash("/export", false), Some(SlashCommand::ExportTranscript(None)));
+        assert_eq!(
+            parse_slash("/export out/chat.md", false),
+            Some(SlashCommand::ExportTranscript(Some("out/chat.md".into())))
+        );
+        assert_eq!(
+            parse_slash("/image shot.png", false),
+            Some(SlashCommand::AttachImage(Some("shot.png".into())))
+        );
+    }
 }

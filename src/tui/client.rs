@@ -414,6 +414,166 @@ pub fn format_verify_report(result: &Value) -> (bool, String) {
     )
 }
 
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+fn image_mime_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Read an image file and encode it as an OpenAI-compatible `data:image/...;base64,...` URL.
+pub fn load_image_data_url(repo: &str, raw_path: &str) -> Result<(String, String), String> {
+    let trimmed = raw_path.trim().trim_matches(['"', '\'']);
+    if trimmed.is_empty() {
+        return Err("empty image path".into());
+    }
+    let pb = PathBuf::from(trimmed);
+    let path = if pb.is_absolute() {
+        pb
+    } else {
+        Path::new(repo).join(pb)
+    };
+    let mime = image_mime_for_path(&path)
+        .ok_or_else(|| format!("unsupported image extension: {}", path.display()))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("read image {}: {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err("image file is empty".into());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image too large ({}MB > 10MB limit)",
+            bytes.len() / (1024 * 1024)
+        ));
+    }
+    let label = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_owned());
+    Ok((label, format!("data:{mime};base64,{}", encode_base64(&bytes))))
+}
+
+/// Grab an image directly from the Wayland clipboard via `wl-paste` if present.
+pub fn paste_clipboard_image() -> Result<Option<(String, String)>, String> {
+    let list = Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .map_err(|e| format!("wl-paste unavailable: {e}"))?;
+    if !list.status.success() {
+        return Ok(None);
+    }
+    let types = String::from_utf8_lossy(&list.stdout);
+    let mime = if types.lines().any(|l| l.trim() == "image/png") {
+        "image/png"
+    } else if types.lines().any(|l| l.trim() == "image/jpeg") {
+        "image/jpeg"
+    } else {
+        return Ok(None);
+    };
+    let data = Command::new("wl-paste")
+        .args(["--no-newline", "--type", mime])
+        .output()
+        .map_err(|e| format!("wl-paste image: {e}"))?;
+    if !data.status.success() || data.stdout.is_empty() {
+        return Ok(None);
+    }
+    if data.stdout.len() > MAX_IMAGE_BYTES {
+        return Err("clipboard image exceeds 10MB limit".into());
+    }
+    let ext = if mime == "image/png" { "png" } else { "jpg" };
+    Ok(Some((
+        format!("clipboard.{ext} ({}KB)", data.stdout.len() / 1024),
+        format!("data:{mime};base64,{}", encode_base64(&data.stdout)),
+    )))
+}
+
+/// Auto-detect `@path/to/image.png` mentions inside a prompt and load existing image files.
+pub fn extract_inline_images(repo: &str, text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for token in text.split_whitespace() {
+        let Some(candidate) = token.strip_prefix('@') else {
+            continue;
+        };
+        let cleaned = candidate.trim_end_matches([',', '.', ';', ')', ']']);
+        if image_mime_for_path(Path::new(cleaned)).is_some() {
+            if let Ok(img) = load_image_data_url(repo, cleaned) {
+                out.push(img);
+            }
+        }
+    }
+    out
+}
+
+/// Format an `mcp.list` RPC reply cleanly for the transcript.
+pub fn format_mcp_report(result: &Value) -> String {
+    let servers = result["servers"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if servers.is_empty() {
+        return "no MCP servers configured (add `mcpServers` to `.twig/mcp.json` or `~/.config/twig/mcp.json`)".into();
+    }
+    let mut lines = Vec::new();
+    for s in servers {
+        let name = s["server"].as_str().unwrap_or("?");
+        if s["ok"] == true {
+            let tools: Vec<&str> = s["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str())
+                .collect();
+            let list = if tools.is_empty() {
+                "0 tools".to_owned()
+            } else {
+                format!("{} tools: {}", tools.len(), tools.join(", "))
+            };
+            lines.push(format!("- **{name}** ({list})"));
+        } else {
+            let err = s["error"].as_str().unwrap_or("error");
+            lines.push(format!("- **{name}** — error: `{err}`"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Format effective `HarnessConfig` summary for `/config`.
+pub fn format_config_report() -> Result<String, String> {
+    let (cfg, src) = crate::config::HarnessConfig::resolve()?;
+    Ok(format!(
+        "config:{src} · max_turns:{} · stall_turns:{} · context_max:{}KB · timeout:{}s · isolation:{}",
+        cfg.max_turns,
+        cfg.stall_turns,
+        cfg.context_max_bytes / 1024,
+        cfg.bash_timeout_secs,
+        cfg.isolation
+    ))
+}
+
+/// Read `<repo>/.twig/preferences.md` for `/memory show`.
+pub fn read_memory_preview(repo: &str) -> Result<Option<String>, String> {
+    let path = Path::new(repo).join(".twig/preferences.md");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    Ok(Some(body))
+}
+
+/// Format `.twig/` initialization results for `/init`.
+pub fn format_init_report(created: &[String], existing: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !created.is_empty() {
+        parts.push(format!("created {}", created.join(", ")));
+    }
+    if !existing.is_empty() {
+        parts.push(format!("kept existing {}", existing.join(", ")));
+    }
+    format!("twig init: {}", parts.join(" · "))
+}
+
 pub fn detect_git_branch(repo: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])

@@ -4,6 +4,7 @@
 pub mod context;
 pub mod guard;
 pub mod guidance;
+pub mod mcp;
 pub mod policy;
 pub mod subagent;
 pub mod tools;
@@ -217,6 +218,7 @@ fn recover_session(rows: &[Value], default_check: Option<Check>) -> RecoveredSta
 pub struct Daemon<'a> {
     llm: &'a dyn Llm,
     worktree: PathBuf,
+    runs_dir: PathBuf,
     record: Record,
     guard: Guard,
     system: String,
@@ -239,8 +241,10 @@ pub struct Daemon<'a> {
     context: Context,
     check: Option<Check>,
     model_override: Option<String>,
+    effort: Option<String>,
     title: Option<String>,
     plan_mode: bool,
+    todos: Vec<Value>,
 }
 
 impl<'a> Daemon<'a> {
@@ -282,12 +286,26 @@ impl<'a> Daemon<'a> {
             .find(|r| r["kind"] == "mode.changed")
             .and_then(|r| r["plan"].as_bool())
             .unwrap_or(false);
+        let todos = rows
+            .iter()
+            .rev()
+            .find(|r| r["kind"] == "todo.updated")
+            .and_then(|r| r["items"].as_array().cloned())
+            .unwrap_or_default();
         let recovered = recover_session(&rows, default_check);
         let guard =
             Guard::new(&worktree, cfg.max_turns, cfg.stall_turns, 3).ignoring([runs_dir.clone()]);
         let mut context = Context::new(cfg.context_max_bytes, runs_dir.join("artifacts"));
         for c in recovered.constraints {
             context.add_constraint(c);
+        }
+        let policy = Policy::new();
+        for row in &rows {
+            if row["kind"] == "policy.allowed" {
+                if let Some(pat) = row["pattern"].as_str() {
+                    policy.allow_for_session(pat);
+                }
+            }
         }
         let mut tools = Tools::with_config(&worktree, cfg);
         tools.apply_plan_mode(plan_mode);
@@ -298,14 +316,17 @@ impl<'a> Daemon<'a> {
             context,
             check: recovered.check,
             model_override: None,
+            effort: llm.effort(),
             title,
             plan_mode,
+            todos,
             tools,
             system: cfg.system.clone(),
             worktree,
+            runs_dir,
             record,
             guard,
-            policy: Policy::new(),
+            policy,
             messages: recovered.messages,
             audit: Vec::new(),
             pending: recovered.pending,
@@ -390,6 +411,7 @@ impl<'a> Daemon<'a> {
                     "pong": true,
                     "sid": self.sid(),
                     "model": model,
+                    "effort": self.effort,
                     "title": self.title,
                     "plan": self.plan_mode,
                     "read_only": self.tools.is_read_only(),
@@ -417,10 +439,12 @@ impl<'a> Daemon<'a> {
                     "sid": self.sid(),
                     "title": self.title,
                     "model": model,
+                    "effort": self.effort,
                     "plan": self.plan_mode,
                     "read_only": self.tools.is_read_only(),
                     "turns": turns,
                     "messages": self.messages,
+                    "todos": self.todos,
                     "pending": self.pending,
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
@@ -491,6 +515,81 @@ impl<'a> Daemon<'a> {
                     .unwrap_or_else(|| self.llm.roles().get("code").to_string());
                 Ok(json!({"model": active}))
             }
+
+            "effort.set" => {
+                let raw = params.get("effort").and_then(Value::as_str).unwrap_or("");
+                let next = crate::llm::normalize_effort(raw)?;
+                self.effort = next.clone();
+                self.llm.set_effort(next.as_deref());
+                let _ = crate::llm::Provider::save_effort(next.as_deref());
+                self.record
+                    .append("effort.changed", json!({"effort": next}))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"effort": self.effort}))
+            }
+
+            "session.fork" => {
+                let new_sid = crate::config::paths::session_id();
+                let mut forked =
+                    Record::open(self.runs_dir.join(format!("{new_sid}.jsonl")), new_sid.clone())
+                        .map_err(|e| e.to_string())?;
+                forked
+                    .append("session.forked", json!({"from": self.sid()}))
+                    .map_err(|e| e.to_string())?;
+                if let Some(title) = &self.title {
+                    forked
+                        .append("session.renamed", json!({"title": format!("{title} (fork)")}))
+                        .map_err(|e| e.to_string())?;
+                }
+                if self.plan_mode {
+                    forked
+                        .append("mode.changed", json!({"plan": true}))
+                        .map_err(|e| e.to_string())?;
+                }
+                if !self.todos.is_empty() {
+                    forked
+                        .append("todo.updated", json!({"items": self.todos}))
+                        .map_err(|e| e.to_string())?;
+                }
+                forked
+                    .append("messages.checkpoint", json!({"messages": self.messages}))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"sid": new_sid, "messages": self.messages.len()}))
+            }
+
+            "session.rewind" => {
+                let requested = params.get("turns").and_then(Value::as_u64).unwrap_or(1) as usize;
+                let n = requested.max(1);
+                let user_indices: Vec<usize> = self
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, m)| (m["role"] == "user").then_some(i))
+                    .collect();
+                if user_indices.is_empty() {
+                    return Err("no user turns to rewind".into());
+                }
+                let cut_pos = user_indices.len().saturating_sub(n);
+                let keep_len = user_indices[cut_pos];
+                let rewound_turns = user_indices.len() - cut_pos;
+                self.messages.truncate(keep_len);
+                self.pending.clear();
+                self.deferred_calls.clear();
+                self.record
+                    .append("session.rewound", json!({"turns": rewound_turns}))
+                    .map_err(|e| e.to_string())?;
+                self.record
+                    .append("messages.checkpoint", json!({"messages": self.messages}))
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({
+                    "rewound_turns": rewound_turns,
+                    "messages": self.messages,
+                    "context_bytes": self.context.used_bytes(&self.messages),
+                    "context_max": self.context.max_bytes(),
+                }))
+            }
+
+            "mcp.list" => Ok(self.tools.list_mcp()),
 
             "mode.set" => {
                 let next = params
@@ -569,7 +668,22 @@ impl<'a> Daemon<'a> {
                     return Err("pending tool approval must be resolved first; explicitly /approve ID or /deny ID".into());
                 }
 
-                let user_msg = json!({"role": "user", "content": input});
+                let images = params
+                    .get("images")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let user_msg = if images.is_empty() {
+                    json!({"role": "user", "content": input})
+                } else {
+                    let mut parts = vec![json!({"type": "text", "text": input})];
+                    for img in images {
+                        if let Some(url) = img["url"].as_str() {
+                            parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
+                        }
+                    }
+                    json!({"role": "user", "content": parts})
+                };
                 self.messages.push(user_msg.clone());
                 self.context.sync_constraints(&mut self.messages);
                 self.record
@@ -620,6 +734,7 @@ impl<'a> Daemon<'a> {
                     let result = {
                         let audit = &mut self.audit;
                         let pending = &mut self.pending;
+                        let todos = &mut self.todos;
                         let mut sink = |call: &ToolCall, out: &str| {
                             audit.push(json!({"id": call.id, "args": call.args, "bytes": out.len()}));
                         };
@@ -629,6 +744,11 @@ impl<'a> Daemon<'a> {
                             }
                             if ev["ev"] == "approval.resolved" {
                                 pending.retain(|p| p["id"] != ev["id"]);
+                            }
+                            if ev["ev"] == "todo.updated" {
+                                if let Some(items) = ev["items"].as_array() {
+                                    *todos = items.clone();
+                                }
                             }
                             emit(ev);
                         };
@@ -767,6 +887,10 @@ impl<'a> Daemon<'a> {
                     .get("allow")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let remember = params
+                    .get("remember")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let at = self
                     .pending
                     .iter()
@@ -817,10 +941,21 @@ impl<'a> Daemon<'a> {
                 // the command never started, so execute once on allow or record denial.
                 let name = pending["name"].as_str().unwrap_or("bash").to_owned();
                 let args = pending["args"].clone();
+                if allow && remember && name == "bash" {
+                    let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                    let pattern = self.policy.allow_for_session(cmd);
+                    self.record
+                        .append("policy.allowed", json!({"pattern": pattern}))
+                        .map_err(|e| e.to_string())?;
+                    emit(json!({"ev": "policy.allowed", "pattern": pattern}));
+                }
                 self.record
-                    .append("approval.resolved", json!({"id": id, "allow": allow}))
+                    .append(
+                        "approval.resolved",
+                        json!({"id": id, "allow": allow, "remember": remember}),
+                    )
                     .map_err(|e| e.to_string())?;
-                emit(json!({"ev": "approval.resolved", "id": id, "allow": allow}));
+                emit(json!({"ev": "approval.resolved", "id": id, "allow": allow, "remember": remember}));
 
                 let output = if !allow {
                     self.record
@@ -1001,9 +1136,10 @@ impl<'a> Daemon<'a> {
                             "approval.resolve"
                                 if control.waiting().as_deref() == params["id"].as_str() =>
                             {
-                                control.resolve(
+                                control.resolve_with_scope(
                                     params["id"].as_str().unwrap_or("").into(),
                                     params["allow"].as_bool().unwrap_or(false),
+                                    params["remember"].as_bool().unwrap_or(false),
                                 );
                                 Some(Ok(json!({"queued": true})))
                             }
@@ -1262,5 +1398,35 @@ mod tests {
             .unwrap();
         assert_eq!(off["plan"], false);
         assert_eq!(off["read_only"], true);
+
+        // Effort, fork, rewind, and session policy allow work end-to-end.
+        let eff = resumed
+            .dispatch("effort.set", &json!({"effort": "high"}), &mut |_| {})
+            .unwrap();
+        assert_eq!(eff["effort"], "high");
+
+        let pat = resumed.policy.allow_for_session("git reset --hard HEAD");
+        assert_eq!(pat, "git reset --hard *");
+        assert_eq!(
+            resumed.policy.classify("git reset --hard origin/main"),
+            Tier::Audit
+        );
+
+        resumed.messages.push(json!({"role": "user", "content": "one"}));
+        resumed.messages.push(json!({"role": "assistant", "content": "a1"}));
+        resumed.messages.push(json!({"role": "user", "content": "two"}));
+        resumed.messages.push(json!({"role": "assistant", "content": "a2"}));
+
+        let forked = resumed
+            .dispatch("session.fork", &json!({}), &mut |_| {})
+            .unwrap();
+        let fork_sid = forked["sid"].as_str().unwrap();
+        assert!(Record::verify_chain(&runs.join(format!("{fork_sid}.jsonl"))).is_ok());
+
+        let rewound = resumed
+            .dispatch("session.rewind", &json!({"turns": 1}), &mut |_| {})
+            .unwrap();
+        assert_eq!(rewound["rewound_turns"], 1);
+        assert_eq!(resumed.messages.len(), 2);
     }
 }

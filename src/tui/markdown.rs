@@ -87,6 +87,8 @@ pub fn tool_glyph(name: &str) -> &'static str {
         "grep" => "⌕",
         "glob" => "◌",
         "diff" => "±",
+        "todo" => "☑",
+        "mcp" => "⌘",
         "skill" => "✦",
         "subagent" => "◈",
         "papercut" => "⚑",
@@ -973,9 +975,11 @@ pub struct FooterView<'a> {
     pub repo_label: &'a str,
     pub git_branch: Option<&'a str>,
     pub model: &'a str,
+    pub effort: Option<&'a str>,
     pub title: Option<&'a str>,
     pub sid: &'a str,
     pub plan_mode: bool,
+    pub pending_images: usize,
     pub context_pct: Option<usize>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -1004,6 +1008,30 @@ pub fn fmt_tokens_compact(n: u64) -> String {
     } else {
         format!("{:.2}M tok", n as f64 / 1_000_000.0)
     }
+}
+
+pub fn format_status_notice(view: &FooterView<'_>, turns_used: u64, ctx_bytes: usize, ctx_max: usize) -> String {
+    let ctx_pct = view
+        .context_pct
+        .map(|p| format!("{p}%"))
+        .unwrap_or_else(|| "—".into());
+    let total_tok = view.input_tokens + view.output_tokens;
+    let cache_pct = (view.cached_tokens * 100)
+        .checked_div(view.input_tokens)
+        .map(|p| format!(" · cache {p}%"))
+        .unwrap_or_default();
+    let title = view
+        .title
+        .map(|t| format!(" · title:{t}"))
+        .unwrap_or_default();
+    let effort = view.effort.unwrap_or("off");
+    let mode = if view.plan_mode { "plan (RO)" } else { "edit" };
+    format!(
+        "sid:{} · model:{} · effort:{effort} · mode:{mode} · turns:{turns_used} · ctx:{ctx_pct} ({ctx_bytes}/{ctx_max}B) · {}{cache_pct}{title}",
+        if view.sid.is_empty() { "—" } else { view.sid },
+        view.model,
+        fmt_tokens_compact(total_tok)
+    )
 }
 
 /// Borderless Codex/Claude footer with live model, plan-mode badge, context %, tokens, and cache %.
@@ -1058,10 +1086,26 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
             format!(" · {}", view.model),
             Style::default().fg(ACCENT_PEAK),
         ));
+        if let Some(effort) = view.effort {
+            spans.push(Span::styled(
+                format!(" {effort}"),
+                Style::default().fg(if matches!(effort, "high" | "xhigh") {
+                    AMBER
+                } else {
+                    STONE
+                }),
+            ));
+        }
         if view.plan_mode {
             spans.push(Span::styled(
                 " · ◈ plan",
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if view.pending_images > 0 {
+            spans.push(Span::styled(
+                format!(" · 📎 {} img", view.pending_images),
+                Style::default().fg(ACCENT),
             ));
         }
         if let Some(title) = view.title {
