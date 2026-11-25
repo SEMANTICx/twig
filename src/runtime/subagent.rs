@@ -86,10 +86,18 @@ impl SubagentPool {
                 "subagent concurrency must be positive",
             ));
         }
+        #[cfg(target_os = "linux")]
         if !config.bwrap.is_absolute() || !config.twig.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "twig and bwrap paths must be absolute",
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !config.twig.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "twig path must be absolute",
             ));
         }
         Ok(Self {
@@ -228,84 +236,99 @@ impl SubagentPool {
     ) -> io::Result<SubagentResult> {
         let host_worktree = worktree.canonicalize()?;
         let host_runs = run_dir.canonicalize()?;
-        let mut command = Command::new(&self.config.bwrap);
-        command.args([
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-pid",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind",
-            "/bin",
-            "/bin",
-            "--ro-bind",
-            "/lib",
-            "/lib",
-        ]);
-        for lib in ["/lib64", "/usr/lib"] {
-            if Path::new(lib).exists() {
-                command.args(["--ro-bind", lib, lib]);
+        #[cfg(target_os = "linux")]
+        let mut command = {
+            let mut command = Command::new(&self.config.bwrap);
+            command.args([
+                "--die-with-parent",
+                "--new-session",
+                "--unshare-pid",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind",
+                "/bin",
+                "/bin",
+                "--ro-bind",
+                "/lib",
+                "/lib",
+            ]);
+            for lib in ["/lib64", "/usr/lib"] {
+                if Path::new(lib).exists() {
+                    command.args(["--ro-bind", lib, lib]);
+                }
             }
-        }
-        command.args([
-            "--dir",
-            "/etc",
-            "--dir",
-            "/tool",
-            "--dir",
-            "/workspace",
-            "--dir",
-            "/runs",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--tmpfs",
-            "/tmp",
-        ]);
-        command
-            .args(["--ro-bind"])
-            .arg(&self.config.twig)
-            .arg("/tool/twig");
-        for path in ["/etc/ssl", "/etc/resolv.conf"] {
-            if Path::new(path).exists() {
-                command.args(["--ro-bind", path, path]);
-            }
-        }
-        let mount_flag = if role.read_only() {
-            "--ro-bind"
-        } else {
-            "--bind"
-        };
-        command
-            .args([mount_flag])
-            .arg(&host_worktree)
-            .arg("/workspace");
-        command.args(["--bind"]).arg(&host_runs).arg("/runs");
-        if role.read_only() && host_runs.join("review.diff").exists() {
-            command
-                .arg("--ro-bind")
-                .arg(host_runs.join("review.diff"))
-                .arg("/runs/review.diff");
-        }
-        if !self.config.network {
-            command.arg("--unshare-net");
-        }
-        command
-            .args([
-                "--chdir",
+            command.args([
+                "--dir",
+                "/etc",
+                "--dir",
+                "/tool",
+                "--dir",
                 "/workspace",
-                "--",
-                "/tool/twig",
-                "serve",
-                "/workspace",
+                "--dir",
                 "/runs",
-            ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", "/tmp")
-            .env("TWIG_SUBAGENT", "1");
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+            ]);
+            command
+                .args(["--ro-bind"])
+                .arg(&self.config.twig)
+                .arg("/tool/twig");
+            for path in ["/etc/ssl", "/etc/resolv.conf"] {
+                if Path::new(path).exists() {
+                    command.args(["--ro-bind", path, path]);
+                }
+            }
+            let mount_flag = if role.read_only() {
+                "--ro-bind"
+            } else {
+                "--bind"
+            };
+            command
+                .args([mount_flag])
+                .arg(&host_worktree)
+                .arg("/workspace");
+            command.args(["--bind"]).arg(&host_runs).arg("/runs");
+            if role.read_only() && host_runs.join("review.diff").exists() {
+                command
+                    .arg("--ro-bind")
+                    .arg(host_runs.join("review.diff"))
+                    .arg("/runs/review.diff");
+            }
+            if !self.config.network {
+                command.arg("--unshare-net");
+            }
+            command
+                .args([
+                    "--chdir",
+                    "/workspace",
+                    "--",
+                    "/tool/twig",
+                    "serve",
+                    "/workspace",
+                    "/runs",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", "/tmp")
+                .env("TWIG_SUBAGENT", "1");
+            command
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mut command = {
+            let mut command = Command::new(&self.config.twig);
+            command
+                .arg("serve")
+                .arg(&host_worktree)
+                .arg(&host_runs)
+                .current_dir(&host_worktree)
+                .env("TWIG_SUBAGENT", "1");
+            command
+        };
         for key in [
             "TWIG_MODEL",
             "TWIG_ROLES",
@@ -333,10 +356,25 @@ impl SubagentPool {
                 command.env("TWIG_EFFORT", saved);
             }
         }
-        let request = format!(
+        let mut request = String::new();
+        if role.read_only() {
+            request.push_str(&format!(
+                "{}\n",
+                json!({"id":0,"method":"mode.set","params":{"plan":true}})
+            ));
+        }
+        let effective_task = if cfg!(target_os = "linux") {
+            task.to_owned()
+        } else {
+            task.replace(
+                "/runs/review.diff",
+                &host_runs.join("review.diff").display().to_string(),
+            )
+        };
+        request.push_str(&format!(
             "{}\n",
-            json!({"id":1,"method":"turn","params":{"input":task,"role":role.as_str()}})
-        );
+            json!({"id":1,"method":"turn","params":{"input":effective_task,"role":role.as_str()}})
+        ));
         let capture = run_process(
             &mut command,
             request.as_bytes(),

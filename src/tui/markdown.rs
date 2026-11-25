@@ -317,7 +317,8 @@ impl DiffGutterState {
                 .collect();
         };
 
-        let prefix_w = if gutter_num.is_some() { 7 } else { 2 };
+        let show_gutter = gutter_num.is_some() && max_width >= 44;
+        let prefix_w = if show_gutter { 7 } else { 2 };
         let content_w = max_width.saturating_sub(prefix_w).max(8);
         let sign_ch = sign.unwrap_or(' ');
         let gutter_bg = line_style.bg.unwrap_or(Color::Reset);
@@ -328,13 +329,15 @@ impl DiffGutterState {
             .enumerate()
             .map(|(idx, segment)| {
                 let mut spans = Vec::with_capacity(3);
-                if let Some(n) = gutter_num {
-                    let num_str = if idx == 0 {
-                        format!("{n:>4} ")
-                    } else {
-                        "     ".to_owned()
-                    };
-                    spans.push(Span::styled(num_str, gutter_style));
+                if show_gutter {
+                    if let Some(n) = gutter_num {
+                        let num_str = if idx == 0 {
+                            format!("{n:>4} ")
+                        } else {
+                            "     ".to_owned()
+                        };
+                        spans.push(Span::styled(num_str, gutter_style));
+                    }
                 }
                 spans.push(Span::styled(
                     if idx == 0 {
@@ -872,14 +875,28 @@ impl SmoothScroll {
     }
 }
 
-/// Minimal borderless warm-terracotta welcome header — zero duplication with
-/// composer prefixes or footer status; displays repo path + loaded harness environment.
-pub fn render_welcome_card(repo_path: &str, env_summary: &str) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
+/// Left-truncate a long path keeping the tail (`…/parent/repo`) for narrow/phone screens.
+fn clip_path_tail(path: &str, max_chars: usize) -> String {
+    let limit = max_chars.max(10);
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= limit {
+        return path.to_owned();
+    }
+    let tail: String = chars[chars.len() - (limit - 1)..].iter().collect();
+    format!("…{tail}")
+}
+
+/// Responsive borderless warm-terracotta welcome header adapting from phone (32+ cols)
+/// to ultrawide desktop; zero duplication with composer prefixes or footer status.
+pub fn render_welcome_card(repo_path: &str, env_summary: &str, width: usize) -> Vec<Line<'static>> {
+    let compact = width < 56;
+    let indent = if compact { " " } else { "  " };
+    let sub_indent = if compact { "  " } else { "    " };
+    let mut lines = vec![Line::from("")];
+    if compact {
+        lines.push(Line::from(vec![
             Span::styled(
-                "  ✻ ",
+                format!("{indent}✻ "),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -887,24 +904,72 @@ pub fn render_welcome_card(repo_path: &str, env_summary: &str) -> Vec<Line<'stat
                 Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {}  ", env!("CARGO_PKG_VERSION")),
+                format!(" {}", env!("CARGO_PKG_VERSION")),
                 Style::default().fg(MUTED),
             ),
-            Span::styled(repo_path.to_owned(), Style::default().fg(STONE)),
-        ]),
-    ];
-    if !env_summary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(env_summary.to_owned(), Style::default().fg(MUTED)),
         ]));
+        let path_w = width.saturating_sub(sub_indent.len() + 1);
+        lines.push(Line::from(vec![
+            Span::raw(sub_indent),
+            Span::styled(clip_path_tail(repo_path, path_w), Style::default().fg(STONE)),
+        ]));
+    } else {
+        let ver = format!(" {}  ", env!("CARGO_PKG_VERSION"));
+        let path_w = width.saturating_sub(indent.len() + 6 + ver.len() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{indent}✻ "),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "twig",
+                Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(ver, Style::default().fg(MUTED)),
+            Span::styled(clip_path_tail(repo_path, path_w), Style::default().fg(STONE)),
+        ]));
+    }
+    if !env_summary.is_empty() {
+        let wrap_w = width.saturating_sub(sub_indent.len() + 1).max(16);
+        for seg in wrap_plain(env_summary, wrap_w) {
+            lines.push(Line::from(vec![
+                Span::raw(sub_indent),
+                Span::styled(seg, Style::default().fg(MUTED)),
+            ]));
+        }
     }
     lines.push(Line::from(""));
     lines
 }
 
-/// 2-column Codex-style shortcut reference rows for the `?` footer overlay.
-pub fn shortcut_overlay_lines() -> Vec<Line<'static>> {
+/// Responsive shortcut reference rows for the `?` footer overlay (2-col desktop, 1-col phone).
+pub fn shortcut_overlay_lines(width: usize) -> Vec<Line<'static>> {
+    if width < 76 {
+        let rows = [
+            ("Enter · S-Tab", "send/steer · plan"),
+            ("! @ $ /", "shell·file·skill·cmd"),
+            ("^R · ^F · ^O", "hist · find · tools"),
+            ("^G · Alt+Y/V", "editor · copy · img"),
+            ("Esc×2 · ^C", "rewind/clear · quit"),
+        ];
+        let w = width.saturating_sub(2).max(16);
+        return rows
+            .into_iter()
+            .map(|(k, d)| {
+                let k_w = k.chars().count();
+                let rem = w.saturating_sub(k_w + 2);
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {k} "),
+                        Style::default()
+                            .fg(ACCENT_PEAK)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(clip_str(d, rem), Style::default().fg(STONE)),
+                ])
+            })
+            .collect();
+    }
     let row = |k1: &str, d1: &str, k2: &str, d2: &str| -> Line<'static> {
         Line::from(vec![
             Span::styled(
@@ -1031,11 +1096,14 @@ pub fn format_status_notice(view: &FooterView<'_>, turns_used: u64, ctx_bytes: u
     )
 }
 
-/// Borderless Codex/Claude footer with live model, plan-mode badge, context %, tokens, and cache %.
+/// Borderless responsive footer adapting from phone (32+ cols) to ultrawide desktop.
 pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
     match view.mode {
         FooterMode::ShortcutOverlay => {
-            frame.render_widget(Paragraph::new(shortcut_overlay_lines()), area);
+            frame.render_widget(
+                Paragraph::new(shortcut_overlay_lines(area.width as usize)),
+                area,
+            );
             return;
         }
         FooterMode::QuitReminder => {
@@ -1071,69 +1139,106 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
         FooterMode::Contextual => {}
     }
 
+    let width = area.width as usize;
+    let compact = width < 58;
+    let narrow = width < 88;
+
     let left: Line<'static> = if let Some(msg) = view.flash {
-        Line::from(Span::styled(format!("  {msg}"), Style::default().fg(AMBER)))
+        Line::from(Span::styled(
+            format!("{}{}", if compact { " " } else { "  " }, msg),
+            Style::default().fg(AMBER),
+        ))
     } else {
         let mut spans = vec![
             Span::styled(
-                "  ✻ ",
+                if compact { " ✻ " } else { "  ✻ " },
                 Style::default()
                     .fg(if view.plan_mode { AMBER } else { ACCENT })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(view.repo_label.to_owned(), Style::default().fg(STONE)),
+            Span::styled(
+                if compact {
+                    clip_str(view.repo_label, 12)
+                } else {
+                    view.repo_label.to_owned()
+                },
+                Style::default().fg(STONE),
+            ),
         ];
-        if let Some(branch) = view.git_branch {
-            spans.push(Span::styled(
-                format!(" ({branch})"),
-                Style::default().fg(MUTED),
-            ));
-        }
-        if let Some((ins, del)) = view.git_stat {
-            if ins > 0 {
-                spans.push(Span::styled(format!(" +{ins}"), Style::default().fg(SAGE)));
+        if !compact {
+            if let Some(branch) = view.git_branch {
+                spans.push(Span::styled(
+                    format!(" ({branch})"),
+                    Style::default().fg(MUTED),
+                ));
             }
-            if del > 0 {
-                spans.push(Span::styled(format!(" -{del}"), Style::default().fg(ROSE)));
+            if !narrow {
+                if let Some((ins, del)) = view.git_stat {
+                    if ins > 0 {
+                        spans.push(Span::styled(format!(" +{ins}"), Style::default().fg(SAGE)));
+                    }
+                    if del > 0 {
+                        spans.push(Span::styled(format!(" -{del}"), Style::default().fg(ROSE)));
+                    }
+                }
             }
         }
         spans.push(Span::styled(
-            format!(" · {}", view.model),
+            format!(
+                " · {}",
+                if compact {
+                    clip_str(view.model, 14)
+                } else {
+                    view.model.to_owned()
+                }
+            ),
             Style::default().fg(ACCENT_PEAK),
         ));
-        if let Some(effort) = view.effort {
-            spans.push(Span::styled(
-                format!(" {effort}"),
-                Style::default().fg(if matches!(effort, "high" | "xhigh") {
-                    AMBER
-                } else {
-                    STONE
-                }),
-            ));
+        if !compact {
+            if let Some(effort) = view.effort {
+                spans.push(Span::styled(
+                    format!(" {effort}"),
+                    Style::default().fg(if matches!(effort, "high" | "xhigh") {
+                        AMBER
+                    } else {
+                        STONE
+                    }),
+                ));
+            }
         }
         if view.plan_mode {
             spans.push(Span::styled(
-                " · ◈ plan",
+                if compact { " · ◈" } else { " · ◈ plan" },
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
             ));
         }
         if view.running_tasks > 0 {
             spans.push(Span::styled(
-                format!(" · ⚙ {} task{}", view.running_tasks, if view.running_tasks == 1 { "" } else { "s" }),
+                if compact {
+                    format!(" · ⚙{}", view.running_tasks)
+                } else {
+                    format!(
+                        " · ⚙ {} task{}",
+                        view.running_tasks,
+                        if view.running_tasks == 1 { "" } else { "s" }
+                    )
+                },
                 Style::default().fg(AMBER),
             ));
         }
         if view.pending_images > 0 {
             spans.push(Span::styled(
-                format!(" · 📎 {} img", view.pending_images),
+                format!(" · 📎 {}", view.pending_images),
                 Style::default().fg(ACCENT),
             ));
         }
-        if let Some(title) = view.title {
-            spans.push(Span::styled(
-                format!(" · {}", clip_str(title, 20)),
-                Style::default().fg(IVORY),
-            ));
+        if !compact {
+            if let Some(title) = view.title {
+                spans.push(Span::styled(
+                    format!(" · {}", clip_str(title, 20)),
+                    Style::default().fg(IVORY),
+                ));
+            }
         }
         if let Some(pct) = view.context_pct.filter(|&p| p > 0) {
             let color = if pct >= 85 {
@@ -1144,30 +1249,36 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
                 MUTED
             };
             spans.push(Span::styled(
-                format!(" · ctx {pct}%"),
+                if compact {
+                    format!(" · {pct}%")
+                } else {
+                    format!(" · ctx {pct}%")
+                },
                 Style::default().fg(color),
             ));
         }
-        let total_tok = view.input_tokens + view.output_tokens;
-        if total_tok > 0 {
-            spans.push(Span::styled(
-                format!(" · {}", fmt_tokens_compact(total_tok)),
-                Style::default().fg(MUTED),
-            ));
-            if view.cached_tokens > 0 {
-                if let Some(hit) = (view.cached_tokens * 100).checked_div(view.input_tokens) {
-                    spans.push(Span::styled(
-                        format!(" · cache {hit}%"),
-                        Style::default().fg(SAGE),
-                    ));
+        if !narrow {
+            let total_tok = view.input_tokens + view.output_tokens;
+            if total_tok > 0 {
+                spans.push(Span::styled(
+                    format!(" · {}", fmt_tokens_compact(total_tok)),
+                    Style::default().fg(MUTED),
+                ));
+                if view.cached_tokens > 0 {
+                    if let Some(hit) = (view.cached_tokens * 100).checked_div(view.input_tokens) {
+                        spans.push(Span::styled(
+                            format!(" · cache {hit}%"),
+                            Style::default().fg(SAGE),
+                        ));
+                    }
                 }
             }
-        }
-        if let Some(book) = view.playbook {
-            spans.push(Span::styled(
-                format!(" · ✦ {book}"),
-                Style::default().fg(AMBER),
-            ));
+            if let Some(book) = view.playbook {
+                spans.push(Span::styled(
+                    format!(" · ✦ {book}"),
+                    Style::default().fg(AMBER),
+                ));
+            }
         }
         if let Some(level) = view.guard_level {
             spans.push(Span::styled(
@@ -1175,20 +1286,29 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
                 Style::default().fg(ROSE),
             ));
         }
-        if !view.mouse_enabled {
+        if !view.mouse_enabled && !compact {
             spans.push(Span::styled(" · select", Style::default().fg(AMBER)));
         }
         Line::from(spans)
     };
 
-    let right_w = (display_width(view.right_hint) as u16).min(area.width / 2);
+    if compact {
+        frame.render_widget(Paragraph::new(left), area);
+        return;
+    }
+    let hint = if narrow {
+        "? help · ^R hist "
+    } else {
+        view.right_hint
+    };
+    let right_w = (display_width(hint) as u16).min(area.width / 2);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(10), Constraint::Length(right_w)])
         .split(area);
     frame.render_widget(Paragraph::new(left), cols[0]);
     frame.render_widget(
-        Paragraph::new(Span::styled(view.right_hint.to_owned(), Style::default().fg(MUTED))),
+        Paragraph::new(Span::styled(hint.to_owned(), Style::default().fg(MUTED))),
         cols[1],
     );
 }

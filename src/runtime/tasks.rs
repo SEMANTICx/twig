@@ -6,10 +6,12 @@
 //! process groups on `cancel` or `Drop`.
 
 use std::io::Read;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -17,12 +19,32 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::control::Control;
-use crate::exec::isolation;
+use crate::exec::{isolation, kill_tree, shell_command};
 
 const MAX_TASK_BUFFER_BYTES: usize = 64 * 1024;
 const STATUS_TAIL_BYTES: usize = 4 * 1024;
 const MAX_WAIT_SECS: u64 = 300;
 const MAX_CONCURRENT_TASKS: usize = 8;
+
+fn append_task_chunk(shared_bg: &Arc<(Mutex<TaskState>, Condvar)>, chunk: &[u8]) {
+    if let Ok(mut s) = shared_bg.0.lock() {
+        let n = chunk.len();
+        if s.output.len() + n <= MAX_TASK_BUFFER_BYTES {
+            s.output.extend_from_slice(chunk);
+        } else {
+            s.truncated = true;
+            if n >= MAX_TASK_BUFFER_BYTES {
+                s.output.clear();
+                s.output
+                    .extend_from_slice(&chunk[n - MAX_TASK_BUFFER_BYTES..n]);
+            } else {
+                let drop_n = (s.output.len() + n) - MAX_TASK_BUFFER_BYTES;
+                s.output.drain(..drop_n);
+                s.output.extend_from_slice(chunk);
+            }
+        }
+    }
+}
 
 struct TaskState {
     output: Vec<u8>,
@@ -66,9 +88,7 @@ impl ManagedTask {
             })
             .unwrap_or(true);
         if !already_done {
-            unsafe {
-                libc::kill(-(self.pid as i32), libc::SIGKILL);
-            }
+            kill_tree(self.pid);
         }
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
@@ -164,27 +184,6 @@ impl TaskManager {
         };
         let effective = isolated.as_deref().unwrap_or(trimmed);
 
-        let (mut reader, writer) = UnixStream::pair().map_err(|e| format!("pipe: {e}"))?;
-        let out_fd: OwnedFd = writer
-            .try_clone()
-            .map_err(|e| format!("dup stdout: {e}"))?
-            .into();
-        let err_fd: OwnedFd = writer.into();
-
-        let mut child = Command::new("sh")
-            .args(["-c", effective])
-            .current_dir(&self.worktree)
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(out_fd))
-            .stderr(Stdio::from(err_fd))
-            .spawn()
-            .map_err(|e| format!("spawn task: {e}"))?;
-
-        let pid = child.id();
-        self.next_id += 1;
-        let id = format!("bg-{}", self.next_id);
-        let started = Instant::now();
         let shared = Arc::new((
             Mutex::new(TaskState {
                 output: Vec::new(),
@@ -196,43 +195,99 @@ impl TaskManager {
             }),
             Condvar::new(),
         ));
+        let started = Instant::now();
 
-        let shared_bg = Arc::clone(&shared);
-        let worker = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(mut s) = shared_bg.0.lock() {
-                            if s.output.len() + n <= MAX_TASK_BUFFER_BYTES {
-                                s.output.extend_from_slice(&buf[..n]);
-                            } else {
-                                s.truncated = true;
-                                if n >= MAX_TASK_BUFFER_BYTES {
-                                    s.output.clear();
-                                    s.output
-                                        .extend_from_slice(&buf[n - MAX_TASK_BUFFER_BYTES..n]);
-                                } else {
-                                    let drop_n = (s.output.len() + n) - MAX_TASK_BUFFER_BYTES;
-                                    s.output.drain(..drop_n);
-                                    s.output.extend_from_slice(&buf[..n]);
-                                }
-                            }
-                        }
+        #[cfg(unix)]
+        let (pid, worker) = {
+            let (mut reader, writer) = UnixStream::pair().map_err(|e| format!("pipe: {e}"))?;
+            let out_fd: OwnedFd = writer
+                .try_clone()
+                .map_err(|e| format!("dup stdout: {e}"))?
+                .into();
+            let err_fd: OwnedFd = writer.into();
+            let mut cmd = shell_command(effective);
+            let mut child = cmd
+                .current_dir(&self.worktree)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(out_fd))
+                .stderr(Stdio::from(err_fd))
+                .spawn()
+                .map_err(|e| format!("spawn task: {e}"))?;
+            let pid = child.id();
+            let shared_bg = Arc::clone(&shared);
+            let worker = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => append_task_chunk(&shared_bg, &buf[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
                 }
-            }
-            let exit_code = child.wait().ok().and_then(|st| st.code());
-            if let Ok(mut s) = shared_bg.0.lock() {
-                s.exit_code = exit_code;
-                s.finished = true;
-                s.elapsed_secs = started.elapsed().as_secs();
-                shared_bg.1.notify_all();
-            }
-        });
+                let exit_code = child.wait().ok().and_then(|st| st.code());
+                if let Ok(mut s) = shared_bg.0.lock() {
+                    s.exit_code = exit_code;
+                    s.finished = true;
+                    s.elapsed_secs = started.elapsed().as_secs();
+                    shared_bg.1.notify_all();
+                }
+            });
+            (pid, worker)
+        };
+
+        #[cfg(not(unix))]
+        let (pid, worker) = {
+            let mut cmd = shell_command(effective);
+            let mut child = cmd
+                .current_dir(&self.worktree)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("spawn task: {e}"))?;
+            let pid = child.id();
+            let out_pipe = child.stdout.take();
+            let err_pipe = child.stderr.take();
+            let shared_bg = Arc::clone(&shared);
+            let worker = std::thread::spawn(move || {
+                let mut readers = Vec::new();
+                for pipe in [
+                    out_pipe.map(|s| Box::new(s) as Box<dyn Read + Send>),
+                    err_pipe.map(|s| Box::new(s) as Box<dyn Read + Send>),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let sb = Arc::clone(&shared_bg);
+                    readers.push(std::thread::spawn(move || {
+                        let mut r = pipe;
+                        let mut buf = [0u8; 4096];
+                        while let Ok(n) = r.read(&mut buf) {
+                            if n == 0 {
+                                break;
+                            }
+                            append_task_chunk(&sb, &buf[..n]);
+                        }
+                    }));
+                }
+                for h in readers {
+                    let _ = h.join();
+                }
+                let exit_code = child.wait().ok().and_then(|st| st.code());
+                if let Ok(mut s) = shared_bg.0.lock() {
+                    s.exit_code = exit_code;
+                    s.finished = true;
+                    s.elapsed_secs = started.elapsed().as_secs();
+                    shared_bg.1.notify_all();
+                }
+            });
+            (pid, worker)
+        };
+
+        self.next_id += 1;
+        let id = format!("bg-{}", self.next_id);
 
         let task = ManagedTask {
             id: id.clone(),

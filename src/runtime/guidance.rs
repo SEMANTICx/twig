@@ -548,15 +548,7 @@ impl SkillStore {
             .unwrap_or_else(|| crate::config::paths::config_dir().join("skills"));
         let vault_dir = std::env::var_os("TWIG_SKILLS_VAULT")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(std::env::temp_dir);
-                std::env::var_os("XDG_DATA_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"))
-                    .join("twig-skills-vault")
-            });
+            .unwrap_or_else(|| crate::config::paths::data_dir().join("twig-skills-vault"));
         let project_dir = repo.map(|r| r.join(".twig/skills"));
         Self {
             project_dir,
@@ -804,9 +796,17 @@ impl SkillStore {
             if dst.exists() || dst.symlink_metadata().is_ok() {
                 return Err(format!("global skill {name:?} is already enabled"));
             }
-            std::os::unix::fs::symlink(&src, &dst)
-                .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
-            Ok(format!("enabled {name} globally ({} -> {})", dst.display(), src.display()))
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&src, &dst)
+                    .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
+                Ok(format!("enabled {name} globally ({} -> {})", dst.display(), src.display()))
+            }
+            #[cfg(not(unix))]
+            {
+                copy_dir_recursive(&src, &dst).map_err(|e| format!("copy skill: {e}"))?;
+                Ok(format!("enabled {name} globally ({})", dst.display()))
+            }
         }
     }
 

@@ -6,7 +6,9 @@
 pub mod isolation;
 
 use std::io::{self, ErrorKind, Read, Write};
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -22,25 +24,57 @@ const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Build a platform-native shell `Command` (`sh -c` on Unix, `cmd /C` on Windows).
+pub fn shell_command(command: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", command]);
+        cmd
+    }
+}
+
+#[cfg(unix)]
 fn kill_group(id: u32) {
     unsafe {
         libc::kill(-(id as i32), libc::SIGKILL);
     }
 }
 
+#[cfg(windows)]
+fn kill_group(id: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub fn kill_tree(pid: u32) {
-    let children =
-        std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
-    for child in children
-        .split_whitespace()
-        .filter_map(|s| s.parse::<u32>().ok())
+    #[cfg(target_os = "linux")]
     {
-        kill_tree(child);
+        let children =
+            std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap_or_default();
+        for child in children
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+        {
+            kill_tree(child);
+        }
     }
     kill_group(pid);
 }
 
-fn status_without_reaping(pid: u32) -> io::Result<Option<i32>> {
+#[cfg(target_os = "linux")]
+fn status_without_reaping(child: &mut Child) -> io::Result<Option<i32>> {
+    let pid = child.id();
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // WNOWAIT leaves the leader waitable so its numeric PID cannot be recycled
     // while session-owned background children still need cleanup.
@@ -66,8 +100,14 @@ fn status_without_reaping(pid: u32) -> io::Result<Option<i32>> {
     }))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn status_without_reaping(child: &mut Child) -> io::Result<Option<i32>> {
+    Ok(child.try_wait()?.map(|st| st.code().unwrap_or(1)))
+}
+
 pub struct Owner {
     child: Child,
+    #[cfg(unix)]
     capture: Option<UnixStream>,
     stop: Arc<AtomicBool>,
     drain: Option<std::thread::JoinHandle<()>>,
@@ -76,6 +116,7 @@ pub struct Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         kill_group(self.child.id());
+        let _ = self.child.kill();
         let _ = self.child.wait();
         self.stop.store(true, Ordering::Relaxed);
         if let Some(drain) = self.drain.take() {
@@ -91,10 +132,35 @@ pub struct Output {
     pub owner: Owner,
 }
 
+fn format_live_output(bytes: &[u8], discarded: bool, timed_out: bool, timeout: Duration) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if discarded {
+        text.push_str("\n[capture truncated at 1 MiB]\n");
+    }
+    if timed_out {
+        text = format!(
+            "timeout: killed process group after {}s\n{text}",
+            timeout.as_secs_f64()
+        );
+    }
+    text
+}
+
+fn validate_process_limits(input: &[u8], timeout: Duration, max_output_bytes: usize) -> io::Result<(Duration, usize)> {
+    if input.len() > MAX_INPUT_BYTES {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "process input exceeds 8 MiB",
+        ));
+    }
+    Ok((timeout.min(MAX_TIMEOUT), max_output_bytes.min(MAX_OUTPUT_BYTES)))
+}
+
 pub fn run(cwd: &Path, command: &str, timeout: Duration) -> io::Result<Output> {
     run_live(cwd, command, timeout, &Control::default(), &mut |_| {})
 }
 
+#[cfg(unix)]
 pub fn run_live(
     cwd: &Path,
     command: &str,
@@ -107,8 +173,8 @@ pub fn run_live(
     let capture = reader.try_clone()?;
     let out: OwnedFd = writer.try_clone()?.into();
     let err: OwnedFd = writer.into();
-    let child = Command::new("sh")
-        .args(["-c", command])
+    let mut cmd = shell_command(command);
+    let child = cmd
         .current_dir(cwd)
         .process_group(0)
         .stdin(Stdio::null())
@@ -147,7 +213,7 @@ pub fn run_live(
     };
     let (code, timed_out) = loop {
         drain_once(&mut reader)?;
-        if let Some(code) = status_without_reaping(owner.child.id())? {
+        if let Some(code) = status_without_reaping(&mut owner.child)? {
             break (code, false);
         }
         if control.cancelled() {
@@ -177,16 +243,91 @@ pub fn run_live(
             }
         }
     }));
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if discarded {
-        text.push_str("\n[capture truncated at 1 MiB]\n");
+    let text = format_live_output(&bytes, discarded, timed_out, timeout);
+    Ok(Output {
+        text,
+        exit_code: Some(code),
+        timed_out,
+        owner,
+    })
+}
+
+#[cfg(not(unix))]
+pub fn run_live(
+    cwd: &Path,
+    command: &str,
+    timeout: Duration,
+    control: &Control,
+    emit: &mut dyn FnMut(String),
+) -> io::Result<Output> {
+    let mut cmd = shell_command(command);
+    let mut child = cmd
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    for pipe in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut reader = pipe;
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
     }
-    if timed_out {
-        text = format!(
-            "timeout: killed process group after {}s\n{text}",
-            timeout.as_secs_f64()
-        );
-    }
+    drop(tx);
+    let mut owner = Owner {
+        child,
+        stop: Default::default(),
+        drain: None,
+    };
+    let deadline = Instant::now() + timeout;
+    const CAP: usize = 1_048_576;
+    let mut bytes = Vec::new();
+    let mut discarded = false;
+    let mut drain_rx = |rx: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        while let Ok(chunk) = rx.try_recv() {
+            if bytes.len() < CAP {
+                emit(String::from_utf8_lossy(&chunk).into_owned());
+            }
+            let take = chunk.len().min(CAP.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..take]);
+            discarded |= take < chunk.len();
+        }
+    };
+    let (code, timed_out) = loop {
+        drain_rx(&rx);
+        if let Some(code) = status_without_reaping(&mut owner.child)? {
+            break (code, false);
+        }
+        if control.cancelled() {
+            kill_group(owner.child.id());
+            let _ = owner.child.kill();
+            break (130, false);
+        }
+        if Instant::now() >= deadline {
+            kill_group(owner.child.id());
+            let _ = owner.child.kill();
+            break (124, true);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    drain_rx(&rx);
+    let text = format_live_output(&bytes, discarded, timed_out, timeout);
     Ok(Output {
         text,
         exit_code: Some(code),
@@ -241,6 +382,7 @@ impl Drop for ChildOwner {
     }
 }
 
+#[cfg(unix)]
 fn drain_bounded(
     stream: &mut UnixStream,
     bytes: &mut Vec<u8>,
@@ -265,20 +407,14 @@ fn drain_bounded(
 }
 
 /// Nonblocking bounded stdin/stdout/stderr; terminates all children before reaping.
+#[cfg(unix)]
 pub fn run_process(
     command: &mut Command,
     input: &[u8],
     timeout: Duration,
     max_output_bytes: usize,
 ) -> io::Result<Capture> {
-    if input.len() > MAX_INPUT_BYTES {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            "process input exceeds 8 MiB",
-        ));
-    }
-    let max_output_bytes = max_output_bytes.min(MAX_OUTPUT_BYTES);
-    let timeout = timeout.min(MAX_TIMEOUT);
+    let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
     let (mut stdin, input_child) = UnixStream::pair()?;
     let (mut stdout, out_child) = UnixStream::pair()?;
     let (mut stderr, err_child) = UnixStream::pair()?;
@@ -326,7 +462,7 @@ pub fn run_process(
             max_output_bytes.saturating_sub(capture.stdout.len() + capture.stderr.len());
         capture.truncated |= drain_bounded(&mut stdout, &mut capture.stdout, &mut remaining)?;
         capture.truncated |= drain_bounded(&mut stderr, &mut capture.stderr, &mut remaining)?;
-        if let Some(code) = status_without_reaping(pid)? {
+        if let Some(code) = status_without_reaping(owner.0.as_mut().unwrap())? {
             capture.exit_code = Some(code);
             break;
         }
@@ -347,6 +483,85 @@ pub fn run_process(
     Ok(capture)
 }
 
+#[cfg(not(unix))]
+pub fn run_process(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> io::Result<Capture> {
+    let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        });
+    }
+    let read_capped = |pipe: Option<Box<dyn Read + Send>>, cap: usize| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut trunc = false;
+            if let Some(mut r) = pipe {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = r.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let take = n.min(cap.saturating_sub(out.len()));
+                    out.extend_from_slice(&buf[..take]);
+                    trunc |= take < n;
+                }
+            }
+            (out, trunc)
+        })
+    };
+    let out_h = read_capped(
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        max_output_bytes,
+    );
+    let err_h = read_capped(
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        max_output_bytes,
+    );
+    let mut owner = ChildOwner(Some(child));
+    let pid = owner.0.as_ref().unwrap().id();
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "timeout overflow"))?;
+    let mut exit_code = None;
+    let mut timed_out = false;
+    loop {
+        if let Some(code) = status_without_reaping(owner.0.as_mut().unwrap())? {
+            exit_code = Some(code);
+            break;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    kill_tree(pid);
+    if let Some(mut c) = owner.0.take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    let (stdout, t1) = out_h.join().unwrap_or_default();
+    let (stderr, t2) = err_h.join().unwrap_or_default();
+    Ok(Capture {
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+        truncated: t1 || t2,
+    })
+}
+
 fn floor_char_boundary(s: &str, max: usize) -> usize {
     let mut end = max.min(s.len());
     while !s.is_char_boundary(end) {
@@ -356,10 +571,10 @@ fn floor_char_boundary(s: &str, max: usize) -> usize {
 }
 
 pub fn run_check(cwd: &Path, check: &Check) -> io::Result<CheckResult> {
+    let mut cmd = shell_command(&check.command);
+    cmd.current_dir(cwd);
     let out = run_process(
-        Command::new("sh")
-            .args(["-c", &check.command])
-            .current_dir(cwd),
+        &mut cmd,
         &[],
         Duration::from_millis(check.timeout_ms.max(1)),
         check.max_output_bytes,

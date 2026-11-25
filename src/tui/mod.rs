@@ -1239,14 +1239,16 @@ impl App {
             0
         };
         let search_h: u16 = if search_open { 1 } else { 0 };
+        let max_bottom = area.height.saturating_sub(5).max(3);
         let bottom_panel_h: u16 = if let Some(picker) = &self.overlay_picker {
-            picker.desired_height()
+            picker.desired_height().min(max_bottom)
         } else if has_approval {
-            8
+            (if area.height < 16 { 6 } else { 8 }).min(max_bottom)
         } else {
-            self.composer.desired_height(area.width as usize)
+            let max_c = if area.height < 18 { 5 } else { 8 };
+            self.composer.desired_height(area.width as usize, max_c).min(max_bottom)
         };
-        let footer_h = self.footer_height();
+        let footer_h = self.footer_height().min(area.height.saturating_sub(4).max(1));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1294,10 +1296,12 @@ impl App {
                 self.status_header_started.elapsed(),
                 self.motion,
             ));
-            spans.push(Span::styled(
-                format!("  ({pretty_elapsed} · esc to interrupt · enter to steer)"),
-                Style::default().fg(MUTED),
-            ));
+            let act_hint = if area.width < 58 {
+                format!(" ({pretty_elapsed} · esc)")
+            } else {
+                format!("  ({pretty_elapsed} · esc to interrupt · enter to steer)")
+            };
+            spans.push(Span::styled(act_hint, Style::default().fg(MUTED)));
             frame.render_widget(Paragraph::new(Line::from(spans)), chunks[2]);
         }
 
@@ -1310,21 +1314,18 @@ impl App {
         } else if has_approval {
             self.approvals.render(frame, chunks[4]);
         } else {
+            let narrow_ui = area.width < 58;
             let (rule_color, prompt_color, placeholder) = if self.running {
                 (
                     active_rule_color(run_elapsed, self.motion),
                     AMBER,
-                    "Type steering guidance and press Enter (or Esc to interrupt)…",
+                    if narrow_ui { "Steer (Enter) / Esc…" } else { "Type steering guidance and press Enter (or Esc to interrupt)…" },
                 )
             } else if self.plan_mode {
                 (
                     AMBER,
                     AMBER,
-                    if self.composer.is_empty() {
-                        "Plan mode (read-only) — ask twig to explore or design… (Shift+Tab to exit)"
-                    } else {
-                        ""
-                    },
+                    if !self.composer.is_empty() { "" } else if narrow_ui { "Plan (RO)… (S-Tab)" } else { "Plan mode (read-only) — ask twig to explore or design… (Shift+Tab to exit)" },
                 )
             } else if !self.composer.is_empty() {
                 (HAIRLINE_FOCUS, ACCENT, "")
@@ -1332,7 +1333,7 @@ impl App {
                 (
                     HAIRLINE,
                     ACCENT,
-                    "Ask twig anything… (/ command · @ file · $ skill · ! shell)",
+                    if narrow_ui { "Ask twig… (/ @ $ !)" } else { "Ask twig anything… (/ command · @ file · $ skill · ! shell)" },
                 )
             };
             self.composer.render(
@@ -1897,6 +1898,11 @@ mod tests {
         assert!(welcome.contains("✻ twig") && !welcome.contains("╭─"));
         assert!(welcome.contains("skills 10 (+13 vault)") && welcome.contains("docs AGENTS.md"));
         assert!(!welcome.contains("ctx 0%"));
+        // Responsive rendering across phone (36x16), split pane (60x20), and ultrawide (180x40).
+        let phone = render_frame_text(&mut app, 36, 16);
+        assert!(phone.contains("✻ twig") && phone.contains("Ask twig… (/ @ $ !)"));
+        assert!(render_frame_text(&mut app, 60, 20).contains("✻ twig"));
+        assert!(render_frame_text(&mut app, 180, 40).contains("skills 10 (+13 vault)"));
 
         assert_eq!(
             app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),

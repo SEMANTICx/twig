@@ -773,13 +773,14 @@ impl Composer {
         None
     }
 
-    pub fn desired_height(&self, total_width: usize) -> u16 {
-        let text_w = total_width.saturating_sub(6).max(16);
+    pub fn desired_height(&self, total_width: usize, max_rows: u16) -> u16 {
+        let margin = if total_width < 46 { 3 } else { 6 };
+        let text_w = total_width.saturating_sub(margin).max(12);
         let lines = wrap_plain(&self.text, text_w);
-        (lines.len() as u16 + 2).clamp(3, 8)
+        (lines.len() as u16 + 2).clamp(3, max_rows.max(3))
     }
 
-    /// Claude Code hairline composer with 2-col horizontal breathing margin (`  ❯  `).
+    /// Claude Code hairline composer with responsive horizontal margins (adapts down to phone width).
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -792,6 +793,7 @@ impl Composer {
         if area.height < 3 || area.width < 10 {
             return;
         }
+        let compact = area.width < 46;
         let rule_len = area.width.saturating_sub(2) as usize;
         let rule_line = format!(" {}", "─".repeat(rule_len));
         let rule_style = Style::default().fg(rule_color);
@@ -821,12 +823,20 @@ impl Composer {
             width: area.width,
             height: area.height.saturating_sub(2),
         };
-        let text_w = area.width.saturating_sub(6).max(12) as usize;
+        let (prompt_head, prompt_cont, prompt_cols) = if compact {
+            (" ❯ ", "   ", 3u16)
+        } else {
+            ("  ❯ ", "    ", 4u16)
+        };
+        let text_w = area
+            .width
+            .saturating_sub(prompt_cols + 2)
+            .max(10) as usize;
 
         let rendered_lines: Vec<Line<'static>> = if self.text.is_empty() {
             vec![Line::from(vec![
                 Span::styled(
-                    "  ❯ ",
+                    prompt_head,
                     Style::default()
                         .fg(prompt_color)
                         .add_modifier(Modifier::BOLD),
@@ -838,7 +848,7 @@ impl Composer {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, segment)| {
-                    let prefix = if idx == 0 { "  ❯ " } else { "    " };
+                    let prefix = if idx == 0 { prompt_head } else { prompt_cont };
                     let mut spans = vec![Span::styled(
                         prefix,
                         Style::default()
@@ -871,25 +881,26 @@ impl Composer {
                 .unwrap_or(0);
             if cur_row < body_area.height {
                 frame.set_cursor_position((
-                    body_area.x + 4 + cur_col.min(text_w as u16),
+                    body_area.x + prompt_cols + cur_col.min(text_w as u16),
                     body_area.y + cur_row,
                 ));
             }
         }
     }
 
-    /// Codex-style borderless scrollable command/file popup with full-width accent selection bar.
+    /// Codex-style borderless scrollable command/file/skill popup with full-width accent selection bar.
     pub fn render_popup(&self, frame: &mut Frame, composer_area: Rect, transcript_h: u16) {
         let Some(popup) = self.active_popup() else {
             return;
         };
         let max_rows = (transcript_h.saturating_sub(1) as usize).clamp(1, 8);
-        if composer_area.width < 20 {
+        if composer_area.width < 14 {
             return;
         }
         let popup_w = composer_area.width.saturating_sub(2) as usize;
         let sel_bg = ACCENT;
         let sel_fg = Color::Rgb(22, 19, 17);
+        let cmd_pad = if popup_w < 44 { 10 } else { 14 };
 
         let rows: Vec<Line<'static>> = match popup {
             PopupKind::Slash(items) => {
@@ -903,7 +914,7 @@ impl Composer {
                         let active = start + offset == sel;
                         let bg = if active { sel_bg } else { Color::Reset };
                         let marker = if active { " › " } else { "   " };
-                        let cmd_col = format!("{:<14}", cmd.trim_end());
+                        let cmd_col = format!("{:<width$}", cmd.trim_end(), width = cmd_pad);
                         let used = display_width(marker) + display_width(&cmd_col);
                         let desc_clipped: String = desc
                             .chars()

@@ -18,12 +18,33 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            bin: twig
+            setup_musl: true
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            bin: twig
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin: twig
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin: twig
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin: twig.exe
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install musl tools (Linux static x86_64)
+        if: matrix.setup_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -33,24 +54,40 @@ jobs:
       - name: Cache Cargo registry & build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run offline checks
-        run: |
-          cargo clippy --all-targets -- -D warnings
-          cargo run --quiet -- selfcheck
+      - name: Lint target with clippy
+        run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package tarball & checksum
+      - name: Package Unix tarball & checksum
+        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
           PKG="twig-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${PKG}"
-          cp "target/${{ matrix.target }}/release/twig" "dist/${PKG}/twig"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${PKG}/"
           cp README.md LICENSE "dist/${PKG}/"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-          (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+          fi
+
+      - name: Package Windows zip & checksum
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Tag = $env:GITHUB_REF_NAME
+          $Pkg = "twig-$Tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$Pkg" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$Pkg/"
+          Copy-Item "README.md", "LICENSE" "dist/$Pkg/"
+          Compress-Archive -Path "dist/$Pkg" -DestinationPath "dist/$Pkg.zip" -Force
+          $Hash = (Get-FileHash "dist/$Pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$Hash  $Pkg.zip" | Out-File -Encoding ascii "dist/$Pkg.zip.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -58,6 +95,7 @@ jobs:
           name: twig-${{ matrix.target }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
 
   publish:
@@ -81,4 +119,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
             artifacts/SHA256SUMS.txt

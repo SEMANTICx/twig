@@ -69,7 +69,17 @@ pub fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
                         "snapshot symlink escapes its repository",
                     ));
                 }
+                #[cfg(unix)]
                 std::os::unix::fs::symlink(target, dst)?;
+                #[cfg(not(unix))]
+                {
+                    let resolved = src.canonicalize()?;
+                    if resolved.is_dir() {
+                        copy(&resolved, &dst, root)?;
+                    } else {
+                        std::fs::copy(&resolved, &dst)?;
+                    }
+                }
             }
         }
         Ok(())

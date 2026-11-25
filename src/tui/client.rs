@@ -183,9 +183,7 @@ pub fn list_sessions() -> Vec<SessionSummary> {
 /// Run a local quick shell command (`!cmd`) directly in `repo` without spending LLM tokens.
 pub fn run_local_shell(repo: &str, cmd: &str) -> (String, Option<i32>, Duration) {
     let started = Instant::now();
-    match Command::new("sh")
-        .arg("-lc")
-        .arg(cmd)
+    match crate::exec::shell_command(cmd)
         .current_dir(repo)
         .output()
     {
@@ -458,38 +456,82 @@ pub fn load_image_data_url(repo: &str, raw_path: &str) -> Result<(String, String
     Ok((label, format!("data:{mime};base64,{}", encode_base64(&bytes))))
 }
 
-/// Grab an image directly from the Wayland clipboard via `wl-paste` if present.
+/// Grab an image directly from the system clipboard (`wl-paste` on Linux, `pngpaste` on macOS, PowerShell on Windows).
 pub fn paste_clipboard_image() -> Result<Option<(String, String)>, String> {
-    let list = Command::new("wl-paste")
-        .arg("--list-types")
-        .output()
-        .map_err(|e| format!("wl-paste unavailable: {e}"))?;
-    if !list.status.success() {
-        return Ok(None);
+    #[cfg(target_os = "macos")]
+    {
+        let tmp = std::env::temp_dir().join(format!("twig-clip-{}.png", std::process::id()));
+        let ok = Command::new("pngpaste")
+            .arg(&tmp)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+            return Ok(None);
+        }
+        return Ok(Some((
+            format!("clipboard.png ({}KB)", bytes.len() / 1024),
+            format!("data:image/png;base64,{}", encode_base64(&bytes)),
+        )));
     }
-    let types = String::from_utf8_lossy(&list.stdout);
-    let mime = if types.lines().any(|l| l.trim() == "image/png") {
-        "image/png"
-    } else if types.lines().any(|l| l.trim() == "image/jpeg") {
-        "image/jpeg"
-    } else {
-        return Ok(None);
-    };
-    let data = Command::new("wl-paste")
-        .args(["--no-newline", "--type", mime])
-        .output()
-        .map_err(|e| format!("wl-paste image: {e}"))?;
-    if !data.status.success() || data.stdout.is_empty() {
-        return Ok(None);
+    #[cfg(windows)]
+    {
+        let tmp = std::env::temp_dir().join(format!("twig-clip-{}.png", std::process::id()));
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; $i = [System.Windows.Forms.Clipboard]::GetImage(); if ($i -ne $null) {{ $i.Save('{}') }}",
+            tmp.display()
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .output();
+        let bytes = std::fs::read(&tmp).unwrap_or_default();
+        let _ = std::fs::remove_file(&tmp);
+        if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+            return Ok(None);
+        }
+        return Ok(Some((
+            format!("clipboard.png ({}KB)", bytes.len() / 1024),
+            format!("data:image/png;base64,{}", encode_base64(&bytes)),
+        )));
     }
-    if data.stdout.len() > MAX_IMAGE_BYTES {
-        return Err("clipboard image exceeds 10MB limit".into());
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let list = Command::new("wl-paste")
+            .arg("--list-types")
+            .output()
+            .map_err(|e| format!("wl-paste unavailable: {e}"))?;
+        if !list.status.success() {
+            return Ok(None);
+        }
+        let types = String::from_utf8_lossy(&list.stdout);
+        let mime = if types.lines().any(|l| l.trim() == "image/png") {
+            "image/png"
+        } else if types.lines().any(|l| l.trim() == "image/jpeg") {
+            "image/jpeg"
+        } else {
+            return Ok(None);
+        };
+        let data = Command::new("wl-paste")
+            .args(["--no-newline", "--type", mime])
+            .output()
+            .map_err(|e| format!("wl-paste image: {e}"))?;
+        if !data.status.success() || data.stdout.is_empty() {
+            return Ok(None);
+        }
+        if data.stdout.len() > MAX_IMAGE_BYTES {
+            return Err("clipboard image exceeds 10MB limit".into());
+        }
+        let ext = if mime == "image/png" { "png" } else { "jpg" };
+        Ok(Some((
+            format!("clipboard.{ext} ({}KB)", data.stdout.len() / 1024),
+            format!("data:{mime};base64,{}", encode_base64(&data.stdout)),
+        )))
     }
-    let ext = if mime == "image/png" { "png" } else { "jpg" };
-    Ok(Some((
-        format!("clipboard.{ext} ({}KB)", data.stdout.len() / 1024),
-        format!("data:{mime};base64,{}", encode_base64(&data.stdout)),
-    )))
 }
 
 /// Auto-detect `@path/to/image.png` mentions inside a prompt and load existing image files.
@@ -744,7 +786,7 @@ fn append_input_history_at(path: &Path, entry: &str) {
 }
 
 pub fn shorten_home(path: &str) -> String {
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         if let Some(rest) = path.strip_prefix(&home) {
             return format!("~{rest}");
         }
@@ -753,9 +795,10 @@ pub fn shorten_home(path: &str) -> String {
 }
 
 fn run_editor_on_path(path: &Path) -> Result<(), String> {
+    let default_ed = if cfg!(windows) { "notepad" } else { "vi" };
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
+        .unwrap_or_else(|_| default_ed.into());
     let parts = shlex::split(&editor).unwrap_or_else(|| vec![editor]);
     let (bin, args) = parts
         .split_first()
@@ -788,13 +831,20 @@ pub fn edit_file_in_external_editor(path: &Path) -> Result<usize, String> {
     Ok(content.lines().count())
 }
 
-/// Copy text to system clipboard via OSC 52 (Kitty/Ghostty/WezTerm/tmux) + Wayland `wl-copy`.
+/// Copy text to system clipboard via OSC 52 + native fallback (`wl-copy`/`pbcopy`/`clip`).
 pub fn copy_to_clipboard(text: &str) {
     let b64 = encode_base64(text.as_bytes());
     let mut stdout = io::stdout();
     let _ = write!(stdout, "\x1b]52;c;{b64}\x07");
     let _ = stdout.flush();
-    if let Ok(mut child) = Command::new("wl-copy")
+    let clip_bin = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else if cfg!(windows) {
+        "clip"
+    } else {
+        "wl-copy"
+    };
+    if let Ok(mut child) = Command::new(clip_bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

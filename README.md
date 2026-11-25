@@ -1,6 +1,6 @@
 # twig
 
-**A thin, high-discipline coding-agent harness in Rust.**
+**A thin, high-discipline coding-agent harness in Rust — cross-platform (Linux, macOS, Windows) with a responsive borderless TUI from phone screens to ultrawide monitors.**
 
 > Any OpenAI-compatible gateway (default: `magpie`) provides the models; **twig** provides the execution loop, structured tools, tiered safety policy, isolated subagents, curated skills, verifier, borderless TUI, and tamper-evident session record.
 
@@ -13,47 +13,57 @@ Most coding agents accumulate hidden latency and prompt bloat: per-call LLM clas
 `twig` takes the opposite approach:
 
 - **One round-trip per model turn** — multiple tool calls execute within a single turn, with mid-turn steering (`Enter` while running) and automatic retry on transient upstream errors.
-- **Borderless warm-terracotta TUI** — zero 4-sided box borders, live environment pulse on launch (`skills · docs · mcp · sandbox`), 60fps smooth scroll, diff line gutters, live Git `+N -M` stat, and Kitty OSC 99 notifications.
+- **Responsive borderless warm-terracotta TUI** — zero 4-sided box borders, adapts cleanly across **phone / Termux / Blink SSH (`36×16`)**, **tmux split panes (`60×20`)**, **laptops (`100×28`)**, and **ultrawide monitors (`180×45`)**.
+- **Cross-platform by design** — native execution, clipboard text/image, file locking, XDG/AppData config paths, and isolated Git-worktree subagents on **Linux, macOS, and Windows**.
 - **Three-tier shell policy (no LLM classifier)** — `Auto` (shape-cached read-only commands), `Audit` (default, runs immediately and logs out of band), and `Deny` (token-aware destructive guard that pauses for human approval).
 - **3-tier hybrid skill system** — project (`.twig/skills`) > global (`~/.config/twig/skills`) + cold vault (`~/.local/share/twig-skills-vault`), with zero-RTT `$skill-name` invocation and automatic Top-5 local pre-ranking when `> 15` skills are enabled.
 - **Evidence over claims** — external acceptance checks, differential replay verification, BLAKE3 hash-chained JSONL session records, and ablation-controlled `harness.json` tuning (`twig improve`).
 
 ---
 
-## Requirements
+## Platform Support
 
-- **OS**: Linux (uses Linux `waitid(WNOWAIT)` process-group cleanup and optional `bwrap` namespace isolation)
-- **Tools**: `git` (required), `bwrap` / bubblewrap (optional, for sandboxed commands & subagents), `gh` (optional, for `twig automate`), `wl-copy` / `wl-paste` (optional, Wayland clipboard text/image support)
-- **Model Gateway**: Any OpenAI-compatible `/v1/chat/completions` endpoint (defaults to local `magpie` at `http://127.0.0.1:3425/v1`)
+| Platform | TUI & Core Loop | Structured Tools & Shell | Clipboard (Text / Image) | Subagents & Isolation |
+|---|---|---|---|---|
+| **Linux** (`x86_64` musl, `aarch64`) | Full | Full (`sh -c`, `waitid` pgid cleanup) | OSC 52 + `wl-copy` / `wl-paste` | Isolated Git worktree + optional `bwrap` OS sandbox |
+| **macOS** (`arm64`, `x86_64`) | Full | Full (`sh -c`, pgid cleanup) | OSC 52 + `pbcopy` / `pngpaste` | Isolated Git worktree (`mode.set` RO for scout/reviewer) |
+| **Windows** (`x86_64-msvc`) | Full (Windows Terminal) | Full (`cmd /C`, `taskkill /T` tree cleanup) | OSC 52 + `clip` / PowerShell clipboard | Isolated Git worktree (`mode.set` RO for scout/reviewer) |
+| **Mobile SSH / Termux** | Responsive compact layout (`>= 32 cols`) | Remote host or Termux shell | OSC 52 | Runs on connected host |
 
 ---
 
 ## Installation
 
-### From Source (Recommended)
+### 1. One-Line Prebuilt Installer (Recommended)
+
+**Linux & macOS:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/SEMANTICx/twig/main/scripts/install.ps1 | iex
+```
+
+*(Both scripts verify SHA-256 checksums against GitHub Releases and install into `~/.local/bin` or `%LOCALAPPDATA%\twig\bin`. Pin a version with `TWIG_VERSION=v0.2.0`.)*
+
+### 2. Cargo / `cargo-binstall`
+
+```bash
+# Instant prebuilt download via cargo-binstall (no local compilation)
+cargo binstall --git https://github.com/SEMANTICx/twig.git twig
+
+# Or build from source
+cargo install --git https://github.com/SEMANTICx/twig.git --locked
+```
+
+### 3. Manual Build from Source
 
 ```bash
 git clone https://github.com/SEMANTICx/twig.git
 cd twig
 cargo build --release --locked
-install -Dm755 target/release/twig ~/.local/bin/twig
-```
-
-Or install directly with Cargo:
-
-```bash
-cargo install --git https://github.com/SEMANTICx/twig.git --locked
-```
-
-### From GitHub Releases
-
-Prebuilt Linux binaries (`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`) are built automatically on every `v*` tag:
-
-```bash
-VERSION=v0.2.0
-ARCH=$(uname -m)
-curl -fsSL "https://github.com/SEMANTICx/twig/releases/download/${VERSION}/twig-${VERSION}-${ARCH}-unknown-linux-gnu.tar.gz" \
-  | tar -xz --strip-components=1 -C ~/.local/bin "twig-${VERSION}-${ARCH}-unknown-linux-gnu/twig"
 ```
 
 ---
@@ -61,7 +71,7 @@ curl -fsSL "https://github.com/SEMANTICx/twig/releases/download/${VERSION}/twig-
 ## Quick Start
 
 ```bash
-# 1. Verify environment, config, bwrap, magpie gateway, and skills
+# 1. Verify environment, config, git/bwrap, model gateway, and skills
 twig doctor
 
 # 2. Run offline harness self-check (no model/network required)
@@ -74,7 +84,15 @@ twig chat
 
 ---
 
-## Interactive TUI (`twig chat`)
+## Responsive Borderless TUI (`twig chat`)
+
+`twig` adapts layout, margins, gutters, shortcut overlays, approval panels, and footer telemetry to any viewport width and height:
+
+| Breakpoint | Typical Device | Layout Adaptation |
+|---|---|---|
+| **Compact (`< 58 cols`)** | Phone SSH / Termux portrait (`36×16`) | Stacked welcome header with tail-elided path & wrapped env pulse, tight 1-col margins, hidden diff line-number gutter, compact placeholder `Ask twig… (/ @ $ !)`, single-column `?` shortcut guide, concise footer (`✻ repo · model · badges`), compact approval options |
+| **Split (`58–87 cols`)** | Tmux / IDE split pane (`60×20`) | Inline welcome header, full diff gutters, shortened right footer hint (`? help · ^R hist`), 1-column `?` overlay below 76 cols |
+| **Desktop / Ultrawide (`>= 88 cols`)** | Laptop & desktop (`100×28` – `180×45`) | Full welcome pulse, full live telemetry (`repo (branch) +N -M · model effort · ctx% · tokens · cache%`), 2-column `?` shortcut reference |
 
 ```text
   ✻ twig 0.2.0  ~/Dev/my-project
@@ -122,26 +140,26 @@ twig chat
 | Tool | Behavior |
 |---|---|
 | `read`, `edit`, `write`, `grep`, `glob` | Worktree-confined structured file tools; `edit`/`write` push snapshots for `/undo`; `read` supports `artifact:<file>` pagination |
-| `bash` | Bounded 1 MiB Unix-socket shell runner with process-group cleanup, optional `bwrap` isolation, and tiered policy |
+| `bash` | Bounded 1 MiB shell runner (`sh -c` on Unix, `cmd /C` on Windows) with process-tree cleanup, optional Linux `bwrap` isolation, and tiered policy |
 | `task` | Session-scoped async background shell tasks (`start`, `status`, `wait`, `cancel`, `list`) with cancellation support |
-| `subagent` | Parallel isolated Git worktrees (`code`, `test`, `scout`, `reviewer`); read-only roles mount `/workspace` `--ro-bind` and auto-clean worktrees |
+| `subagent` | Parallel isolated Git worktrees (`code`, `test`, `scout`, `reviewer`); read-only roles enforce read-only mode and auto-clean worktrees |
 | `skill` | Progressive-disclosure skill catalog (`query`) and on-demand body loader (`name`), including cold-vault fallback |
-| `mcp` | Lazy stdio JSON-RPC 2.0 MCP client (`.twig/mcp.json` & `~/.config/twig/mcp.json`) supporting tools, prompts, and resources with timeouts & auto-recovery |
+| `mcp` | Lazy stdio JSON-RPC 2.0 MCP client (`.twig/mcp.json` & config `mcp.json`) supporting tools, prompts, and resources with bounded timeouts & auto-recovery |
 | `todo` / `papercut` | Live progress checklist / structured harness defect reporting |
 
 ### 3-Tier Skill Management (`twig skill`)
 
 ```bash
 twig skill list                         # Inspect project, global, and vault skills
-twig skill enable <name> [--project]    # Symlink to global Tier-0 or copy into .twig/skills/
+twig skill enable <name> [--project]    # Enable globally (symlink on Unix, copy on Windows) or in .twig/skills/
 twig skill disable <name> [--project]   # Disable without deleting from vault
 twig skill add <path> [--name N] [--enable]
 twig skill doctor                       # Audit frontmatter, 500-line budget, shadowing & hygiene
 ```
 
 - **Tier 1 (Project)**: `<repo>/.twig/skills/<name>/SKILL.md` (highest precedence, confined to repo)
-- **Tier 2 (Global Active)**: `~/.config/twig/skills/<name>/` (recommended `<= 10–15` evergreen skills)
-- **Tier 3 (Cold Vault)**: `~/.local/share/twig-skills-vault/<name>/` (zero Layer-1 token cost; invoke on-demand via `$name` or `skill(name="...")`)
+- **Tier 2 (Global Active)**: `~/.config/twig/skills` (Windows: `%APPDATA%\twig\skills`, recommended `<= 10–15` evergreen skills)
+- **Tier 3 (Cold Vault)**: `~/.local/share/twig-skills-vault` (Windows: `%LOCALAPPDATA%\twig-skills-vault`; zero Layer-1 token cost; invoke on-demand via `$name` or `skill(name="...")`)
 
 ### Instruction Discovery
 
@@ -161,25 +179,26 @@ On every turn, `twig` automatically loads repository instructions in precedence 
 
 ---
 
-## CLI Reference
+## Releasing & Distribution
 
-```text
-twig chat [repo] [sid] [--plain]             Interactive TUI (or --plain stdio mode)
-twig serve [worktree] [runs] [sid]           JSON-RPC daemon over stdio
-twig doctor                                  Check config, model, git/bwrap, gateway, and skills
-twig selfcheck                               Offline verification suite (no network)
-twig config [init]                           Print or initialize harness.json
-twig skill <list|enable|disable|add|doctor>  Manage 3-tier curated skills
-twig record <file.jsonl>                     Verify BLAKE3 session hash chain
-twig classify <file.jsonl>                   Classify process vs content failures
-twig playbooks <goal>                        Test playbook routing for a goal
-twig decisions [file.tsv]                    Inspect decision trail
-twig eval [dir] [reps] [only]                Run scoring suite in fresh isolated repos
-twig improve [dir] [rounds]                  Tune harness.json with ablation controls
-twig automate [cfg] [--once]                 Unattended GitHub issue/PR maintenance loop
-twig subagent [repo] [role]                  Run an isolated role subagent
-twig review [repo] <diff>                    Fresh read-only independent diff reviewer
+Every `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to lint and build 5 prebuilt archives + `SHA256SUMS.txt`:
+
+- `twig-<tag>-x86_64-unknown-linux-musl.tar.gz` (static portable Linux x64)
+- `twig-<tag>-aarch64-unknown-linux-gnu.tar.gz` (Linux ARM64)
+- `twig-<tag>-aarch64-apple-darwin.tar.gz` (macOS Apple Silicon)
+- `twig-<tag>-x86_64-apple-darwin.tar.gz` (macOS Intel)
+- `twig-<tag>-x86_64-pc-windows-msvc.zip` (Windows x64)
+
+Cut a release with:
+```bash
+git tag v0.2.0
+git push origin v0.2.0
 ```
+
+Once public, the recommended multi-channel distribution stack is:
+1. **GitHub Releases + `install.sh` / `install.ps1`** (already wired in this repo)
+2. **`cargo-binstall`** (`[package.metadata.binstall]` already configured in `Cargo.toml`)
+3. **Homebrew Tap (`brew install SEMANTICx/tap/twig`)** for macOS/Linux + **Scoop bucket (`scoop install twig`)** for Windows + **AUR (`twig-bin`)** for Arch Linux — all pointing directly at the GitHub Release archives and `SHA256SUMS.txt`.
 
 ---
 

@@ -5,8 +5,12 @@ pub mod outer;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,32 +32,69 @@ fn now() -> u64 {
         .as_secs()
 }
 
+#[cfg(unix)]
 struct Lock(File);
+
+#[cfg(not(unix))]
+struct Lock {
+    _file: File,
+    path: PathBuf,
+}
 
 impl Drop for Lock {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fs::remove_file(&self.path);
         }
     }
 }
 
 fn lock(path: &Path) -> std::io::Result<Lock> {
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path.with_extension("lock"))?;
-    for _ in 0..500 {
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Lock(f));
+    let lock_path = path.with_extension("lock");
+    #[cfg(unix)]
+    {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        for _ in 0..500 {
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Lock(f));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(e);
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(e);
+    }
+    #[cfg(not(unix))]
+    {
+        for _ in 0..500 {
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(f) => {
+                    return Ok(Lock {
+                        _file: f,
+                        path: lock_path,
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::WouldBlock,
@@ -406,8 +447,12 @@ fn run_command(
         ));
     }
     let code = result.exit_code.unwrap_or(1);
+    #[cfg(unix)]
+    let status = std::process::ExitStatus::from_raw(code << 8);
+    #[cfg(windows)]
+    let status = std::process::ExitStatus::from_raw(code as u32);
     Ok(Output {
-        status: std::process::ExitStatus::from_raw(code << 8),
+        status,
         stdout: result.stdout,
         stderr: result.stderr,
     })

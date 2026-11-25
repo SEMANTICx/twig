@@ -16,6 +16,13 @@ pub fn shell(
     network: bool,
     read_only: bool,
 ) -> Result<String, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (workspace, command, network, read_only);
+        return Err("bwrap OS isolation requires Linux (disable `isolation` in harness.json on macOS/Windows)".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
     let workspace = workspace.canonicalize().map_err(|e| e.to_string())?;
     let mut args = vec![
         "bwrap".to_string(),
@@ -73,6 +80,7 @@ pub fn shell(
         .map(|a| quote(a))
         .collect::<Vec<_>>()
         .join(" "))
+    }
 }
 
 /// Evaluation sandbox with an allowlist filesystem: never mounts `/home`,
@@ -83,6 +91,13 @@ pub fn eval_command(
     workspace: &Path,
     runs: &Path,
 ) -> Result<Command, String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (twig, config, workspace, runs);
+        return Err("bwrap evaluation sandbox requires Linux".into());
+    }
+    #[cfg(target_os = "linux")]
+    {
     let absolute = |path: &Path| {
         path.canonicalize()
             .map_err(|e| format!("sandbox {}: {e}", path.display()))
@@ -164,9 +179,10 @@ pub fn eval_command(
     }
     cmd.args(["--", "/twig", "serve", "/workspace", "/runs"]);
     Ok(cmd)
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

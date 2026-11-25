@@ -344,28 +344,38 @@ fn main() {
                     saved_model.as_deref().unwrap_or("")
                 );
             }
-            for exe in ["git", "gh", "bwrap"] {
+            let tools_to_check: &[&str] = if cfg!(target_os = "linux") {
+                &["git", "gh", "bwrap"]
+            } else {
+                &["git", "gh"]
+            };
+            for exe in tools_to_check {
                 let ok = std::process::Command::new(exe)
                     .arg("--version")
                     .output()
                     .is_ok_and(|o| o.status.success());
                 println!("{exe:<12} {}", if ok { "available" } else { "missing" });
-                if exe == "git" && !ok {
+                if *exe == "git" && !ok {
                     failed = true;
                 }
             }
-            let bwrap_ns_ok = std::process::Command::new("bwrap")
-                .args(["--ro-bind", "/", "/", "--", "/bin/true"])
-                .output()
-                .is_ok_and(|o| o.status.success());
-            println!(
-                "bwrap_ns:    {}",
-                if bwrap_ns_ok {
-                    "ok (user namespaces enabled)"
-                } else {
-                    "unavailable (sandbox/subagent bwrap restricted in this environment)"
-                }
-            );
+            #[cfg(target_os = "linux")]
+            {
+                let bwrap_ns_ok = std::process::Command::new("bwrap")
+                    .args(["--ro-bind", "/", "/", "--", "/bin/true"])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+                println!(
+                    "bwrap_ns:    {}",
+                    if bwrap_ns_ok {
+                        "ok (user namespaces enabled)"
+                    } else {
+                        "unavailable (sandbox/subagent bwrap restricted in this environment)"
+                    }
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            println!("sandbox:     worktree-only (bwrap OS isolation is Linux-only)");
             match provider.list_models() {
                 Ok(models) => println!(
                     "magpie:      ok ({} models at {})",

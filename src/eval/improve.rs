@@ -954,6 +954,7 @@ mod tests {
         assert!(non_regressing(&candidate, &candidate).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn final_regression_retains_original_file_and_never_reaches_proposer() {
         use std::os::unix::fs::PermissionsExt;

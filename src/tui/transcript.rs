@@ -460,10 +460,10 @@ impl Transcript {
         motion: MotionMode,
     ) -> Vec<Line<'static>> {
         if self.cells.is_empty() {
-            return render_welcome_card(repo_path, env_summary);
+            return render_welcome_card(repo_path, env_summary, width);
         }
         let mut lines = Vec::new();
-        let inner = width.saturating_sub(4).max(16);
+        let inner = width.saturating_sub(if width < 48 { 2 } else { 4 }).max(14);
         let last_idx = self.cells.len().saturating_sub(1);
 
         for (cell_idx, cell) in self.cells.iter().enumerate() {
@@ -983,15 +983,18 @@ fn render_approval_panel(
     recovered: bool,
     sel: usize,
 ) {
-    if area.height < 6 || area.width < 18 {
+    if area.height < 5 || area.width < 14 {
         return;
     }
+    let compact = area.width < 52;
     let rule_len = area.width.saturating_sub(2) as usize;
     let rule = format!(" {}", "─".repeat(rule_len));
-    let inner_w = area.width.saturating_sub(4) as usize;
+    let inner_w = area.width.saturating_sub(if compact { 2 } else { 4 }) as usize;
     let cmd_preview = summarize_tool_args(name, args);
     let title = if recovered {
-        format!("  ▲ Recovered approval ({id}) — NO replay")
+        format!("  ▲ Recovered ({id}) — NO replay")
+    } else if compact {
+        format!(" ▲ Approve {}?", title_tool_name(name))
     } else {
         format!("  ▲ Approve {}? ({id})", title_tool_name(name))
     };
@@ -1001,9 +1004,10 @@ fn render_approval_panel(
         let bg = if active { SURFACE_HI } else { Color::Reset };
         let marker = if active { " ▸ " } else { "   " };
         let fg = if active { IVORY } else { STONE };
-        let pad = inner_w.saturating_sub(display_width(marker) + display_width(label));
+        let shown = clip_str(label, inner_w.saturating_sub(display_width(marker)));
+        let pad = inner_w.saturating_sub(display_width(marker) + display_width(&shown));
         Line::from(vec![
-            Span::raw("  "),
+            Span::raw(if compact { " " } else { "  " }),
             Span::styled(
                 marker,
                 Style::default()
@@ -1012,7 +1016,7 @@ fn render_approval_panel(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                label.to_owned(),
+                shown,
                 Style::default().fg(fg).bg(bg).add_modifier(if active {
                     Modifier::BOLD
                 } else {
@@ -1025,24 +1029,37 @@ fn render_approval_panel(
 
     let preview_line = format!(" $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(4)));
     let preview_pad = inner_w.saturating_sub(display_width(&preview_line));
+    let (l0, l1, l2) = if compact {
+        ("1. Allow once (y)", "2. Always allow (a)", "3. Deny (n)")
+    } else {
+        (
+            "1. Yes, allow once (y / Enter)",
+            "2. Always allow this pattern for this session (a)",
+            "3. No, deny and tell agent (n / Esc)",
+        )
+    };
 
-    let rows = vec![
+    let mut rows = vec![
         Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
         Line::from(Span::styled(
-            title,
+            clip_str(&title, area.width as usize),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         )),
         Line::from(vec![
-            Span::raw("  "),
+            Span::raw(if compact { " " } else { "  " }),
             Span::styled(preview_line, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
             Span::styled(" ".repeat(preview_pad), Style::default().bg(SURFACE)),
         ]),
-        Line::from(""),
-        opt(0, "1. Yes, allow once (y / Enter)"),
-        opt(1, "2. Always allow this pattern for this session (a)"),
-        opt(2, "3. No, deny and tell agent (n / Esc)"),
-        Line::from(Span::styled(rule, Style::default().fg(AMBER))),
     ];
+    if area.height >= 8 {
+        rows.push(Line::from(""));
+    }
+    rows.push(opt(0, l0));
+    rows.push(opt(1, l1));
+    rows.push(opt(2, l2));
+    if area.height >= 7 {
+        rows.push(Line::from(Span::styled(rule, Style::default().fg(AMBER))));
+    }
     frame.render_widget(Paragraph::new(rows), area);
 }
 

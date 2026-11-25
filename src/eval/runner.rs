@@ -1,6 +1,7 @@
 //! Isolated evaluation runner, external judge, and summary formatter.
 
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -68,15 +69,14 @@ fn initialize_repo(workspace: &Path, task: &Task) -> Result<(), String> {
 
 /// Run the check in its own process group and kill the group afterwards.
 pub fn judge(worktree: &Path, check: &str) -> (bool, String) {
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg(check)
-        .current_dir(worktree)
-        .process_group(0)
+    let mut cmd = crate::exec::shell_command(check);
+    cmd.current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (false, format!("judge spawn: {e}")),
@@ -193,8 +193,9 @@ pub fn run_one(task: &Task, rep: u32, spec: &Spec<'_>) -> Value {
             return json!({"task": task.name, "rep": rep, "pass": null, "outcome": e, "isolation": false})
         }
     };
+    #[cfg(unix)]
+    command.process_group(0);
     let spawned = command
-        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(stderr)

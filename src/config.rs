@@ -23,8 +23,9 @@ about to do; do it and show the result.";
 pub mod paths {
     use std::path::PathBuf;
 
-    fn home() -> PathBuf {
+    pub fn home() -> PathBuf {
         std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."))
     }
@@ -33,10 +34,14 @@ pub mod paths {
         std::env::var_os("TWIG_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                std::env::var_os("XDG_CONFIG_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home().join(".config"))
-                    .join("twig")
+                if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                    return PathBuf::from(xdg).join("twig");
+                }
+                #[cfg(windows)]
+                if let Some(appdata) = std::env::var_os("APPDATA") {
+                    return PathBuf::from(appdata).join("twig");
+                }
+                home().join(".config").join("twig")
             })
     }
 
@@ -44,11 +49,26 @@ pub mod paths {
         std::env::var_os("TWIG_STATE_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                std::env::var_os("XDG_STATE_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home().join(".local/state"))
-                    .join("twig")
+                if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+                    return PathBuf::from(xdg).join("twig");
+                }
+                #[cfg(windows)]
+                if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                    return PathBuf::from(local).join("twig").join("state");
+                }
+                home().join(".local").join("state").join("twig")
             })
+    }
+
+    pub fn data_dir() -> PathBuf {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(xdg);
+        }
+        #[cfg(windows)]
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local);
+        }
+        home().join(".local").join("share")
     }
 
     pub fn config_path() -> PathBuf {

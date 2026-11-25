@@ -7,6 +7,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -189,27 +190,60 @@ impl Record {
 }
 
 /// OS-owned lock released automatically on crash; two daemons cannot append one session.
+#[cfg(unix)]
 pub struct Lease(File);
+
+#[cfg(not(unix))]
+pub struct Lease {
+    _file: File,
+    path: PathBuf,
+}
 
 impl Lease {
     pub fn acquire(path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::other(
-                "session is already owned by another process",
-            ));
+        #[cfg(unix)]
+        {
+            let file = OpenOptions::new().create(true).append(true).open(path)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(std::io::Error::other(
+                    "session is already owned by another process",
+                ));
+            }
+            Ok(Self(file))
         }
-        Ok(Self(file))
+        #[cfg(not(unix))]
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        std::io::Error::other("session is already owned by another process")
+                    } else {
+                        e
+                    }
+                })?;
+            Ok(Self {
+                _file: file,
+                path: path.to_path_buf(),
+            })
+        }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }

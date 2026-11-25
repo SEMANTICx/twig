@@ -312,12 +312,9 @@ pub fn run_differential(
             ));
         }
     }
-    let out = run_process(
-        Command::new("sh").args(["-c", command]).current_dir(cwd),
-        &payload,
-        timeout,
-        max_output_bytes,
-    )?;
+    let mut cmd = crate::exec::shell_command(command);
+    cmd.current_dir(cwd);
+    let out = run_process(&mut cmd, &payload, timeout, max_output_bytes)?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let actual: Result<Vec<Value>, _> = text.lines().map(serde_json::from_str).collect();
     let failures = cases
