@@ -1,8 +1,9 @@
-//! The tunable surface: the only thing `twig improve` may change.
+//! The tunable surface and portable runtime paths.
 //!
-//! Prompts, tool descriptions and a handful of bounded limits. Code, the deny
-//! list, the verifier and the scoring set are deliberately out of reach: a loop
-//! that can edit its own exam learns to loosen the exam.
+//! Prompts, tool descriptions and a handful of bounded limits are the only
+//! thing `twig improve` may change. Code, the deny list, the verifier and the
+//! scoring set are deliberately out of reach: a loop that can edit its own
+//! exam learns to loosen the exam.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,61 @@ proves it works; a claim without a command output is not evidence.
 
 Do not ask for permission for ordinary work. Do not explain at length what you are
 about to do; do it and show the result.";
+
+/// Runtime paths never refer to the compilation checkout.
+pub mod paths {
+    use std::path::PathBuf;
+
+    fn home() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub fn config_dir() -> PathBuf {
+        std::env::var_os("TWIG_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home().join(".config"))
+                    .join("twig")
+            })
+    }
+
+    pub fn state_dir() -> PathBuf {
+        std::env::var_os("TWIG_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::var_os("XDG_STATE_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home().join(".local/state"))
+                    .join("twig")
+            })
+    }
+
+    pub fn config_path() -> PathBuf {
+        std::env::var_os("TWIG_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_dir().join("harness.json"))
+    }
+
+    pub fn session_id() -> String {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{n:x}", std::process::id())
+    }
+
+    pub fn valid_session(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() < 100
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -68,8 +124,12 @@ const BOUNDS: &[(&str, u64, u64)] = &[
 
 impl HarnessConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if !(8_000..=2_000_000).contains(&self.context_max_bytes) { return Err("context_max_bytes must be 8000..2000000".into()); }
-        if !(1..=8).contains(&self.subagent_concurrency) { return Err("subagent_concurrency must be 1..8".into()); }
+        if !(8_000..=2_000_000).contains(&self.context_max_bytes) {
+            return Err("context_max_bytes must be 8000..2000000".into());
+        }
+        if !(1..=8).contains(&self.subagent_concurrency) {
+            return Err("subagent_concurrency must be 1..8".into());
+        }
         let values = [
             self.max_output as u64,
             self.read_max_lines as u64,
@@ -88,7 +148,10 @@ impl HarnessConfig {
             ("read_description", &self.read_description, 1500),
         ] {
             if text.trim().is_empty() || text.len() > limit {
-                return Err(format!("{name} must be 1..={limit} bytes, got {}", text.len()));
+                return Err(format!(
+                    "{name} must be 1..={limit} bytes, got {}",
+                    text.len()
+                ));
             }
         }
         Ok(())
@@ -110,8 +173,10 @@ impl HarnessConfig {
     }
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let cfg: Self = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let cfg: Self =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -122,15 +187,15 @@ impl HarnessConfig {
         std::fs::write(path, body + "\n")
     }
 
-    /// `TWIG_CONFIG` if set (a broken file is an error, not a silent fallback),
-    /// else `harness.json` in the project, else the defaults.
+    /// `TWIG_CONFIG` if set; otherwise the XDG config file if present; otherwise defaults.
     pub fn resolve() -> Result<(Self, String), String> {
         if let Ok(path) = std::env::var("TWIG_CONFIG") {
             return Ok((Self::load(Path::new(&path))?, path));
         }
-        let path = project_config_path();
-        if path.exists() {
-            return Ok((Self::load(&path)?, path.display().to_string()));
+        let default_path = paths::config_path();
+        if default_path.exists() {
+            let label = default_path.display().to_string();
+            return Ok((Self::load(&default_path)?, label));
         }
         Ok((Self::default(), "defaults".into()))
     }
@@ -147,7 +212,9 @@ impl HarnessConfig {
                     continue;
                 }
                 match (va.as_str(), vb.as_str()) {
-                    (Some(x), Some(y)) => out.push(format!("{k}: text {} -> {} bytes", x.len(), y.len())),
+                    (Some(x), Some(y)) => {
+                        out.push(format!("{k}: text {} -> {} bytes", x.len(), y.len()))
+                    }
                     _ => out.push(format!("{k}: {va} -> {vb}")),
                 }
             }
@@ -157,5 +224,5 @@ impl HarnessConfig {
 }
 
 pub fn project_config_path() -> PathBuf {
-    crate::paths::config_path()
+    paths::config_path()
 }

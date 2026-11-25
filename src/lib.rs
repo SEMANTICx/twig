@@ -1,46 +1,37 @@
-//! twig — a thin agent harness.
+//! twig — a thin agent harness in Rust.
 //!
-//! magpie provides the models; this provides the loop, the verifier and the record.
+//! magpie provides the models; twig provides the loop, the verifier and the record.
 //!
-//! Design constraints, in priority order:
-//!   1. defence never sits in the exec path
-//!   2. one guard, not two
-//!   3. nothing is enabled until it is proven on recorded real calls
-//!   4. the record is append-only and hash-chained
+//! Architecture layers (strict DAG, deep modules, narrow interfaces):
+//!   Foundation : `config`, `record`, `control`
+//!   Execution  : `exec` (bounded processes, session shells, bwrap isolation)
+//!   Model      : `llm` (provider, bounded SSE streaming, stub, telemetry)
+//!   Verify     : `verify` (differential replay & admission gates)
+//!   Runtime    : `runtime` (daemon, turn loop, tools, policy, guard, context, guidance, subagent, terminal)
+//!   Evaluation : `eval` (scoring runner, protected datasets, improvement optimizer, lessons, ablation, classify, trajectory)
+//!   Automation : `automation` (durable GitHub maintenance queue, outer loop)
 
-pub mod ablation;
-pub mod classify;
+pub mod automation;
 pub mod config;
-pub mod context;
 pub mod control;
-pub mod daemon;
-pub mod decisions;
 pub mod eval;
-pub mod execution;
-pub mod guard;
-pub mod improve;
-pub mod isolation;
-pub mod lease;
-pub mod outer;
-pub mod paths;
-pub mod playbook;
-pub mod policy;
-pub mod provider;
-pub mod process;
+pub mod exec;
+pub mod llm;
 pub mod record;
-pub mod stub;
-pub mod skills;
-pub mod subagent;
-pub mod stream;
-pub mod terminal;
-pub mod telemetry;
-pub mod tools;
-pub mod trajectory;
-pub mod turn;
+pub mod runtime;
 pub mod verify;
 
-pub use daemon::Daemon;
-pub use guard::{Guard, Level};
-pub use provider::{Llm, Provider};
-pub use record::Record;
+// Narrow public façade & compatibility re-exports for CLI and integration tests.
+pub use config::paths;
+pub use eval::{classify, improve};
+pub use exec::isolation;
+pub use exec as process;
+pub use llm::{stub, Provider};
+pub use llm as provider;
+pub use record::{Decisions, Record};
+pub use runtime::{
+    guard::{Guard, Level},
+    guidance as playbook, policy, subagent, terminal, Daemon,
+};
+pub use llm::Llm;
 pub use verify::{Candidate, Verdict};

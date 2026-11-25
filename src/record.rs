@@ -1,13 +1,13 @@
-//! Append-only, hash-chained session record.
+//! Durable storage primitives: hash-chained session record, OS session lease,
+//! and the append-only decision trail.
 //!
-//! Every entry commits to the previous one. Rewriting or dropping history breaks
-//! the chain, which is the property the surveyed harnesses all lack: an outside
-//! party can check the record without trusting the runtime.
-//!
-//! The record is the API. Resume, replay, audit and fork all read it.
+//! Every record entry commits to the previous one. Rewriting or dropping
+//! history breaks the chain, so an outside party can verify the record without
+//! trusting the runtime.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,12 +73,12 @@ impl Record {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // an empty chain is still a chain
         OpenOptions::new().create(true).append(true).open(&path)?;
-        Self::verify_chain(&path).map_err(|(i,e)|std::io::Error::other(format!("record corruption at {i}: {e}")))?;
+        Self::verify_chain(&path)
+            .map_err(|(i, e)| std::io::Error::other(format!("record corruption at {i}: {e}")))?;
         let mut prev = GENESIS.to_string();
         let mut seq = 0u64;
-        if let Ok(file) = std::fs::File::open(&path) {
+        if let Ok(file) = File::open(&path) {
             for line in BufReader::new(file).lines().map_while(Result::ok) {
                 if line.trim().is_empty() {
                     continue;
@@ -91,7 +91,12 @@ impl Record {
                 }
             }
         }
-        Ok(Self { path, sid: sid.into(), prev, seq })
+        Ok(Self {
+            path,
+            sid: sid.into(),
+            prev,
+            seq,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -116,7 +121,9 @@ impl Record {
         map.insert("prev".into(), json!(self.prev));
         if let Value::Object(fields) = extra {
             for (k, v) in fields {
-                if !["seq","ts","sid","kind","prev","hash"].contains(&k.as_str()) { map.insert(k, v); }
+                if !["seq", "ts", "sid", "kind", "prev", "hash"].contains(&k.as_str()) {
+                    map.insert(k, v);
+                }
             }
         }
         let mut body = Value::Object(map);
@@ -134,7 +141,7 @@ impl Record {
     }
 
     pub fn tail(&self, n: usize) -> std::io::Result<Vec<Value>> {
-        let file = std::fs::File::open(&self.path)?;
+        let file = File::open(&self.path)?;
         let mut rows: Vec<Value> = BufReader::new(file)
             .lines()
             .map_while(Result::ok)
@@ -147,8 +154,7 @@ impl Record {
 
     /// `Ok(entries)` when the whole chain is intact, `Err((index, reason))` otherwise.
     pub fn verify_chain(path: &Path) -> Result<u64, (usize, String)> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| (0, format!("open {}: {e}", path.display())))?;
+        let file = File::open(path).map_err(|e| (0, format!("open {}: {e}", path.display())))?;
         let mut prev = GENESIS.to_string();
         let mut count = 0u64;
         let mut index = 0usize;
@@ -182,16 +188,93 @@ impl Record {
     }
 }
 
+/// OS-owned lock released automatically on crash; two daemons cannot append one session.
+pub struct Lease(File);
+
+impl Lease {
+    pub fn acquire(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::other(
+                "session is already owned by another process",
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// The decision trail. Append-only TSV so it diffs well in review and never needs a parser.
+pub struct Decisions {
+    path: PathBuf,
+}
+
+impl Decisions {
+    pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if file.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+            writeln!(file, "ts\tchoice\trejected\twhy")?;
+        }
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// One row per judgment call. Tabs and newlines in free text are folded.
+    pub fn log(&self, choice: &str, rejected: &str, why: &str) -> std::io::Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        writeln!(
+            file,
+            "{ts}\t{}\t{}\t{}",
+            fold(choice),
+            fold(rejected),
+            fold(why)
+        )
+    }
+
+    pub fn rows(&self) -> std::io::Result<Vec<String>> {
+        Ok(std::fs::read_to_string(&self.path)?
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+}
+
+fn fold(text: &str) -> String {
+    text.replace(['\t', '\n', '\r'], " ").trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmp() -> PathBuf {
-        // Parallel tests must never share a path: pid + millis collides under load.
+    fn tmp(ext: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "twig-rec-{}-{}-{}.jsonl",
+            "twig-rec-{}-{}-{}.{ext}",
             std::process::id(),
             now_ms(),
             N.fetch_add(1, Ordering::Relaxed)
@@ -200,17 +283,18 @@ mod tests {
 
     #[test]
     fn chain_round_trip() {
-        let path = tmp();
+        let path = tmp("jsonl");
         let mut rec = Record::open(&path, "s1").unwrap();
         rec.append("turn.started", json!({"model":"m"})).unwrap();
-        rec.append("tool.result", json!({"id":"t1","output":"hi"})).unwrap();
+        rec.append("tool.result", json!({"id":"t1","output":"hi"}))
+            .unwrap();
         assert_eq!(Record::verify_chain(&path).unwrap(), 2);
         std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn tamper_is_detected() {
-        let path = tmp();
+        let path = tmp("jsonl");
         let mut rec = Record::open(&path, "s1").unwrap();
         rec.append("a", json!({"x":1})).unwrap();
         rec.append("b", json!({"x":2})).unwrap();
@@ -225,7 +309,7 @@ mod tests {
 
     #[test]
     fn resume_continues_the_chain() {
-        let path = tmp();
+        let path = tmp("jsonl");
         {
             let mut rec = Record::open(&path, "s1").unwrap();
             rec.append("a", json!({})).unwrap();
@@ -244,5 +328,35 @@ mod tests {
         let a = json!({"b":1,"a":2});
         let b = json!({"a":2,"b":1});
         assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn writes_a_header_then_rows() {
+        let path = tmp("tsv");
+        let d = Decisions::open(&path).unwrap();
+        d.log(
+            "narrow the slice",
+            "batch all four fixes",
+            "one commit per accepted slice",
+        )
+        .unwrap();
+        let rows = d.rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("narrow the slice"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn folds_embedded_tabs() {
+        let path = tmp("tsv");
+        let d = Decisions::open(&path).unwrap();
+        d.log("a\tb", "c", "d\ne").unwrap();
+        let rows = d.rows().unwrap();
+        assert_eq!(
+            rows[0].split('\t').count(),
+            4,
+            "a stray tab must not add a column"
+        );
+        std::fs::remove_file(path).ok();
     }
 }

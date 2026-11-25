@@ -5,6 +5,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/twig automate %h/.config/twig/automation.json
+Environment=PREFIX=%h/.local
 Restart=on-failure
 RestartSec=30
 EnvironmentFile=-%h/.config/twig/environment

@@ -34,7 +34,8 @@ fn source_ids_ignore_mutable_content_and_separate_kind() {
 #[test]
 fn permission_defaults_and_config_validation_prevent_accidental_shipping() {
     let p=ShippingPermissions::default(); assert!(!p.replies&&!p.push&&!p.create_pr&&!p.merge&&!p.release);
-    let mut c=AutomationConfig::default(); c.repository="owner/repo".into(); c.check_command="true".into(); c.create_pr=true; c.permissions.create_pr=true;
+    let c=AutomationConfig{repository:"owner/repo".into(),check_command:"true".into(),create_pr:true,
+        permissions:ShippingPermissions{create_pr:true,..Default::default()},..Default::default()};
     assert!(c.validate().unwrap_err().contains("push"));
 }
 
@@ -46,7 +47,10 @@ fn work_is_verified_reviewed_and_committed_in_a_real_worktree_then_recovers_done
     assert_eq!(automation.run_once(&mut executor).unwrap(),vec![task.id.clone()]); assert_eq!(executor.reviewed,1);
     let wt=root.join("state/worktrees").join(blake3::hash(task.id.as_bytes()).to_hex().to_string());
     assert!(Command::new("git").arg("-C").arg(&wt).args(["rev-parse","--is-inside-work-tree"]).output().unwrap().status.success());
-    assert!(Command::new("git").arg("-C").arg(&wt).args(["log","-1","--format=%s"]).output().unwrap().stdout.starts_with(b"twig: issue #42"));
+    let log=Command::new("git").arg("-C").arg(&wt).args(["log","-1","--format=%s"]).output().unwrap();
+    assert!(log.status.success(),"{}",String::from_utf8_lossy(&log.stderr));
+    let status=Command::new("git").arg("-C").arg(&wt).args(["status","--short"]).output().unwrap();
+    assert!(log.stdout.starts_with(b"twig: issue #42"),"subject={:?}; status={:?}",String::from_utf8_lossy(&log.stdout),String::from_utf8_lossy(&status.stdout));
     assert!(automation.run_once(&mut executor).unwrap().is_empty()); assert_eq!(executor.reviewed,1);
     assert!(root.join("state/reports").read_dir().unwrap().next().is_some());
 }
@@ -71,4 +75,42 @@ fn pull_request_ids_are_canonical_across_restart() {
     let root=temp(); repo(&root.join("repo")); let task=item(SourceKind::PullRequest);
     { let mut a=Automation::open(config(&root)).unwrap(); assert_eq!(a.ingest(vec![task.clone()]).unwrap(),1); }
     let mut a=Automation::open(config(&root)).unwrap(); assert_eq!(a.ingest(vec![task]).unwrap(),0);
+}
+#[test]
+fn modified_queue_event_is_rejected_before_resume() {
+    let root=temp(); repo(&root.join("repo"));
+    let mut automation=Automation::open(config(&root)).unwrap();
+    automation.ingest(vec![item(SourceKind::Issue)]).unwrap();
+    drop(automation);
+    let queue=root.join("state/queue.jsonl");
+    let text=std::fs::read_to_string(&queue).unwrap();
+    let altered=text.replace("\"title\":\"title\"","\"title\":\"tampered\"");
+    assert_ne!(text,altered);
+    std::fs::write(queue,altered).unwrap();
+    assert!(Automation::open(config(&root)).is_err());
+}
+#[test]
+fn unattended_check_runs_in_isolation() {
+    let root=temp(); repo(&root.join("repo"));
+    let secret=root.join("host-secret"); std::fs::write(&secret,"unchanged").unwrap();
+    let mut c=config(&root);
+    c.check_command=format!("test ! -e '{}' && test -f answer.txt",secret.display());
+    let mut automation=Automation::open(c).unwrap();
+    let task=item(SourceKind::Issue); automation.ingest(vec![task.clone()]).unwrap();
+    let mut executor=Executor{reviewed:0};
+    assert_eq!(automation.run_once(&mut executor).unwrap(),vec![task.id]);
+    assert_eq!(std::fs::read_to_string(secret).unwrap(),"unchanged");
+    assert_eq!(executor.reviewed,1);
+}
+#[test]
+fn legacy_queue_is_backed_up_before_hash_chain_migration() {
+    let root=temp(); repo(&root.join("repo"));
+    let state=root.join("state"); std::fs::create_dir_all(&state).unwrap();
+    let queue=state.join("queue.jsonl");
+    let legacy=r#"{"event":"queued","at":1,"item":{"id":"legacy"}}"#;
+    std::fs::write(&queue,format!("{legacy}\n")).unwrap();
+    let backup=queue.with_extension("legacy.jsonl");
+    let _automation=Automation::open(config(&root)).unwrap();
+    assert_eq!(std::fs::read_to_string(backup).unwrap(),format!("{legacy}\n"));
+    assert!(std::fs::read_to_string(queue).unwrap().contains("twig.automation.event.v1"));
 }

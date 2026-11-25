@@ -1,25 +1,21 @@
 //! Differential verification: the previous behaviour is the oracle.
 //!
-//! You do not write expected outputs. You record real invocations against the
-//! old implementation, replay them against the new one, and compare exactly.
-//! Floats compare within 1e-9; wherever the original raised, the candidate must
-//! raise the same class of error.
-//!
-//! The candidate is a *program*, not a closure: JSON on stdin, JSON on stdout.
-//! That keeps the verifier language-agnostic, so the thing being verified can be
-//! Rust, Python or anything else that speaks JSON.
-//!
-//! Two known ceilings, both enforced by `gate` rather than hidden:
-//!   1. derived edge cases cover the value domain, not control flow — a branch
-//!      the recording never took is not verified, so branch coverage is a gate
-//!   2. a correct port that is slower per call is not worth enabling — cost is a
-//!      gate too
+//! Covers both recorded journal replay (`Candidate` / `verify` / `gate`) and
+//! JSON-lines differential suites (`run_differential`). Depends strictly
+//! downward on `crate::exec`.
 
+use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+use crate::exec::run_process;
+
+const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const DEFAULT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Case {
@@ -34,23 +30,46 @@ pub struct Case {
 pub struct Candidate {
     pub program: String,
     pub args: Vec<String>,
+    timeout: Duration,
 }
 
 impl Candidate {
     pub fn new(program: impl Into<String>, args: Vec<String>) -> Self {
-        Self { program: program.into(), args }
+        Self {
+            program: program.into(),
+            args,
+            timeout: DEFAULT_CANDIDATE_TIMEOUT,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// JSON in, JSON out. A non-zero exit is the candidate's error channel.
     pub fn run(&self, input: &Value) -> Result<Value, String> {
-        let mut cmd=Command::new(&self.program);
+        let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
-        let out=crate::execution::run_process(&mut cmd,input.to_string().as_bytes(),
-            std::time::Duration::from_secs(120),1_048_576).map_err(|e|format!("spawn {}: {e}",self.program))?;
-        if out.timed_out {return Err("timeout: differential candidate exceeded 120s".into());}
-        if out.truncated {return Err("candidate output exceeds 1 MiB".into());}
-        if out.exit_code!=Some(0) {return Err(format!("exit {}: {}",out.exit_code.unwrap_or(-1),String::from_utf8_lossy(&out.stderr)));}
-        serde_json::from_slice(&out.stdout).map_err(|e|format!("json: {e}"))
+        let out = run_process(&mut cmd, input.to_string().as_bytes(), self.timeout, 1_048_576)
+            .map_err(|e| format!("spawn {}: {e}", self.program))?;
+        if out.timed_out {
+            return Err(format!(
+                "timeout: differential candidate exceeded {}s",
+                self.timeout.as_secs()
+            ));
+        }
+        if out.truncated {
+            return Err("candidate output exceeds 1 MiB".into());
+        }
+        if out.exit_code != Some(0) {
+            return Err(format!(
+                "exit {}: {}",
+                out.exit_code.unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("json: {e}"))
     }
 }
 
@@ -129,7 +148,7 @@ pub struct Verdict {
     pub why: Option<String>,
 }
 
-pub fn record(path: &Path, cases: &[Case]) -> std::io::Result<()> {
+pub fn record(path: &Path, cases: &[Case]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -141,7 +160,7 @@ pub fn record(path: &Path, cases: &[Case]) -> std::io::Result<()> {
     std::fs::write(path, body)
 }
 
-pub fn load(path: &Path) -> std::io::Result<Vec<Case>> {
+pub fn load(path: &Path) -> io::Result<Vec<Case>> {
     let text = std::fs::read_to_string(path)?;
     let mut cases = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
@@ -190,7 +209,11 @@ pub fn verify(path: &Path, candidate: &Candidate, min_cases: usize) -> Verdict {
             }),
             (None, Err(got_err)) => fails.push(Fail {
                 input: case.input.clone(),
-                want: case.output.as_ref().map(|o| o.to_string()).unwrap_or_default(),
+                want: case
+                    .output
+                    .as_ref()
+                    .map(|o| o.to_string())
+                    .unwrap_or_default(),
                 got: got_err,
             }),
             (None, Ok(got)) => {
@@ -248,10 +271,78 @@ pub fn gate(
     if let Some(ratio) = cost_ratio {
         if ratio > 1.0 {
             verdict.ok = false;
-            verdict.why = Some(format!("cost ratio {ratio:.2}x > 1.00x: correct but slower"));
+            verdict.why = Some(format!(
+                "cost ratio {ratio:.2}x > 1.00x: correct but slower"
+            ));
         }
     }
     verdict
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DifferentialCase {
+    pub input: Value,
+    pub expected: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DifferentialResult {
+    pub passed: bool,
+    pub cases: usize,
+    pub failures: Vec<usize>,
+    pub output: String,
+}
+
+/// JSON-lines differential replay; malformed or extra output is a failure.
+pub fn run_differential(
+    cwd: &Path,
+    command: &str,
+    cases: &[DifferentialCase],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> io::Result<DifferentialResult> {
+    let mut payload = Vec::new();
+    for case in cases {
+        serde_json::to_writer(&mut payload, &case.input)?;
+        payload.push(b'\n');
+        if payload.len() > MAX_INPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "differential input exceeds 8 MiB",
+            ));
+        }
+    }
+    let out = run_process(
+        Command::new("sh").args(["-c", command]).current_dir(cwd),
+        &payload,
+        timeout,
+        max_output_bytes,
+    )?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let actual: Result<Vec<Value>, _> = text.lines().map(serde_json::from_str).collect();
+    let failures = cases
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            actual
+                .as_ref()
+                .ok()
+                .and_then(|a| a.get(i))
+                .is_none_or(|a| !eq_json(a, &c.expected, 1e-9))
+                .then_some(i)
+        })
+        .collect::<Vec<_>>();
+    Ok(DifferentialResult {
+        passed: !cases.is_empty()
+            && !out.timed_out
+            && !out.truncated
+            && out.exit_code == Some(0)
+            && failures.is_empty()
+            && actual.as_ref().is_ok_and(|a| a.len() == cases.len()),
+        cases: cases.len(),
+        failures,
+        output: text,
+    })
 }
 
 #[cfg(test)]
@@ -279,8 +370,6 @@ mod tests {
         path
     }
 
-    /// `cat` is an identity candidate: JSON in, same JSON out. Perfect for
-    /// testing the plumbing without inventing a language.
     fn identity() -> Candidate {
         Candidate::new("cat", vec![])
     }
@@ -348,5 +437,30 @@ mod tests {
         assert!(text.contains(&"0".to_string()));
         assert!(text.contains(&"null".to_string()));
         assert!(text.iter().any(|t| t.contains("üñï")));
+    }
+
+    #[test]
+    fn differential_replay_is_strict() {
+        let cwd = Path::new("/tmp");
+        let cases = [DifferentialCase {
+            input: json!({"x": 1}),
+            expected: json!({"x": 1}),
+        }];
+        assert!(
+            run_differential(cwd, "cat", &cases, Duration::from_secs(1), 1024)
+                .unwrap()
+                .passed
+        );
+        assert!(
+            !run_differential(
+                cwd,
+                "echo not-json; cat",
+                &cases,
+                Duration::from_secs(1),
+                1024
+            )
+            .unwrap()
+            .passed
+        );
     }
 }

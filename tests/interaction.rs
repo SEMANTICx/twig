@@ -45,8 +45,11 @@ fn output_is_live_and_cancel_terminates_running_shell(){
 }
 #[test]
 fn approval_waits_then_runs_the_exact_command_once(){
-    let events=session("printf 'git reset --hard'","approval");
+    let action="approval";
+    let dir=std::env::temp_dir().join(format!("twig-interaction-{}-{action}",std::process::id()));
+    let _=std::fs::remove_file(dir.join("approvals"));
+    let events=session("printf 'git reset --hard\\n' >> approvals","approval");
     assert_eq!(events.iter().filter(|e|e["ev"]=="approval.requested").count(),1);
     assert_eq!(events.iter().filter(|e|e["ev"]=="tool.started").count(),1);
-    assert!(events.iter().any(|e|e["ev"]=="tool.output" && e["text"]=="git reset --hard"));
+    assert_eq!(std::fs::read_to_string(dir.join("approvals")).unwrap().lines().count(),1);
 }
