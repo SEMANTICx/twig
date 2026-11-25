@@ -502,7 +502,7 @@ impl Tools {
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    match reg.invoke(server, action, target, args) {
+                    match reg.invoke(server, action, target, args, control) {
                         Ok(out) => {
                             self.last_exit_code = Some(0);
                             out
@@ -513,7 +513,7 @@ impl Tools {
                 None => "no MCP servers configured in .twig/mcp.json or ~/.config/twig/mcp.json".into(),
             },
             "subagent" => self.delegate(&call.args, emit),
-            "task" => self.run_task(&call.args, emit),
+            "task" => self.run_task(&call.args, control, emit),
             other => format!("no such tool {other:?}"),
         }
     }
@@ -593,7 +593,7 @@ impl Tools {
         format!("todo updated ({completed}/{} completed)", normalized.len())
     }
 
-    fn run_task(&mut self, args: &Value, emit: &mut dyn FnMut(Value)) -> String {
+    fn run_task(&mut self, args: &Value, control: &Control, emit: &mut dyn FnMut(Value)) -> String {
         let action = args["action"].as_str().unwrap_or("list");
         let res = match action {
             "start" => {
@@ -616,7 +616,7 @@ impl Tools {
             "wait" => {
                 let id = args["id"].as_str().unwrap_or("");
                 let secs = args["timeout_secs"].as_u64().unwrap_or(30);
-                let r = self.tasks.wait(id, secs);
+                let r = self.tasks.wait(id, secs, control);
                 if let Ok(ref snap) = r {
                     if snap["status"] != "running" {
                         emit(json!({

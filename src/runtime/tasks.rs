@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::control::Control;
 use crate::exec::isolation;
 
 const MAX_TASK_BUFFER_BYTES: usize = 64 * 1024;
@@ -254,7 +255,7 @@ impl TaskManager {
             .ok_or_else(|| format!("unknown background task {id:?}"))
     }
 
-    pub fn wait(&self, id: &str, timeout_secs: u64) -> Result<Value, String> {
+    pub fn wait(&self, id: &str, timeout_secs: u64, control: &Control) -> Result<Value, String> {
         let task = self
             .tasks
             .iter()
@@ -264,15 +265,17 @@ impl TaskManager {
         let deadline = Instant::now() + timeout;
         let mut guard = task.shared.0.lock().unwrap();
         while !guard.finished {
+            if control.cancelled() {
+                drop(guard);
+                return Err("wait interrupted by cancellation".into());
+            }
             let rem = deadline.saturating_duration_since(Instant::now());
             if rem.is_zero() {
                 break;
             }
-            let (next, res) = task.shared.1.wait_timeout(guard, rem).unwrap();
+            let slice = rem.min(Duration::from_millis(100));
+            let (next, _) = task.shared.1.wait_timeout(guard, slice).unwrap();
             guard = next;
-            if res.timed_out() {
-                break;
-            }
         }
         drop(guard);
         Ok(task.snapshot(true))
@@ -318,18 +321,22 @@ mod tests {
         // Read-only refuses start.
         assert!(mgr.start("echo nope", true).is_err());
 
+        let ctrl = Control::default();
         // Start + wait completes cleanly with output.
         let started = mgr.start("echo hello-bg", false).unwrap();
         let id = started["id"].as_str().unwrap().to_owned();
-        let done = mgr.wait(&id, 5).unwrap();
+        let done = mgr.wait(&id, 5, &ctrl).unwrap();
         assert_eq!(done["status"], "completed");
         assert_eq!(done["exit_code"], 0);
         assert!(done["output"].as_str().unwrap().contains("hello-bg"));
 
-        // Start a long sleep + cancel terminates it cleanly.
+        // Start a long sleep + verify wait obeys cancellation immediately, then cancel cleanly.
         let slow = mgr.start("sleep 30", false).unwrap();
         let slow_id = slow["id"].as_str().unwrap().to_owned();
         assert_eq!(mgr.running_count(), 1);
+        let cancel_ctrl = Control::default();
+        cancel_ctrl.cancel();
+        assert!(mgr.wait(&slow_id, 30, &cancel_ctrl).is_err());
         let cancelled = mgr.cancel(&slow_id).unwrap();
         assert_eq!(cancelled["status"], "cancelled");
         assert_eq!(mgr.running_count(), 0);

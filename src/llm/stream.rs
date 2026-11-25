@@ -203,8 +203,10 @@ fn stream_once(
                     }
                 }
                 if let Some(s) = delta["content"].as_str() {
-                    text.push_str(s);
-                    emit(json!({"ev": "model.delta", "text": s}));
+                    if !s.is_empty() {
+                        text.push_str(s);
+                        emit(json!({"ev": "model.delta", "text": s}));
+                    }
                 }
                 for c in delta["tool_calls"].as_array().into_iter().flatten() {
                     let slot = calls
