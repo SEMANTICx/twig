@@ -4,6 +4,7 @@
 //! depend on `CARGO_MANIFEST_DIR`. `SkillIndex` hides its internal metadata list
 //! behind narrow summary/load operations so callers never depend on its layout.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 
@@ -339,6 +340,55 @@ impl SkillIndex {
         serde_json::to_string(&self.entries).unwrap_or_default()
     }
 
+    /// Progressive-disclosure Layer 1 system prompt addendum.
+    /// Keeps system prompt bounded once more than 15 skills are active by
+    /// switching to on-demand `skill(query=...)` search.
+    pub fn system_prompt_block(&self) -> String {
+        if self.entries.is_empty() {
+            return String::new();
+        }
+        if self.entries.len() <= 15 {
+            format!(
+                "\nAvailable project/global skills (load body via skill tool only when relevant): {}",
+                self.summary_json()
+            )
+        } else {
+            format!(
+                "\n{} skills are installed (Layer 1 compacted to avoid context bloat). Call skill(query=\"<keywords>\") to discover relevant skills or skill(name=\"<name>\") to load one.",
+                self.entries.len()
+            )
+        }
+    }
+
+    /// Lightweight token-overlap search over skill names (3x weight) and descriptions (1x weight).
+    pub fn search_json(&self, query: &str) -> String {
+        let q_tokens = tokenize_keywords(query);
+        if q_tokens.is_empty() {
+            return self.summary_json();
+        }
+        let mut scored: Vec<(usize, &SkillMetadata)> = self
+            .entries
+            .iter()
+            .filter_map(|meta| {
+                let name_low = meta.name.to_lowercase();
+                let desc_low = meta.description.to_lowercase();
+                let mut score = 0usize;
+                for tok in &q_tokens {
+                    if name_low.contains(tok.as_str()) {
+                        score += 3;
+                    }
+                    if desc_low.contains(tok.as_str()) {
+                        score += 1;
+                    }
+                }
+                (score > 0).then_some((score, meta))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        let top: Vec<&SkillMetadata> = scored.into_iter().take(8).map(|(_, m)| m).collect();
+        serde_json::to_string(&top).unwrap_or_default()
+    }
+
     pub fn load(&self, name: &str) -> io::Result<String> {
         let metadata = self
             .entries
@@ -355,6 +405,486 @@ impl SkillIndex {
             }
         }
         read_bounded(&path, MAX_SKILL_BYTES)
+    }
+}
+
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "when", "use", "using", "into", "your",
+    "only", "more", "than", "any", "not", "before", "after", "about", "skill", "skills", "code",
+];
+
+fn tokenize_keywords(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|t| t.len() >= 3 && !STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+struct ParsedSkillHeader {
+    name: String,
+    description: String,
+    double_frontmatter: bool,
+    line_count: usize,
+    body: String,
+}
+
+fn inspect_skill_file(path: &Path) -> Result<ParsedSkillHeader, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let line_count = raw.lines().count();
+    let mut lines = raw.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return Err(format!(
+            "{}: missing opening YAML frontmatter `---`",
+            path.display()
+        ));
+    }
+    let mut name = String::new();
+    let mut description = String::new();
+    let mut desc_block = false;
+    let mut closed = false;
+    let mut rest_lines = Vec::new();
+    for line in lines {
+        if !closed {
+            let trimmed = line.trim();
+            if trimmed == "---" {
+                closed = true;
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("name:") {
+                name = v.trim().trim_matches(['\'', '"']).to_owned();
+                desc_block = false;
+            } else if let Some(v) = line.strip_prefix("description:") {
+                let v = v.trim();
+                desc_block = matches!(v, ">" | "|" | ">-" | "|-");
+                if !desc_block {
+                    description = v.trim_matches(['\'', '"']).to_owned();
+                }
+            } else if desc_block && line.starts_with(char::is_whitespace) {
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str(trimmed);
+            } else if !trimmed.is_empty() {
+                desc_block = false;
+            }
+        } else {
+            rest_lines.push(line);
+        }
+    }
+    if !closed || name.is_empty() {
+        return Err(format!(
+            "{}: malformed frontmatter (requires `name:` and closing `---`)",
+            path.display()
+        ));
+    }
+    let first_nonempty = rest_lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim());
+    let double_frontmatter = first_nonempty == Some("---");
+    Ok(ParsedSkillHeader {
+        name,
+        description,
+        double_frontmatter,
+        line_count,
+        body: rest_lines.join("\n"),
+    })
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Manages twig's 3-tier skill lifecycle: project `.twig/skills`, global
+/// `~/.config/twig/skills`, and the inactive cold vault `~/.local/share/twig-skills-vault`.
+pub struct SkillStore {
+    project_dir: Option<PathBuf>,
+    global_dir: PathBuf,
+    vault_dir: PathBuf,
+}
+
+impl SkillStore {
+    pub fn default_for(repo: Option<&Path>) -> Self {
+        let global_dir = std::env::var_os("TWIG_SKILLS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| crate::config::paths::config_dir().join("skills"));
+        let vault_dir = std::env::var_os("TWIG_SKILLS_VAULT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir);
+                std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join(".local/share"))
+                    .join("twig-skills-vault")
+            });
+        let project_dir = repo.map(|r| r.join(".twig/skills"));
+        Self {
+            project_dir,
+            global_dir,
+            vault_dir,
+        }
+    }
+
+    pub fn with_dirs(project_dir: Option<PathBuf>, global_dir: PathBuf, vault_dir: PathBuf) -> Self {
+        Self {
+            project_dir,
+            global_dir,
+            vault_dir,
+        }
+    }
+
+    fn scan_entries(dir: &Path) -> Vec<(String, PathBuf, Result<ParsedSkillHeader, String>)> {
+        let mut out = Vec::new();
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let skill_file = if p.is_dir() {
+                let f = p.join("SKILL.md");
+                if f.exists() { f } else { continue }
+            } else if p.is_file() && p.extension().is_some_and(|e| e == "md") {
+                p
+            } else {
+                continue;
+            };
+            let folder = entry.file_name().to_string_lossy().into_owned();
+            let parsed = inspect_skill_file(&skill_file);
+            out.push((folder, skill_file, parsed));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn list_report(&self) -> String {
+        let mut out = String::new();
+        let mut enabled_names = HashSet::new();
+
+        if let Some(proj) = &self.project_dir {
+            let items = Self::scan_entries(proj);
+            out.push_str(&format!("Project skills ({}):\n", proj.display()));
+            if items.is_empty() {
+                out.push_str("  (none)\n");
+            }
+            for (folder, _, parsed) in items {
+                enabled_names.insert(folder.clone());
+                match parsed {
+                    Ok(h) => out.push_str(&format!(
+                        "  {:<32} {:>3}L  {}\n",
+                        h.name,
+                        h.line_count,
+                        truncate_one_line(&h.description, 64)
+                    )),
+                    Err(e) => out.push_str(&format!("  {:<32} [ERR] {e}\n", folder)),
+                }
+            }
+            out.push('\n');
+        }
+
+        let global_items = Self::scan_entries(&self.global_dir);
+        out.push_str(&format!(
+            "Global Tier-0 skills ({}): {} enabled\n",
+            self.global_dir.display(),
+            global_items.len()
+        ));
+        if global_items.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for (folder, _, parsed) in global_items {
+            enabled_names.insert(folder.clone());
+            match parsed {
+                Ok(h) => out.push_str(&format!(
+                    "  {:<32} {:>3}L  {}\n",
+                    h.name,
+                    h.line_count,
+                    truncate_one_line(&h.description, 64)
+                )),
+                Err(e) => out.push_str(&format!("  {:<32} [ERR] {e}\n", folder)),
+            }
+        }
+
+        let vault_items = Self::scan_entries(&self.vault_dir);
+        let inactive: Vec<_> = vault_items
+            .into_iter()
+            .filter(|(folder, _, _)| !enabled_names.contains(folder))
+            .collect();
+        out.push_str(&format!(
+            "\nVault cold storage ({}): {} available (disabled)\n",
+            self.vault_dir.display(),
+            inactive.len()
+        ));
+        if inactive.is_empty() {
+            out.push_str("  (none)\n");
+        }
+        for (folder, _, parsed) in inactive {
+            match parsed {
+                Ok(h) => out.push_str(&format!(
+                    "  {:<32} {:>3}L  {}\n",
+                    h.name,
+                    h.line_count,
+                    truncate_one_line(&h.description, 64)
+                )),
+                Err(e) => out.push_str(&format!("  {:<32} [ERR] {e}\n", folder)),
+            }
+        }
+        out
+    }
+
+    pub fn enable(&self, name: &str, project_scope: bool) -> Result<String, String> {
+        if !valid_skill_name(name) {
+            return Err(format!("invalid skill name {name:?}"));
+        }
+        let src = self.vault_dir.join(name);
+        let src_file = src.join("SKILL.md");
+        if !src_file.exists() {
+            return Err(format!(
+                "skill {name:?} not found in vault ({})",
+                self.vault_dir.display()
+            ));
+        }
+        let header = inspect_skill_file(&src_file)?;
+        if header.double_frontmatter {
+            return Err(format!(
+                "skill {name:?} has corrupted double YAML frontmatter; fix before enabling"
+            ));
+        }
+        if project_scope {
+            let proj = self
+                .project_dir
+                .as_ref()
+                .ok_or("project scope requires a repository path")?;
+            let dst = proj.join(name);
+            if dst.exists() {
+                return Err(format!("project skill {name:?} already exists at {}", dst.display()));
+            }
+            copy_dir_recursive(&src, &dst).map_err(|e| format!("copy skill: {e}"))?;
+            Ok(format!("enabled {name} in project ({})", dst.display()))
+        } else {
+            std::fs::create_dir_all(&self.global_dir)
+                .map_err(|e| format!("create {}: {e}", self.global_dir.display()))?;
+            let dst = self.global_dir.join(name);
+            if dst.exists() || dst.symlink_metadata().is_ok() {
+                return Err(format!("global skill {name:?} is already enabled"));
+            }
+            std::os::unix::fs::symlink(&src, &dst)
+                .map_err(|e| format!("symlink {}: {e}", dst.display()))?;
+            Ok(format!("enabled {name} globally ({} -> {})", dst.display(), src.display()))
+        }
+    }
+
+    pub fn disable(&self, name: &str, project_scope: bool) -> Result<String, String> {
+        if !valid_skill_name(name) {
+            return Err(format!("invalid skill name {name:?}"));
+        }
+        let root = if project_scope {
+            self.project_dir
+                .as_ref()
+                .ok_or("project scope requires a repository path")?
+        } else {
+            &self.global_dir
+        };
+        let target = root.join(name);
+        let meta = target
+            .symlink_metadata()
+            .map_err(|_| format!("skill {name:?} is not enabled in {}", root.display()))?;
+        if meta.file_type().is_symlink() || meta.is_file() {
+            std::fs::remove_file(&target).map_err(|e| format!("remove {}: {e}", target.display()))?;
+        } else if meta.is_dir() {
+            std::fs::remove_dir_all(&target)
+                .map_err(|e| format!("remove {}: {e}", target.display()))?;
+        }
+        Ok(format!("disabled {name} (removed {}, vault untouched)", target.display()))
+    }
+
+    pub fn import_to_vault(
+        &self,
+        src: &Path,
+        custom_name: Option<&str>,
+        enable_global: bool,
+    ) -> Result<String, String> {
+        let skill_file = if src.is_dir() {
+            src.join("SKILL.md")
+        } else {
+            src.to_path_buf()
+        };
+        let header = inspect_skill_file(&skill_file)?;
+        if header.double_frontmatter {
+            return Err("refused: source SKILL.md contains duplicate YAML frontmatter".into());
+        }
+        let target_name = custom_name.unwrap_or(&header.name);
+        if !valid_skill_name(target_name) {
+            return Err(format!("invalid skill name {target_name:?}"));
+        }
+        let dst = self.vault_dir.join(target_name);
+        if dst.exists() {
+            return Err(format!("vault already contains {target_name:?}"));
+        }
+        if src.is_dir() {
+            copy_dir_recursive(src, &dst).map_err(|e| format!("import dir: {e}"))?;
+        } else {
+            std::fs::create_dir_all(&dst).map_err(|e| format!("create dir: {e}"))?;
+            std::fs::copy(src, dst.join("SKILL.md")).map_err(|e| format!("import file: {e}"))?;
+        }
+        let mut msg = format!("imported {target_name} into vault ({})", dst.display());
+        if enable_global {
+            let enabled = self.enable(target_name, false)?;
+            msg.push_str(&format!("\n{enabled}"));
+        }
+        Ok(msg)
+    }
+
+    /// Audit enabled skills for frontmatter corruption, 500-line bloat, vague
+    /// descriptions, Tier-0 budget overflow, keyword shadowing, and injection patterns.
+    pub fn doctor_report(&self) -> (bool, String) {
+        let mut issues = Vec::new();
+        let mut warnings = Vec::new();
+        let mut checked: Vec<(String, ParsedSkillHeader)> = Vec::new();
+
+        let mut scan_scope = |label: &str, dir: &Path| {
+            let items = Self::scan_entries(dir);
+            if label == "global" && items.len() > 12 {
+                warnings.push(format!(
+                    "global Tier-0 has {} enabled skills (recommended <= 10 to prevent Skill Shadowing)",
+                    items.len()
+                ));
+            }
+            for (folder, _, parsed) in items {
+                match parsed {
+                    Err(e) => issues.push(format!("[{label}/{folder}] {e}")),
+                    Ok(h) => {
+                        if h.double_frontmatter {
+                            issues.push(format!(
+                                "[{label}/{}] duplicate YAML frontmatter detected",
+                                h.name
+                            ));
+                        }
+                        if h.line_count > 500 {
+                            warnings.push(format!(
+                                "[{label}/{}] {} lines (> 500-line progressive-disclosure limit)",
+                                h.name, h.line_count
+                            ));
+                        }
+                        let desc = h.description.trim();
+                        if desc.len() < 20 || desc.eq_ignore_ascii_case(&h.name) {
+                            warnings.push(format!(
+                                "[{label}/{}] weak/short description ({} chars) — hurts trigger accuracy",
+                                h.name,
+                                desc.len()
+                            ));
+                        } else if desc.len() > 360 {
+                            warnings.push(format!(
+                                "[{label}/{}] verbose description ({} chars > 360) — inflates Layer-1 prompt",
+                                h.name,
+                                desc.len()
+                            ));
+                        }
+                        let desc_low = desc.to_lowercase();
+                        if desc_low.contains("help with anything")
+                            || desc_low.contains("general assistant")
+                        {
+                            warnings.push(format!(
+                                "[{label}/{}] overly broad catch-all description",
+                                h.name
+                            ));
+                        }
+                        let body_low = h.body.to_lowercase();
+                        for needle in [
+                            "ignore previous instructions",
+                            "ignore all previous",
+                            "disregard prior instructions",
+                            "exfiltrate",
+                        ] {
+                            if body_low.contains(needle) {
+                                issues.push(format!(
+                                    "[{label}/{}] suspicious prompt-injection phrase {needle:?}",
+                                    h.name
+                                ));
+                            }
+                        }
+                        checked.push((format!("{label}/{}", h.name), h));
+                    }
+                }
+            }
+        };
+
+        if let Some(proj) = &self.project_dir {
+            if proj.is_dir() {
+                scan_scope("project", proj);
+            }
+        }
+        scan_scope("global", &self.global_dir);
+
+        // Pairwise description keyword overlap (Skill Shadowing detector).
+        let token_sets: Vec<HashSet<String>> = checked
+            .iter()
+            .map(|(_, h)| tokenize_keywords(&h.description))
+            .collect();
+        for i in 0..checked.len() {
+            for j in (i + 1)..checked.len() {
+                let a = &token_sets[i];
+                let b = &token_sets[j];
+                if a.len() < 3 || b.len() < 3 {
+                    continue;
+                }
+                let inter = a.intersection(b).count();
+                let union = a.union(b).count();
+                if union > 0 && (inter as f64 / union as f64) >= 0.45 {
+                    warnings.push(format!(
+                        "trigger overlap ({inter}/{union} shared keywords): {} <-> {}",
+                        checked[i].0, checked[j].0
+                    ));
+                }
+            }
+        }
+
+        let vault_count = Self::scan_entries(&self.vault_dir).len();
+        let mut report = format!(
+            "twig skill doctor: {} active skill(s), {} in vault\n",
+            checked.len(),
+            vault_count
+        );
+        if issues.is_empty() && warnings.is_empty() {
+            report.push_str("status: OK (no issues or warnings)\n");
+        } else {
+            for e in &issues {
+                report.push_str(&format!("  [FAIL] {e}\n"));
+            }
+            for w in &warnings {
+                report.push_str(&format!("  [WARN] {w}\n"));
+            }
+        }
+        (issues.is_empty(), report)
+    }
+}
+
+fn truncate_one_line(s: &str, max_chars: usize) -> String {
+    let flat = s.replace('\n', " ");
+    let clipped: String = flat.chars().take(max_chars).collect();
+    if flat.chars().count() > max_chars {
+        format!("{clipped}…")
+    } else {
+        clipped
     }
 }
 
@@ -532,5 +1062,57 @@ when: bug, broken, crash, regression
         assert!(index.load("ponytail").unwrap().contains("PONYTAIL BODY"));
         assert!(index.summary_json().contains("architecture debt audit"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn skill_store_lifecycle_search_and_doctor_catch_bloat_and_shadowing() {
+        let base = std::env::temp_dir().join(format!("twig-skill-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("proj/.twig/skills");
+        let global = base.join("global");
+        let vault = base.join("vault");
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let good_md = src_dir.join("debugging.md");
+        std::fs::write(
+            &good_md,
+            "---\nname: systematic-debugging\ndescription: Investigate bugs systematically by reproducing failures and isolating root causes before editing.\n---\n# Debugging\n1. Reproduce first.\n",
+        )
+        .unwrap();
+        let bad_md = src_dir.join("broken.md");
+        std::fs::write(
+            &bad_md,
+            "---\nname: broken\ndescription: broken\n---\n---\nname: broken\n---\nBody\n",
+        )
+        .unwrap();
+
+        let store = SkillStore::with_dirs(Some(proj.clone()), global.clone(), vault.clone());
+        assert!(store.import_to_vault(&bad_md, None, false).is_err());
+        let imported = store.import_to_vault(&good_md, None, true).unwrap();
+        assert!(imported.contains("enabled systematic-debugging globally"));
+        assert!(store.list_report().contains("systematic-debugging"));
+
+        let (ok, report) = store.doctor_report();
+        assert!(ok, "{report}");
+        assert!(report.contains("status: OK"), "{report}");
+
+        // Search and progressive-disclosure compaction over global symlinked skills.
+        let mut entries = Vec::new();
+        SkillIndex::scan_root(&global, "global", false, &mut entries).unwrap();
+        let index = SkillIndex { entries };
+        assert!(index.search_json("root causes").contains("systematic-debugging"));
+        assert!(index.system_prompt_block().contains("systematic-debugging"));
+
+        // Disable leaves vault copy intact.
+        store.disable("systematic-debugging", false).unwrap();
+        assert!(vault.join("systematic-debugging/SKILL.md").exists());
+        assert!(!global.join("systematic-debugging").exists());
+
+        // Project enable copies rather than symlinks so strict confinement passes.
+        store.enable("systematic-debugging", true).unwrap();
+        assert!(SkillIndex::discover(&proj).is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -125,11 +125,8 @@ impl Tools {
     /// System prompt instructions owned by the active tool configuration (skills + plan mode).
     pub fn system_addendum(&self) -> String {
         let mut out = String::new();
-        let metadata = self.skill_metadata();
-        if !metadata.is_empty() {
-            out.push_str(&format!(
-                "\nAvailable project skills (load body via skill tool only when relevant): {metadata}"
-            ));
+        if let Some(skills) = &self.skills {
+            out.push_str(&skills.system_prompt_block());
         }
         if let Some(mcp) = &self.mcp {
             out.push_str(&format!(
@@ -231,8 +228,8 @@ impl Tools {
                         "expected":{"type":"string"}, "actual":{"type":"string"},
                         "recovery":{"type":"string"}},
                     "required":["component","attempted","expected","actual","recovery"]}}}),
-            json!({"type":"function","function":{"name":"skill","description":"List project/global skill metadata, or load one named skill only when needed.",
-                "parameters":{"type":"object","properties":{"name":{"type":"string"}}}}}),
+            json!({"type":"function","function":{"name":"skill","description":"List/search project & global skill metadata (optional query), or load one named skill body only when needed.",
+                "parameters":{"type":"object","properties":{"name":{"type":"string"},"query":{"type":"string"}}}}}),
             json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in a fresh isolated Git worktree; reviewer/scout are OS read-only. Multiple subagent calls in one turn run in parallel up to concurrency limit. Optional model/effort override per role.",
                 "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","reviewer"]},"task":{"type":"string"},"model":{"type":"string"},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
             json!({"type":"function","function":{"name":"task","description":"Manage asynchronous background shell tasks (start a long-running build/test/server, poll status, wait for completion, cancel, or list active tasks).",
@@ -423,9 +420,12 @@ impl Tools {
                     Some(name) => index
                         .load(name)
                         .unwrap_or_else(|e| format!("skill error: {e}")),
-                    None => index.summary_json(),
+                    None => match call.args["query"].as_str() {
+                        Some(q) if !q.trim().is_empty() => index.search_json(q),
+                        _ => index.summary_json(),
+                    },
                 },
-                None => "No project skills found under .twig/skills".into(),
+                None => "No project or global skills found".into(),
             },
             "todo" => self.update_todo(&call.args, emit),
             "mcp" => match &mut self.mcp {

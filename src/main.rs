@@ -635,6 +635,78 @@ fn main() {
             );
         }
 
+        "skill" => {
+            let sub = args.get(1).map(String::as_str).unwrap_or("list");
+            let flag_value = |flag: &str| -> Option<String> {
+                args.iter()
+                    .position(|a| a == flag)
+                    .and_then(|i| args.get(i + 1))
+                    .cloned()
+            };
+            let has_flag = |flag: &str| args.iter().any(|a| a == flag);
+            let repo_arg = flag_value("--repo")
+                .or_else(|| has_flag("--project").then(|| flag_value("--project").unwrap_or_else(|| ".".into())));
+            let repo_path = repo_arg
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| Path::new(".twig/skills").is_dir().then(|| PathBuf::from(".")));
+            let store = twig::playbook::SkillStore::default_for(repo_path.as_deref());
+            match sub {
+                "list" => print!("{}", store.list_report()),
+                "enable" => {
+                    let Some(name) = args.get(2) else {
+                        eprintln!("usage: twig skill enable <name> [--project [repo]]");
+                        std::process::exit(2);
+                    };
+                    match store.enable(name, has_flag("--project")) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("twig skill: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "disable" => {
+                    let Some(name) = args.get(2) else {
+                        eprintln!("usage: twig skill disable <name> [--project [repo]]");
+                        std::process::exit(2);
+                    };
+                    match store.disable(name, has_flag("--project")) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("twig skill: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "add" => {
+                    let Some(src) = args.get(2) else {
+                        eprintln!("usage: twig skill add <path> [--name NAME] [--enable]");
+                        std::process::exit(2);
+                    };
+                    let custom = flag_value("--name");
+                    match store.import_to_vault(Path::new(src), custom.as_deref(), has_flag("--enable")) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => {
+                            eprintln!("twig skill: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                "doctor" => {
+                    let (ok, report) = store.doctor_report();
+                    print!("{report}");
+                    if !ok {
+                        std::process::exit(1);
+                    }
+                }
+                _ => {
+                    eprintln!("usage: twig skill <list|enable|disable|add|doctor>");
+                    std::process::exit(2);
+                }
+            }
+        }
+
         "playbooks" => {
             let goal = args.get(1).cloned().unwrap_or_default();
             let books = Playbook::load_default();
@@ -677,6 +749,7 @@ fn main() {
                  twig record <file.jsonl>       verify the hash chain\n  \
                  twig classify <file.jsonl>     process vs content failures\n  \
                  twig playbooks <goal>          route a goal to a playbook\n  \
+                 twig skill <list|enable|disable|add|doctor>  manage curated global/project skills\n  \
                  twig decisions [file.tsv]      read the decision trail\n  \
                  twig eval [dir] [reps] [only]  scoring set: fresh repo, external judge\n  \
                  twig improve [dir] [rounds]    tune harness.json against the scoring set\n  \
