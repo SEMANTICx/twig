@@ -19,6 +19,7 @@ pub mod exec;
 pub mod llm;
 pub mod record;
 pub mod runtime;
+pub mod tui;
 pub mod verify;
 
 // Narrow public façade & compatibility re-exports for CLI and integration tests.
@@ -26,12 +27,11 @@ pub use config::paths;
 pub use eval::{classify, improve};
 pub use exec::isolation;
 pub use exec as process;
-pub use llm::{stub, Provider};
 pub use llm as provider;
+pub use llm::{stub, Llm, Provider};
 pub use record::{Decisions, Record};
 pub use runtime::{
     guard::{Guard, Level},
-    guidance as playbook, policy, subagent, terminal, Daemon,
+    guidance as playbook, policy, subagent, Daemon,
 };
-pub use llm::Llm;
 pub use verify::{Candidate, Verdict};

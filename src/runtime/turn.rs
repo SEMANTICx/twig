@@ -60,12 +60,13 @@ pub fn execute_recorded_call(
             json!({"id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}),
         )
         .map_err(|e| e.to_string())?;
-    emit(json!({"ev": "tool.started", "id": call.id, "tier": tier.as_str()}));
+    emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
     let output = if control.cancelled() {
         "cancelled before execution".into()
     } else {
         tools.run_live(call, control, emit)
     };
+    let exit_code = tools.last_exit_code();
     record
         .append(
             "tool.result",
@@ -75,7 +76,7 @@ pub fn execute_recorded_call(
                 "args": call.args,
                 "tier": tier.as_str(),
                 "output": output,
-                "exit_code": tools.last_exit_code()
+                "exit_code": exit_code
             }),
         )
         .map_err(|e| e.to_string())?;
@@ -85,7 +86,7 @@ pub fn execute_recorded_call(
             .map_err(|e| e.to_string())?;
         emit(json!({"ev": "papercut.filed", "report": call.args}));
     }
-    emit(json!({"ev": "tool.completed", "id": call.id, "bytes": output.len()}));
+    emit(json!({"ev": "tool.completed", "id": call.id, "bytes": output.len(), "exit_code": exit_code}));
     if tier == Tier::Audit {
         audit_sink(call, &output);
     }

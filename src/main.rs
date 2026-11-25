@@ -290,9 +290,17 @@ fn main() {
         "--version" | "version" => println!("twig {}", env!("CARGO_PKG_VERSION")),
         "selfcheck" => selfcheck(),
         "chat" => {
-            if let Err(e) = twig::terminal::chat(
-                args.get(1).map(String::as_str).unwrap_or("."),
-                args.get(2).map(String::as_str),
+            let plain = args.iter().any(|a| a == "--plain");
+            let positional: Vec<&str> = args
+                .iter()
+                .skip(1)
+                .filter(|a| *a != "--plain")
+                .map(String::as_str)
+                .collect();
+            if let Err(e) = twig::tui::chat(
+                positional.first().copied().unwrap_or("."),
+                positional.get(1).copied(),
+                plain,
             ) {
                 eprintln!("twig: {e}");
                 std::process::exit(1);
@@ -661,7 +669,7 @@ fn main() {
             println!(
                 "twig 0.2.0 — a thin agent harness\n\n\
                  usage:\n  \
-                 twig chat [worktree] [session] terminal interface (default)\n  \
+                 twig chat [repo] [sid] [--plain] interactive TUI (or --plain line mode)\n  \
                  twig serve [worktree] [runs]   JSON-RPC over stdio\n  \
                  twig selfcheck                 offline checks (no network)\n  \
                  twig doctor                    check config/state paths and dependencies\n  \

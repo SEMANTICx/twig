@@ -6,7 +6,6 @@ pub mod guard;
 pub mod guidance;
 pub mod policy;
 pub mod subagent;
-pub mod terminal;
 pub mod tools;
 pub mod turn;
 

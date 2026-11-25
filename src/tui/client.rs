@@ -1,13 +1,123 @@
-//! A thin terminal client of the same line-delimited protocol as IDE clients.
+//! Subprocess transport for `twig serve` (JSON-RPC over stdio) plus plain non-TTY fallback.
 
 use std::io::{BufRead, BufReader, IsTerminal, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
 use crate::config::paths;
 
-pub fn chat(repo: &str, resume: Option<&str>) -> Result<(), String> {
+#[derive(Debug)]
+pub enum ServerMsg {
+    Event(Value),
+    Reply { id: u64, result: Value },
+    Error { id: Option<u64>, message: String },
+    Stderr(String),
+    Exited,
+}
+
+pub struct ServeClient {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    rx: Receiver<ServerMsg>,
+    next_id: u64,
+}
+
+impl ServeClient {
+    pub fn spawn(repo: &str, resume: Option<&str>) -> Result<Self, String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mut command = Command::new(exe);
+        command
+            .arg("serve")
+            .arg(repo)
+            .arg(paths::state_dir().join("sessions"));
+        if let Some(id) = resume {
+            command.arg(id);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn twig serve: {e}"))?;
+        let stdin = child.stdin.take().ok_or("missing server stdin")?;
+        let stdout = child.stdout.take().ok_or("missing server stdout")?;
+        let stderr = child.stderr.take().ok_or("missing server stderr")?;
+        let (tx, rx) = mpsc::channel();
+
+        let tx_out = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let msg = if v.get("ev").is_some() {
+                    ServerMsg::Event(v)
+                } else if let Some(err) = v.get("error") {
+                    let message = err
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| err.to_string());
+                    ServerMsg::Error {
+                        id: v.get("id").and_then(Value::as_u64),
+                        message,
+                    }
+                } else {
+                    ServerMsg::Reply {
+                        id: v.get("id").and_then(Value::as_u64).unwrap_or(0),
+                        result: v.get("result").cloned().unwrap_or(Value::Null),
+                    }
+                };
+                if tx_out.send(msg).is_err() {
+                    break;
+                }
+            }
+            let _ = tx_out.send(ServerMsg::Exited);
+        });
+
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() && tx.send(ServerMsg::Stderr(line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            rx,
+            next_id: 0,
+        })
+    }
+
+    pub fn send(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let req = json!({"id": id, "method": method, "params": params});
+        let stdin = self.stdin.as_mut().ok_or("server stdin closed")?;
+        writeln!(stdin, "{req}").map_err(|e| e.to_string())?;
+        stdin.flush().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub fn try_recv(&self) -> Option<ServerMsg> {
+        self.rx.try_recv().ok()
+    }
+
+    pub fn shutdown(mut self, cancel_active: bool) {
+        if cancel_active {
+            let _ = self.send("cancel", json!({}));
+        }
+        drop(self.stdin.take());
+        let _ = self.child.wait();
+    }
+}
+
+/// Plain line-delimited fallback for piped / non-TTY sessions or `--plain`.
+pub fn chat_plain(repo: &str, resume: Option<&str>) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = Command::new(exe);
     command
@@ -23,7 +133,7 @@ pub fn chat(repo: &str, resume: Option<&str>) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     let stdout = child.stdout.take().ok_or("missing server stdout")?;
-    let input = std::sync::Arc::new(std::sync::Mutex::new(
+    let input = Arc::new(Mutex::new(
         child.stdin.take().ok_or("missing server stdin")?,
     ));
     let reader = std::thread::spawn(move || {
@@ -38,7 +148,8 @@ pub fn chat(repo: &str, resume: Option<&str>) -> Result<(), String> {
                     let _ = write!(out, "{}", v["text"].as_str().unwrap_or(""));
                 }
                 Some("tool.started") => {
-                    let _ = writeln!(out, "\n[tool {}]", v["id"].as_str().unwrap_or(""));
+                    let name = v["tool"].as_str().unwrap_or("tool");
+                    let _ = writeln!(out, "\n[{name} {}]", v["id"].as_str().unwrap_or(""));
                 }
                 Some("tool.output") => {
                     let _ = write!(out, "{}", v["text"].as_str().unwrap_or(""));
