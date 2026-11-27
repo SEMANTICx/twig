@@ -5,13 +5,90 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const IVORY: Color = Color::Rgb(245, 241, 234);
-const ACCENT: Color = Color::Rgb(217, 119, 87);
-const ACCENT_PEAK: Color = Color::Rgb(245, 183, 153);
-const SAGE: Color = Color::Rgb(136, 184, 136);
-const AMBER: Color = Color::Rgb(229, 174, 92);
-const MUTED: Color = Color::Rgb(152, 144, 134);
-const HAIRLINE: Color = Color::Rgb(112, 105, 98);
+const ACCENT: Color = Color::Rgb(215, 119, 87);
+const ACCENT_PEAK: Color = Color::Rgb(248, 206, 178);
+const AMBER: Color = Color::Rgb(232, 177, 98);
+const SAGE: Color = Color::Rgb(128, 192, 138);
+const IVORY: Color = Color::Rgb(242, 238, 232);
+const MUTED: Color = Color::Rgb(168, 160, 150);
+const HAIRLINE: Color = Color::Rgb(128, 119, 110);
+
+#[derive(Default)]
+pub(super) struct LinkRegistry {
+    urls: Vec<String>,
+    flushed: usize,
+}
+
+impl LinkRegistry {
+    pub(super) fn register(&mut self, url: &str) -> usize {
+        if let Some(pos) = self.urls.iter().position(|u| u == url) {
+            pos + 1
+        } else {
+            self.urls.push(url.to_owned());
+            self.urls.len()
+        }
+    }
+
+    pub(super) fn drain_footnotes(&mut self) -> Vec<Line<'static>> {
+        if self.flushed >= self.urls.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.urls.len() - self.flushed);
+        while self.flushed < self.urls.len() {
+            let idx = self.flushed + 1;
+            let url = self.urls[self.flushed].clone();
+            self.flushed += 1;
+            out.push(Line::from(vec![
+                Span::styled(format!("  [{idx}] "), Style::default().fg(ACCENT)),
+                Span::styled(url, Style::default().fg(MUTED)),
+            ]));
+        }
+        out
+    }
+}
+
+pub(super) fn format_link_suffix(
+    label: &str,
+    url: &str,
+    links: Option<&mut LinkRegistry>,
+) -> Option<Span<'static>> {
+    if url.is_empty() || url == label || url.starts_with('#') {
+        return None;
+    }
+    if let Some(local) = url.strip_prefix("file://") {
+        let (path_part, anchor) = match local.split_once('#') {
+            Some((p, a)) => (p, Some(a)),
+            None => (local, None),
+        };
+        let base = path_part.rsplit('/').next().unwrap_or(path_part);
+        if label.contains(base) {
+            return anchor.map(|a| Span::styled(format!(" (#{a})"), Style::default().fg(MUTED)));
+        }
+        let short = match anchor {
+            Some(a) => format!(" ({base}#{a})"),
+            None => format!(" ({base})"),
+        };
+        return Some(Span::styled(short, Style::default().fg(MUTED)));
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") && url.chars().count() <= 28 {
+        return Some(Span::styled(
+            format!(" ({url})"),
+            Style::default().fg(MUTED),
+        ));
+    }
+    if let Some(reg) = links {
+        let idx = reg.register(url);
+        Some(Span::styled(
+            format!(" [{idx}]"),
+            Style::default().fg(ACCENT),
+        ))
+    } else {
+        Some(Span::styled(
+            format!(" ({url})"),
+            Style::default().fg(MUTED),
+        ))
+    }
+}
 
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)

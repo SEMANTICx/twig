@@ -55,7 +55,11 @@ struct ToolCell {
 enum Cell {
     User(String),
     Steering(String),
-    Reasoning(String),
+    Reasoning {
+        text: String,
+        started_at: Instant,
+        elapsed: Duration,
+    },
     Assistant(String),
     Tool(ToolCell),
     Notice { kind: NoticeKind, text: String },
@@ -109,7 +113,22 @@ impl Transcript {
         self.scroll.follow_tail();
     }
 
+    fn seal_active_reasoning(&mut self) {
+        if let Some(Cell::Reasoning {
+            started_at,
+            elapsed,
+            ..
+        }) = self.cells.last_mut()
+        {
+            let live = started_at.elapsed();
+            if live > *elapsed {
+                *elapsed = live;
+            }
+        }
+    }
+
     pub fn push_assistant(&mut self, text: String) {
+        self.seal_active_reasoning();
         self.cells.push(Cell::Assistant(text));
     }
 
@@ -120,6 +139,7 @@ impl Transcript {
         if let Some(Cell::Assistant(buf)) = self.cells.last_mut() {
             buf.push_str(delta);
         } else {
+            self.seal_active_reasoning();
             self.cells.push(Cell::Assistant(delta.to_owned()));
         }
     }
@@ -128,14 +148,25 @@ impl Transcript {
         if delta.is_empty() {
             return;
         }
-        if let Some(Cell::Reasoning(buf)) = self.cells.last_mut() {
-            buf.push_str(delta);
+        if let Some(Cell::Reasoning {
+            text,
+            started_at,
+            elapsed,
+        }) = self.cells.last_mut()
+        {
+            text.push_str(delta);
+            *elapsed = started_at.elapsed();
         } else {
-            self.cells.push(Cell::Reasoning(delta.to_owned()));
+            self.cells.push(Cell::Reasoning {
+                text: delta.to_owned(),
+                started_at: Instant::now(),
+                elapsed: Duration::ZERO,
+            });
         }
     }
 
     pub fn push_tool_started(&mut self, id: String, name: String, summary: String, tier: String) {
+        self.seal_active_reasoning();
         self.cells.push(Cell::Tool(ToolCell {
             id,
             name,
@@ -614,7 +645,7 @@ impl Transcript {
                     let prev_is_trace = cell_idx > 0
                         && matches!(
                             self.cells[cell_idx - 1],
-                            Cell::Tool(_) | Cell::Reasoning(_) | Cell::Notice { .. }
+                            Cell::Tool(_) | Cell::Reasoning { .. } | Cell::Notice { .. }
                         );
                     if prev_non_empty && !prev_is_trace {
                         lines.push(Line::from(""));
@@ -740,7 +771,10 @@ impl Transcript {
                             ];
                             if total > 1 {
                                 spans.push(Span::styled(
-                                    format!("  … +{total} lines (^O expand)"),
+                                    format!(
+                                        "  … +{total} {} (^O expand)",
+                                        if total == 1 { "line" } else { "lines" }
+                                    ),
                                     Style::default().fg(MUTED),
                                 ));
                             }
@@ -766,7 +800,10 @@ impl Transcript {
                                     Span::raw(left_margin.clone()),
                                     Span::raw("     "),
                                     Span::styled(
-                                        format!("… +{rem} lines (^O expand)"),
+                                        format!(
+                                            "… +{rem} {} (^O expand)",
+                                            if rem == 1 { "line" } else { "lines" }
+                                        ),
                                         Style::default().fg(MUTED),
                                     ),
                                 ]));
@@ -805,21 +842,32 @@ impl Transcript {
                         }
                     }
                 }
-                Cell::Reasoning(text) => {
+                Cell::Reasoning {
+                    text,
+                    started_at,
+                    elapsed,
+                } => {
                     let prev_is_trace = cell_idx > 0
                         && matches!(
                             self.cells[cell_idx - 1],
-                            Cell::Tool(_) | Cell::Reasoning(_) | Cell::Notice { .. }
+                            Cell::Tool(_) | Cell::Reasoning { .. } | Cell::Notice { .. }
                         );
                     if prev_non_empty && !prev_is_trace {
                         lines.push(Line::from(""));
                     }
                     let wrapped = wrap_plain(text.trim(), prose_w.saturating_sub(2));
                     let total = wrapped.len();
+                    let line_word = if total == 1 { "line" } else { "lines" };
                     let is_prior_step = !self.expand_tools && cell_idx < last_idx;
                     if is_prior_step {
+                        let dur_secs = elapsed.as_secs();
+                        let label = if dur_secs >= 1 {
+                            format!("Thought for {}", fmt_elapsed_compact(dur_secs))
+                        } else {
+                            String::from("Thought")
+                        };
                         let hint = if total > 0 {
-                            format!(" · {total} lines (^O expand)")
+                            format!(" · {total} {line_word} (^O expand)")
                         } else {
                             String::new()
                         };
@@ -827,18 +875,30 @@ impl Transcript {
                             Span::raw(left_margin.clone()),
                             Span::styled("∴ ", Style::default().fg(MUTED)),
                             Span::styled(
-                                "Thought",
+                                label,
                                 Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
                             ),
                             Span::styled(hint, Style::default().fg(MUTED)),
                         ]));
                     } else {
+                        let live_secs = if cell_idx == last_idx && live_streaming {
+                            started_at.elapsed().as_secs()
+                        } else {
+                            elapsed.as_secs()
+                        };
                         let show = if self.expand_tools { total } else { total.min(2) };
-                        let header_hint = if !self.expand_tools && total > 2 {
-                            format!("  … +{total} lines (^O expand)")
+                        let mut header_hint = if live_secs >= 1 {
+                            format!(" ({})", fmt_elapsed_compact(live_secs))
                         } else {
                             String::new()
                         };
+                        if !self.expand_tools && total > 2 {
+                            let rem = total - 2;
+                            header_hint.push_str(&format!(
+                                "  … +{rem} {} (^O expand)",
+                                if rem == 1 { "line" } else { "lines" }
+                            ));
+                        }
                         lines.push(Line::from(vec![
                             Span::raw(left_margin.clone()),
                             Span::styled("∴ ", Style::default().fg(MUTED)),
@@ -938,7 +998,7 @@ impl Transcript {
         // Trigger folding when a finished non-local tool appears (optionally preceded by a prior reasoning step).
         match &self.cells[start] {
             Cell::Tool(t) if is_foldable_tool(t) => {}
-            Cell::Reasoning(_) if start < last_idx => {
+            Cell::Reasoning { .. } if start < last_idx => {
                 let next_is_tool = matches!(
                     self.cells.get(start + 1),
                     Some(Cell::Tool(t)) if is_foldable_tool(t)
@@ -962,7 +1022,7 @@ impl Transcript {
                     idx += 1;
                     last_folded_end = idx;
                 }
-                Cell::Reasoning(_) if idx < last_idx => {
+                Cell::Reasoning { .. } if idx < last_idx => {
                     thoughts += 1;
                     idx += 1;
                     last_folded_end = idx;
@@ -1079,7 +1139,10 @@ impl Transcript {
         if rem_tools > 0 {
             breakdown.push(format!("+{rem_tools} other"));
         } else if thoughts > 0 && breakdown.len() < 4 {
-            breakdown.push(format!("{thoughts} thought"));
+            breakdown.push(format!(
+                "{thoughts} {}",
+                if thoughts == 1 { "thought" } else { "thoughts" }
+            ));
         }
         if failed > 0 {
             breakdown.push(format!("{failed} failed"));
@@ -1229,7 +1292,7 @@ impl Transcript {
                 Cell::Steering(text) => {
                     out.push_str(&format!("> **Steering:** {}\n\n", text.trim()));
                 }
-                Cell::Reasoning(text) => {
+                Cell::Reasoning { text, .. } => {
                     out.push_str("<details>\n<summary>Thinking</summary>\n\n");
                     out.push_str(text.trim_end());
                     out.push_str("\n\n</details>\n\n");

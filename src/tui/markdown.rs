@@ -20,10 +20,10 @@ pub const BASE_SHIMMER_RGB: (u8, u8, u8) = (162, 124, 106); // warm stone-terrac
 pub const AMBER_RGB: (u8, u8, u8) = (232, 177, 98); // #E8B162 steer / approval / warn
 pub const SAGE_RGB: (u8, u8, u8) = (128, 192, 138); // #80C08A success / diff +
 pub const ROSE_RGB: (u8, u8, u8) = (224, 110, 118); // #E06E76 error / diff -
-pub const IVORY_RGB: (u8, u8, u8) = (240, 236, 229); // #F0ECE5 crisp primary text
-pub const STONE_RGB: (u8, u8, u8) = (192, 185, 176); // #C0B9B0 high-contrast secondary text (readable on transparent terminals)
-pub const MUTED_RGB: (u8, u8, u8) = (150, 143, 134); // #968F86 legible hints / tree connectors over bright wallpapers
-pub const HAIRLINE_RGB: (u8, u8, u8) = (104, 96, 89); // #686059 crisp resting hairline rule on dark & transparent terminals
+pub const IVORY_RGB: (u8, u8, u8) = (242, 238, 232); // #F2EEE8 crisp primary text
+pub const STONE_RGB: (u8, u8, u8) = (200, 193, 184); // #C8C1B8 high-contrast secondary text
+pub const MUTED_RGB: (u8, u8, u8) = (168, 160, 150); // #A8A096 legible hints over bright transparent wallpapers
+pub const HAIRLINE_RGB: (u8, u8, u8) = (128, 119, 110); // #80776E crisp table & rule borders on transparent terminals
 pub const HAIRLINE_FOCUS_RGB: (u8, u8, u8) = (154, 122, 104); // warm active hairline
 pub const SURFACE_RGB: (u8, u8, u8) = (38, 35, 32); // #262320 warm subtle surface
 pub const SURFACE_HI_RGB: (u8, u8, u8) = (56, 49, 44); // #38312C selected row highlight
@@ -496,6 +496,15 @@ pub fn style_output_line(line: &str) -> Style {
 
 /// Parse inline `` `code` ``, `**bold**`, `*italic*`, `$latex$` / `\(latex\)`, and `[text](url)` spans.
 fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
+    parse_inline_inner(text, base, None, 0)
+}
+
+fn parse_inline_inner(
+    text: &str,
+    base: Style,
+    mut links: Option<&mut super::math_table::LinkRegistry>,
+    depth: u8,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut buf = String::new();
     let chars: Vec<char> = text.chars().collect();
@@ -513,7 +522,7 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 let code: String = chars[i + 1..i + 1 + rel_end].iter().collect();
                 spans.push(Span::styled(
                     format!(" {code} "),
-                    Style::default().fg(ACCENT_PEAK).bg(SURFACE),
+                    base.fg(ACCENT_PEAK).bg(SURFACE),
                 ));
                 i += rel_end + 2;
                 continue;
@@ -535,7 +544,7 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 let raw_math: String = chars[i + 2..end_idx].iter().collect();
                 spans.push(Span::styled(
                     super::math_table::format_latex_math(&raw_math),
-                    Style::default().fg(AMBER),
+                    base.fg(AMBER),
                 ));
                 i = end_idx + 2;
                 continue;
@@ -567,7 +576,7 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                         flush(&mut buf, base, &mut spans);
                         spans.push(Span::styled(
                             super::math_table::format_latex_math(&raw_math),
-                            Style::default().fg(AMBER),
+                            base.fg(AMBER),
                         ));
                         i = end_idx + 1;
                         continue;
@@ -575,7 +584,7 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 }
             }
         }
-        // Markdown link `[label](url)`
+        // Markdown link `[label](url)` — compact inline reference `[n]` with clean footnote URLs
         if chars[i] == '[' {
             if let Some(rel_rb) = chars[i + 1..].iter().position(|&c| c == ']') {
                 let rb = i + 1 + rel_rb;
@@ -585,17 +594,16 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                         flush(&mut buf, base, &mut spans);
                         let label: String = chars[i + 1..rb].iter().collect();
                         let url: String = chars[rb + 2..rp].iter().collect();
-                        spans.push(Span::styled(
-                            label.clone(),
-                            Style::default()
-                                .fg(ACCENT_PEAK)
-                                .add_modifier(Modifier::UNDERLINED),
-                        ));
-                        if !url.is_empty() && url != label && !url.starts_with('#') {
-                            spans.push(Span::styled(
-                                format!(" ({url})"),
-                                Style::default().fg(MUTED),
-                            ));
+                        let link_style = base.fg(ACCENT_PEAK).add_modifier(Modifier::UNDERLINED);
+                        if depth < 2 {
+                            spans.extend(parse_inline_inner(&label, link_style, None, depth + 1));
+                        } else {
+                            spans.push(Span::styled(label.clone(), link_style));
+                        }
+                        if let Some(suffix) =
+                            super::math_table::format_link_suffix(&label, url.trim(), links.as_deref_mut())
+                        {
+                            spans.push(suffix);
                         }
                         i = rp + 1;
                         continue;
@@ -603,7 +611,7 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 }
             }
         }
-        // `**bold**`
+        // `**bold**` (recursively parses nested `` `code` ``, `$math$`, and `[link](url)`)
         if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
             let mut end = None;
             let mut j = i + 2;
@@ -617,10 +625,17 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
             if let Some(end_idx) = end {
                 flush(&mut buf, base, &mut spans);
                 let bold: String = chars[i + 2..end_idx].iter().collect();
-                spans.push(Span::styled(
-                    bold,
-                    base.fg(IVORY).add_modifier(Modifier::BOLD),
-                ));
+                let bold_style = base.fg(IVORY).add_modifier(Modifier::BOLD);
+                if depth < 2 {
+                    spans.extend(parse_inline_inner(
+                        &bold,
+                        bold_style,
+                        links.as_deref_mut(),
+                        depth + 1,
+                    ));
+                } else {
+                    spans.push(Span::styled(bold, bold_style));
+                }
                 i = end_idx + 2;
                 continue;
             }
@@ -636,10 +651,17 @@ fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
             {
                 flush(&mut buf, base, &mut spans);
                 let italic: String = chars[i + 1..i + 1 + rel_end].iter().collect();
-                spans.push(Span::styled(
-                    italic,
-                    base.add_modifier(Modifier::ITALIC),
-                ));
+                let it_style = base.add_modifier(Modifier::ITALIC);
+                if depth < 2 {
+                    spans.extend(parse_inline_inner(
+                        &italic,
+                        it_style,
+                        links.as_deref_mut(),
+                        depth + 1,
+                    ));
+                } else {
+                    spans.push(Span::styled(italic, it_style));
+                }
                 i += rel_end + 2;
                 continue;
             }
@@ -661,6 +683,7 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let width = max_width.max(12);
     let mut out = Vec::new();
     let body = Style::default().fg(IVORY);
+    let links = std::cell::RefCell::new(super::math_table::LinkRegistry::default());
 
     let raw_lines: Vec<&str> = text
         .split('\n')
@@ -670,6 +693,11 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
 
     while idx < raw_lines.len() {
         let line = raw_lines[idx];
+        let lead_cols: usize = line
+            .chars()
+            .take_while(|c| matches!(c, ' ' | '\t'))
+            .map(|c| if c == '\t' { 2 } else { 1 })
+            .sum();
         let trimmed = line.trim_start();
 
         if let Some(fence) = trimmed.strip_prefix("```") {
@@ -741,16 +769,20 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                 }
                 idx += 1;
             }
-            if let Some(tbl_lines) =
-                super::math_table::render_gfm_table(&raw_lines[start..idx], width, parse_inline)
-            {
+            if let Some(tbl_lines) = super::math_table::render_gfm_table(
+                &raw_lines[start..idx],
+                width,
+                |s, st| parse_inline_inner(s, st, Some(&mut links.borrow_mut()), 0),
+            ) {
                 out.extend(tbl_lines);
+                out.extend(links.borrow_mut().drain_footnotes());
                 continue;
             }
             idx = start;
         }
 
         if trimmed.is_empty() {
+            out.extend(links.borrow_mut().drain_footnotes());
             out.push(Line::from(""));
             idx += 1;
             continue;
@@ -856,6 +888,8 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
+            let depth = (lead_cols / 2).min(4);
+            let nest = "  ".repeat(depth);
             let (bullet, bullet_color, item_rest) = if let Some(r) =
                 rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] "))
             {
@@ -863,17 +897,22 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             } else if let Some(r) = rest.strip_prefix("[ ] ") {
                 ("☐ ", MUTED, r)
             } else {
-                ("• ", ACCENT, rest)
+                match depth {
+                    0 => ("• ", ACCENT, rest),
+                    1 => ("◦ ", ACCENT_PEAK, rest),
+                    _ => ("▪ ", STONE, rest),
+                }
             };
-            let indent_width = width.saturating_sub(2);
-            for (w_idx, row_spans) in wrap_spans(parse_inline(item_rest, body), indent_width)
-                .into_iter()
-                .enumerate()
-            {
-                let mut spans = vec![Span::styled(
-                    if w_idx == 0 { bullet } else { "  " },
-                    Style::default().fg(bullet_color),
-                )];
+            let indent_width = width.saturating_sub(nest.len() + 2);
+            let parsed = parse_inline_inner(item_rest, body, Some(&mut links.borrow_mut()), 0);
+            for (w_idx, row_spans) in wrap_spans(parsed, indent_width).into_iter().enumerate() {
+                let mut spans = vec![
+                    Span::raw(nest.clone()),
+                    Span::styled(
+                        if w_idx == 0 { bullet } else { "  " },
+                        Style::default().fg(bullet_color),
+                    ),
+                ];
                 spans.extend(row_spans);
                 out.push(Line::from(spans));
             }
@@ -881,28 +920,31 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Ordered list (`1. item`, `2) item`)
+        // Ordered list (`1. item`, `2) item`) with nested indentation preserved
         let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
         if (1..=3).contains(&digits)
             && matches!(trimmed.as_bytes().get(digits), Some(b'.' | b')'))
             && trimmed.as_bytes().get(digits + 1) == Some(&b' ')
         {
+            let depth = (lead_cols / 2).min(4);
+            let nest = "  ".repeat(depth);
             let marker = format!("{} ", &trimmed[..=digits]);
             let m_width = marker.len();
             let rest = &trimmed[digits + 2..];
-            let indent_w = width.saturating_sub(m_width);
-            for (w_idx, row_spans) in wrap_spans(parse_inline(rest, body), indent_w)
-                .into_iter()
-                .enumerate()
-            {
-                let mut spans = vec![Span::styled(
-                    if w_idx == 0 {
-                        marker.clone()
-                    } else {
-                        " ".repeat(m_width)
-                    },
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )];
+            let indent_w = width.saturating_sub(nest.len() + m_width);
+            let parsed = parse_inline_inner(rest, body, Some(&mut links.borrow_mut()), 0);
+            for (w_idx, row_spans) in wrap_spans(parsed, indent_w).into_iter().enumerate() {
+                let mut spans = vec![
+                    Span::raw(nest.clone()),
+                    Span::styled(
+                        if w_idx == 0 {
+                            marker.clone()
+                        } else {
+                            " ".repeat(m_width)
+                        },
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ];
                 spans.extend(row_spans);
                 out.push(Line::from(spans));
             }
@@ -910,11 +952,13 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        for row_spans in wrap_spans(parse_inline(line, body), width) {
+        let parsed = parse_inline_inner(line, body, Some(&mut links.borrow_mut()), 0);
+        for row_spans in wrap_spans(parsed, width) {
             out.push(Line::from(row_spans));
         }
         idx += 1;
     }
+    out.extend(links.borrow_mut().drain_footnotes());
 
     out
 }
@@ -1502,7 +1546,7 @@ pub fn shortcut_overlay_lines(width: usize) -> Vec<Line<'static>> {
             "copy code / full reply",
         ),
         Line::from(Span::styled(
-            "  Esc interrupt / ×2 clear or rewind · ^R history · Alt+V paste img · Alt+M mouse · ^C quit",
+            "  Esc interrupt / ×2 clear · ^R history · Shift+drag or Alt+M select text · ^C quit",
             Style::default().fg(MUTED),
         )),
     ]
@@ -1932,5 +1976,15 @@ mod tests {
         assert!(!text.contains("\\frac"), "latex command converted: {text}");
         assert!(text.contains('┌') && text.contains("11-27"), "gfm box table: {text}");
         assert!(text.contains("E = mc²"), "display math rendered: {text}");
+
+        let rich = "**重点核对 `H-01` 的 [市场判断](https://x.com/thankUcrypto/status/2126226625524343032)**\n\n- 一级要点\n  - 二级要点 [web.rs](file:///home/u/src/web.rs#L10-L20)\n    - 三级要点";
+        let rich_out: String = render_markdown(rich, 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rich_out.contains("市场判断 [1]") && rich_out.contains("  [1] https://x.com/thankUcrypto/status/2126226625524343032"));
+        assert!(rich_out.contains(" H-01 ") && rich_out.contains("web.rs (#L10-L20)"));
+        assert!(rich_out.contains("• 一级要点") && rich_out.contains("  ◦ 二级要点") && rich_out.contains("    ▪ 三级要点"));
     }
 }
