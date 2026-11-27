@@ -1719,10 +1719,29 @@ mod tests {
         // `↓` in empty composer opens Subagents & Tasks drawer
         app.running = false;
         app.apply_event(&json!({
-            "ev": "subagent.started", "role": "scout", "task": "Map tui modules", "parallel": false
+            "ev": "subagent.started", "id": "sub-1", "role": "scout", "task": "Map tui modules", "parallel": true
         }));
+        app.apply_event(&json!({
+            "ev": "subagent.started", "id": "sub-2", "role": "scout", "task": "Map runtime tools", "parallel": true
+        }));
+        let cells_before = app.transcript.len();
+        app.apply_event(&json!({
+            "ev": "subagent.progress", "id": "sub-1", "role": "scout", "activity": "Read(src/tui/mod.rs)", "turns": 2
+        }));
+        app.apply_event(&json!({
+            "ev": "subagent.progress", "id": "sub-2", "role": "scout", "activity": "Grep(SubagentPool)", "turns": 1
+        }));
+        // Out-of-band progress must never pollute the main transcript (0-token UI guarantee).
+        assert_eq!(app.transcript.len(), cells_before);
+        let strip_frame = render_frame_text(&mut app, 120, 28);
+        assert!(strip_frame.contains("Read(src/tui/mod.rs) · t2"));
+        assert!(strip_frame.contains("Grep(SubagentPool) · t1"));
+
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(app.overlay_picker, Some(OverlayPicker::Tasks { .. })));
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        let drawer_frame = render_frame_text(&mut app, 120, 28);
+        assert!(drawer_frame.contains("trace (t2): Read(src/tui/mod.rs)"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

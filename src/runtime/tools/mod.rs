@@ -903,6 +903,7 @@ struct SubagentSpec<'a> {
 }
 
 struct SubagentOutcome<'a> {
+    id: String,
     text: String,
     raw_reply: String,
     slice: Option<&'a str>,
@@ -949,7 +950,8 @@ impl Tools {
     }
 
     /// Execute a batch of `subagent` tool calls concurrently via `SubagentPool`
-    /// while preserving original call order and emitting lifecycle events.
+    /// while preserving original call order and streaming out-of-band UI lifecycle events
+    /// (zero tokens injected into parent LLM messages).
     pub fn run_subagents_batch(
         &mut self,
         calls: &[&ToolCall],
@@ -957,13 +959,20 @@ impl Tools {
         emit: &mut dyn FnMut(Value),
     ) -> Vec<(String, Option<i32>)> {
         let mut parsed = Vec::with_capacity(calls.len());
+        let mut call_ids = Vec::with_capacity(calls.len());
         let mut any_valid = false;
-        for call in calls {
+        for (idx, call) in calls.iter().enumerate() {
+            let cid = if call.id.is_empty() {
+                format!("sub-{idx}")
+            } else {
+                call.id.clone()
+            };
             let p = self.parse_subagent_args(&call.args);
             if let Ok(spec) = &p {
                 any_valid = true;
                 emit(json!({
                     "ev": "subagent.started",
+                    "id": cid,
                     "role": spec.role_name,
                     "task": spec.task,
                     "model": spec.model,
@@ -971,6 +980,7 @@ impl Tools {
                     "parallel": calls.len() > 1
                 }));
             }
+            call_ids.push(cid);
             parsed.push(p);
         }
         if !any_valid {
@@ -993,12 +1003,15 @@ impl Tools {
                 self.blackboard.join("\n")
             )
         });
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
         let results: Vec<Result<SubagentOutcome<'_>, String>> = std::thread::scope(|s| {
             let board_ref = board_snapshot.as_deref();
             let handles: Vec<_> = parsed
                 .into_iter()
-                .map(|item| {
+                .zip(call_ids)
+                .map(|(item, cid)| {
                     let pool = pool.clone();
+                    let tx = tx.clone();
                     s.spawn(move || {
                         let spec = item?;
                         let started = std::time::Instant::now();
@@ -1015,7 +1028,16 @@ impl Tools {
                             }
                         }
                         composed_task.push_str(spec.task);
-                        let run = pool.run_resumable(
+                        let progress_cb = |activity: &str, turns: u32| {
+                            let _ = tx.send(json!({
+                                "ev": "subagent.progress",
+                                "id": cid,
+                                "role": spec.role_name,
+                                "activity": activity,
+                                "turns": turns,
+                            }));
+                        };
+                        let run = pool.run_resumable_live(
                             spec.role,
                             &composed_task,
                             spec.model,
@@ -1023,6 +1045,7 @@ impl Tools {
                             spec.resume_sid,
                             parent_artifacts,
                             spec.fork_context.then_some(parent_messages).flatten(),
+                            Some(&progress_cb),
                         );
                         let elapsed_secs = started.elapsed().as_secs();
                         match run {
@@ -1049,6 +1072,7 @@ impl Tools {
                                     "result": r.result,
                                 });
                                 Ok(SubagentOutcome {
+                                    id: cid,
                                     text: serde_json::to_string_pretty(&summary).unwrap_or_default(),
                                     raw_reply,
                                     slice: spec.slice,
@@ -1059,6 +1083,7 @@ impl Tools {
                                 })
                             }
                             Err(e) => Ok(SubagentOutcome {
+                                id: cid,
                                 text: format!("subagent error: {e}"),
                                 raw_reply: String::new(),
                                 slice: spec.slice,
@@ -1071,6 +1096,10 @@ impl Tools {
                     })
                 })
                 .collect();
+            drop(tx);
+            for ev in rx {
+                emit(ev);
+            }
             handles
                 .into_iter()
                 .map(|h| {
@@ -1112,6 +1141,7 @@ impl Tools {
                     });
                     emit(json!({
                         "ev": "subagent.completed",
+                        "id": done.id,
                         "role": done.role_name,
                         "ok": done.ok,
                         "elapsed_secs": done.elapsed_secs,

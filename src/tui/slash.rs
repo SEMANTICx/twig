@@ -607,11 +607,13 @@ impl App {
                 }
             }
             Some("subagent.started") => {
+                let id = ev["id"].as_str().unwrap_or("").to_owned();
                 let role = ev["role"].as_str().unwrap_or("subagent").to_owned();
                 let task = ev["task"].as_str().unwrap_or("").trim().to_owned();
                 let parallel = ev["parallel"] == true;
                 self.update_status_header(format!("Subagent [{role}]"));
                 self.subagents.push(super::overlays::SubagentEntry {
+                    id,
                     role,
                     task,
                     parallel,
@@ -619,13 +621,62 @@ impl App {
                     elapsed_secs: None,
                     status: super::overlays::SubagentStatus::Running,
                     error: None,
+                    activity: None,
+                    turns: 0,
+                    trace: Vec::new(),
                 });
                 if self.subagents.len() > 16 {
                     let drop_n = self.subagents.len() - 16;
                     self.subagents.drain(..drop_n);
                 }
+                if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
+                    &mut self.overlay_picker
+                {
+                    *subagents = self.subagents.clone();
+                }
+            }
+            Some("subagent.progress") => {
+                let id = ev["id"].as_str().unwrap_or("");
+                let role = ev["role"].as_str().unwrap_or("subagent");
+                let activity = ev["activity"].as_str().unwrap_or("").trim();
+                let turns = ev["turns"].as_u64().unwrap_or(0) as u32;
+                let match_idx = (!id.is_empty())
+                    .then(|| {
+                        self.subagents.iter().position(|s| {
+                            s.status == super::overlays::SubagentStatus::Running && s.id == id
+                        })
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        self.subagents.iter().position(|s| {
+                            s.status == super::overlays::SubagentStatus::Running && s.role == role
+                        })
+                    });
+                if let Some(idx) = match_idx {
+                    let entry = &mut self.subagents[idx];
+                    if turns > entry.turns {
+                        entry.turns = turns;
+                    }
+                    if !activity.is_empty() {
+                        entry.activity = Some(activity.to_owned());
+                        if !activity.starts_with("thinking")
+                            && entry.trace.last().map(String::as_str) != Some(activity)
+                        {
+                            entry.trace.push(activity.to_owned());
+                            if entry.trace.len() > 6 {
+                                entry.trace.remove(0);
+                            }
+                        }
+                    }
+                    if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
+                        &mut self.overlay_picker
+                    {
+                        *subagents = self.subagents.clone();
+                    }
+                }
             }
             Some("subagent.completed") => {
+                let id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent");
                 let ok = ev["ok"] == true;
                 let secs = ev["elapsed_secs"].as_u64().unwrap_or(0);
@@ -638,11 +689,17 @@ impl App {
                 } else {
                     super::overlays::SubagentStatus::Failed
                 };
-                let match_idx = self
-                    .subagents
-                    .iter()
-                    .position(|s| {
-                        s.status == super::overlays::SubagentStatus::Running && s.role == role
+                let match_idx = (!id.is_empty())
+                    .then(|| {
+                        self.subagents.iter().position(|s| {
+                            s.status == super::overlays::SubagentStatus::Running && s.id == id
+                        })
+                    })
+                    .flatten()
+                    .or_else(|| {
+                        self.subagents.iter().position(|s| {
+                            s.status == super::overlays::SubagentStatus::Running && s.role == role
+                        })
                     })
                     .or_else(|| {
                         self.subagents
@@ -653,8 +710,10 @@ impl App {
                     self.subagents[idx].status = next_status;
                     self.subagents[idx].elapsed_secs = Some(secs);
                     self.subagents[idx].error = err_note;
+                    self.subagents[idx].activity = None;
                 } else {
                     self.subagents.push(super::overlays::SubagentEntry {
+                        id: id.to_owned(),
                         role: role.to_owned(),
                         task: String::new(),
                         parallel: false,
@@ -662,7 +721,15 @@ impl App {
                         elapsed_secs: Some(secs),
                         status: next_status,
                         error: err_note,
+                        activity: None,
+                        turns: 0,
+                        trace: Vec::new(),
                     });
+                }
+                if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
+                    &mut self.overlay_picker
+                {
+                    *subagents = self.subagents.clone();
                 }
             }
             Some("task.started") => {

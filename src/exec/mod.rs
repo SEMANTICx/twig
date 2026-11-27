@@ -461,11 +461,31 @@ impl Drop for ChildOwner {
     }
 }
 
+fn feed_stdout_lines(pending: &mut Vec<u8>, chunk: &[u8], on_line: &mut dyn FnMut(&str)) {
+    const MAX_LINE_BYTES: usize = 32_768;
+    for &b in chunk {
+        if b == b'\n' {
+            if !pending.is_empty() {
+                let line = String::from_utf8_lossy(pending);
+                let trimmed = line.trim_end_matches('\r');
+                if !trimmed.is_empty() {
+                    on_line(trimmed);
+                }
+                pending.clear();
+            }
+        } else if pending.len() < MAX_LINE_BYTES {
+            pending.push(b);
+        }
+    }
+}
+
 #[cfg(unix)]
+#[allow(clippy::type_complexity)]
 fn drain_bounded(
     stream: &mut UnixStream,
     bytes: &mut Vec<u8>,
     remaining: &mut usize,
+    mut line_state: Option<(&mut Vec<u8>, &mut dyn FnMut(&str))>,
 ) -> io::Result<bool> {
     let mut buf = [0; 8192];
     let mut truncated = false;
@@ -473,10 +493,14 @@ fn drain_bounded(
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                let chunk = &buf[..n];
                 let take = n.min(*remaining);
-                bytes.extend_from_slice(&buf[..take]);
+                bytes.extend_from_slice(&chunk[..take]);
                 *remaining -= take;
                 truncated |= take < n;
+                if let Some((pending, on_line)) = line_state.as_mut() {
+                    feed_stdout_lines(pending, chunk, *on_line);
+                }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => break,
             Err(e) => return Err(e),
@@ -486,12 +510,24 @@ fn drain_bounded(
 }
 
 /// Nonblocking bounded stdin/stdout/stderr; terminates all children before reaping.
-#[cfg(unix)]
 pub fn run_process(
     command: &mut Command,
     input: &[u8],
     timeout: Duration,
     max_output_bytes: usize,
+) -> io::Result<Capture> {
+    run_process_streaming(command, input, timeout, max_output_bytes, &mut |_| {})
+}
+
+/// Like `run_process`, invoking `on_stdout_line` incrementally as complete newline-delimited
+/// stdout lines arrive (even if total stdout later exceeds `max_output_bytes`).
+#[cfg(unix)]
+pub fn run_process_streaming(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    max_output_bytes: usize,
+    on_stdout_line: &mut dyn FnMut(&str),
 ) -> io::Result<Capture> {
     let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
     let (mut stdin, input_child) = UnixStream::pair()?;
@@ -518,6 +554,7 @@ pub fn run_process(
         timed_out: false,
         truncated: false,
     };
+    let mut pending_line = Vec::new();
     let mut sent = 0;
     let mut closed = false;
     loop {
@@ -539,8 +576,13 @@ pub fn run_process(
         }
         let mut remaining =
             max_output_bytes.saturating_sub(capture.stdout.len() + capture.stderr.len());
-        capture.truncated |= drain_bounded(&mut stdout, &mut capture.stdout, &mut remaining)?;
-        capture.truncated |= drain_bounded(&mut stderr, &mut capture.stderr, &mut remaining)?;
+        capture.truncated |= drain_bounded(
+            &mut stdout,
+            &mut capture.stdout,
+            &mut remaining,
+            Some((&mut pending_line, on_stdout_line)),
+        )?;
+        capture.truncated |= drain_bounded(&mut stderr, &mut capture.stderr, &mut remaining, None)?;
         if let Some(code) = status_without_reaping(owner.0.as_mut().unwrap())? {
             capture.exit_code = Some(code);
             break;
@@ -554,8 +596,20 @@ pub fn run_process(
     kill_tree(pid);
     let mut remaining =
         max_output_bytes.saturating_sub(capture.stdout.len() + capture.stderr.len());
-    capture.truncated |= drain_bounded(&mut stdout, &mut capture.stdout, &mut remaining)?;
-    capture.truncated |= drain_bounded(&mut stderr, &mut capture.stderr, &mut remaining)?;
+    capture.truncated |= drain_bounded(
+        &mut stdout,
+        &mut capture.stdout,
+        &mut remaining,
+        Some((&mut pending_line, on_stdout_line)),
+    )?;
+    capture.truncated |= drain_bounded(&mut stderr, &mut capture.stderr, &mut remaining, None)?;
+    if !pending_line.is_empty() {
+        let line = String::from_utf8_lossy(&pending_line);
+        let trimmed = line.trim_end_matches('\r');
+        if !trimmed.is_empty() {
+            on_stdout_line(trimmed);
+        }
+    }
     if let Some(mut child) = owner.0.take() {
         child.wait()?;
     }
@@ -563,11 +617,12 @@ pub fn run_process(
 }
 
 #[cfg(not(unix))]
-pub fn run_process(
+pub fn run_process_streaming(
     command: &mut Command,
     input: &[u8],
     timeout: Duration,
     max_output_bytes: usize,
+    on_stdout_line: &mut dyn FnMut(&str),
 ) -> io::Result<Capture> {
     let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
     let mut child = command
@@ -632,6 +687,15 @@ pub fn run_process(
     }
     let (stdout, t1) = out_h.join().unwrap_or_default();
     let (stderr, t2) = err_h.join().unwrap_or_default();
+    let mut pending = Vec::new();
+    feed_stdout_lines(&mut pending, &stdout, on_stdout_line);
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending);
+        let trimmed = line.trim_end_matches('\r');
+        if !trimmed.is_empty() {
+            on_stdout_line(trimmed);
+        }
+    }
     Ok(Capture {
         stdout,
         stderr,
@@ -750,5 +814,24 @@ mod tests {
         .unwrap();
         assert!(out.timed_out && !out.passed && out.truncated);
         assert!(out.output.len() <= 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_process_streaming_delivers_lines_before_exit() {
+        let mut cmd = shell_command("printf 'first\\n'; sleep 0.12; printf 'second\\n'");
+        let mut seen: Vec<(String, Instant)> = Vec::new();
+        let cap = run_process_streaming(&mut cmd, &[], Duration::from_secs(3), 4096, &mut |line| {
+            seen.push((line.to_owned(), Instant::now()));
+        })
+        .unwrap();
+        assert_eq!(cap.exit_code, Some(0));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, "first");
+        assert_eq!(seen[1].0, "second");
+        assert!(
+            seen[1].1.saturating_duration_since(seen[0].1) >= Duration::from_millis(50),
+            "expected first line to stream before second line arrived"
+        );
     }
 }

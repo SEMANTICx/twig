@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::paths;
-use crate::exec::run_process;
+use crate::exec::{run_process, run_process_streaming};
 use crate::llm::Llm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,7 +647,7 @@ impl SubagentPool {
     }
 
     pub fn run(&self, role: Role, task: &str) -> io::Result<SubagentResult> {
-        self.prepare_and_run(role, "sub", task, None, None, None, None, None, None)
+        self.prepare_and_run(role, "sub", task, None, None, None, None, None, None, None)
     }
 
     pub fn run_with_options(
@@ -657,7 +657,7 @@ impl SubagentPool {
         model: Option<&str>,
         effort: Option<&str>,
     ) -> io::Result<SubagentResult> {
-        self.prepare_and_run(role, "sub", task, None, model, effort, None, None, None)
+        self.prepare_and_run(role, "sub", task, None, model, effort, None, None, None, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -681,6 +681,35 @@ impl SubagentPool {
             resume_sid,
             parent_artifacts,
             fork_messages,
+            None,
+        )
+    }
+
+    /// Execute a subagent while streaming out-of-band UI activity updates (`(activity, turns)`)
+    /// directly from child JSONL stdout without leaking any tokens into the parent LLM context.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_resumable_live(
+        &self,
+        role: Role,
+        task: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        resume_sid: Option<&str>,
+        parent_artifacts: Option<&Path>,
+        fork_messages: Option<&[Value]>,
+        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
+    ) -> io::Result<SubagentResult> {
+        self.prepare_and_run(
+            role,
+            "sub",
+            task,
+            None,
+            model,
+            effort,
+            resume_sid,
+            parent_artifacts,
+            fork_messages,
+            on_progress,
         )
     }
 
@@ -712,10 +741,11 @@ impl SubagentPool {
             None,
             None,
             None,
+            None,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_and_run(
         &self,
         role: Role,
@@ -727,6 +757,7 @@ impl SubagentPool {
         resume_sid: Option<&str>,
         parent_artifacts: Option<&Path>,
         fork_messages: Option<&[Value]>,
+        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
     ) -> io::Result<SubagentResult> {
         if task.trim().is_empty() {
             return Err(io::Error::new(
@@ -831,6 +862,7 @@ impl SubagentPool {
             &run_dir,
             model_override,
             effort_override,
+            on_progress,
         );
 
         if let Ok(ref mut ok_res) = result {
@@ -874,7 +906,7 @@ impl SubagentPool {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn run_in_worktree(
         &self,
         sid: &str,
@@ -885,6 +917,7 @@ impl SubagentPool {
         run_dir: &Path,
         model_override: Option<&str>,
         effort_override: Option<&str>,
+        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
     ) -> io::Result<SubagentResult> {
         let host_worktree = worktree.canonicalize()?;
         let host_runs = run_dir.canonicalize()?;
@@ -941,6 +974,9 @@ impl SubagentPool {
         // External CLI worker bridge (`cli:codex`, `cli:claude`, `cli:gemini`) running inside
         // the isolated Git worktree with automatic diff & review extraction.
         if resolved_model.starts_with("cli:") {
+            if let Some(cb) = on_progress {
+                cb(&format!("running {resolved_model}"), 1);
+            }
             let effective_task = task.replace(
                 "/runs/review.diff",
                 &host_runs.join("review.diff").display().to_string(),
@@ -1068,11 +1104,35 @@ impl SubagentPool {
             "{}\n",
             json!({"id":1,"method":"turn","params":{"input":effective_task,"role":role.as_str()}})
         ));
-        let capture = run_process(
+        let mut live_turns: u32 = 0;
+        let capture = run_process_streaming(
             &mut command,
             request.as_bytes(),
             self.config.timeout,
             self.config.max_output_bytes,
+            &mut |line| {
+                let Some(cb) = on_progress else {
+                    return;
+                };
+                if !line.starts_with('{') || !line.contains("\"ev\"") {
+                    return;
+                }
+                if !(line.contains("tool.started")
+                    || line.contains("turn.started")
+                    || line.contains("model.retry"))
+                {
+                    return;
+                }
+                let Ok(ev) = serde_json::from_str::<Value>(line) else {
+                    return;
+                };
+                if let Some((activity, next_turns)) =
+                    summarize_child_progress_event(&ev, live_turns)
+                {
+                    live_turns = next_turns;
+                    cb(&activity, live_turns);
+                }
+            },
         )?;
         let mut raw = String::from_utf8_lossy(&capture.stdout).into_owned();
         raw.push_str(&String::from_utf8_lossy(&capture.stderr));
@@ -1147,6 +1207,115 @@ impl SubagentPool {
     }
 }
 
+fn compact_arg_snippet(raw: &str, max_chars: usize) -> String {
+    let single = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = single.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        trimmed.to_owned()
+    } else {
+        let mut s: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    }
+}
+
+fn compact_path_tail(raw: &str) -> String {
+    let trimmed = raw.trim().trim_start_matches("./");
+    let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
+    let shown = if parts.len() > 2 {
+        parts[parts.len() - 2..].join("/")
+    } else {
+        trimmed.to_owned()
+    };
+    compact_arg_snippet(&shown, 32)
+}
+
+/// Convert a child `twig serve` JSONL event into a tiny UI-only `(activity, turns)` tuple.
+/// Never enters the parent LLM's context; purely for operator progress rendering.
+fn summarize_child_progress_event(ev: &Value, current_turns: u32) -> Option<(String, u32)> {
+    match ev["ev"].as_str()? {
+        "turn.started" => {
+            let next = ev["turns_used"]
+                .as_u64()
+                .map(|n| n as u32 + 1)
+                .unwrap_or(current_turns.saturating_add(1));
+            Some((format!("thinking (t{next})"), next))
+        }
+        "model.retry" => Some(("retrying model…".into(), current_turns.max(1))),
+        "tool.started" => {
+            let tool = ev["tool"].as_str().unwrap_or("tool");
+            let args = &ev["args"];
+            let label = match tool {
+                "read_file" => {
+                    let p = args["path"].as_str().unwrap_or("");
+                    if p.is_empty() {
+                        "Read".into()
+                    } else {
+                        format!("Read({})", compact_path_tail(p))
+                    }
+                }
+                "edit_file" => {
+                    let p = args["path"].as_str().unwrap_or("");
+                    if p.is_empty() {
+                        "Edit".into()
+                    } else {
+                        format!("Edit({})", compact_path_tail(p))
+                    }
+                }
+                "write_file" => {
+                    let p = args["path"].as_str().unwrap_or("");
+                    if p.is_empty() {
+                        "Write".into()
+                    } else {
+                        format!("Write({})", compact_path_tail(p))
+                    }
+                }
+                "apply_patch" => "Patch".into(),
+                "grep" => {
+                    let q = args["pattern"].as_str().unwrap_or("");
+                    if q.is_empty() {
+                        "Grep".into()
+                    } else {
+                        format!("Grep({})", compact_arg_snippet(q, 24))
+                    }
+                }
+                "glob" => {
+                    let q = args["pattern"].as_str().unwrap_or("");
+                    if q.is_empty() {
+                        "Glob".into()
+                    } else {
+                        format!("Glob({})", compact_arg_snippet(q, 24))
+                    }
+                }
+                "list_dir" => {
+                    let p = args["path"].as_str().unwrap_or(".");
+                    format!("List({})", compact_path_tail(p))
+                }
+                "bash" => {
+                    let c = args["command"].as_str().unwrap_or("");
+                    if c.is_empty() {
+                        "Bash".into()
+                    } else {
+                        format!("Bash({})", compact_arg_snippet(c, 28))
+                    }
+                }
+                "web_search" => {
+                    let q = args["query"].as_str().unwrap_or("");
+                    format!("WebSearch({})", compact_arg_snippet(q, 24))
+                }
+                "web_fetch" => {
+                    let u = args["url"].as_str().unwrap_or("");
+                    format!("WebFetch({})", compact_arg_snippet(u, 24))
+                }
+                other => other.to_owned(),
+            };
+            Some((label, current_turns.max(1)))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,5 +1385,28 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(rw_args.contains(&"--dangerously-skip-permissions".to_owned()));
+
+        assert_eq!(
+            summarize_child_progress_event(&json!({"ev": "turn.started", "turns_used": 2}), 0),
+            Some(("thinking (t3)".into(), 3))
+        );
+        assert_eq!(
+            summarize_child_progress_event(
+                &json!({"ev": "tool.started", "tool": "read_file", "args": {"path": "src/runtime/subagent.rs"}}),
+                3
+            ),
+            Some(("Read(runtime/subagent.rs)".into(), 3))
+        );
+        assert_eq!(
+            summarize_child_progress_event(
+                &json!({"ev": "tool.started", "tool": "bash", "args": {"command": "cargo test --lib"}}),
+                3
+            ),
+            Some(("Bash(cargo test --lib)".into(), 3))
+        );
+        assert_eq!(
+            summarize_child_progress_event(&json!({"ev": "token.delta", "text": "hello"}), 3),
+            None
+        );
     }
 }

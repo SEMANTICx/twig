@@ -483,6 +483,7 @@ pub enum SubagentStatus {
 
 #[derive(Debug, Clone)]
 pub struct SubagentEntry {
+    pub id: String,
     pub role: String,
     pub task: String,
     pub parallel: bool,
@@ -490,6 +491,9 @@ pub struct SubagentEntry {
     pub elapsed_secs: Option<u64>,
     pub status: SubagentStatus,
     pub error: Option<String>,
+    pub activity: Option<String>,
+    pub turns: u32,
+    pub trace: Vec<String>,
 }
 
 pub fn subagent_strip_height(subagents: &[SubagentEntry]) -> u16 {
@@ -680,14 +684,32 @@ pub fn render_subagent_strip(
         } else {
             entry.role.clone()
         };
-        let clean_task = compact_subagent_task(&entry.task, task_cap);
-        let summary_text = match &entry.error {
-            Some(err) if entry.status == SubagentStatus::Failed => {
-                clip_str(&format!("[{err}] {clean_task}"), task_cap)
-            }
-            _ => clean_task,
+        let live_suffix = if entry.status == SubagentStatus::Running {
+            entry.activity.as_deref().map(|act| {
+                let compact_act = clip_str(act, task_cap.min(40));
+                if entry.turns > 0 {
+                    format!(" · {compact_act} · t{}", entry.turns)
+                } else {
+                    format!(" · {compact_act}")
+                }
+            })
+        } else {
+            None
         };
-        rows.push(Line::from(vec![
+        let live_w = live_suffix.as_deref().map(display_width).unwrap_or(0);
+        let task_budget = task_cap.saturating_sub(live_w);
+        let summary_text = if entry.status == SubagentStatus::Failed {
+            let clean_task = compact_subagent_task(&entry.task, task_cap);
+            match &entry.error {
+                Some(err) => clip_str(&format!("[{err}] {clean_task}"), task_cap),
+                None => clean_task,
+            }
+        } else if live_suffix.is_some() && task_budget < 12 {
+            String::new()
+        } else {
+            clip_str(&compact_subagent_task(&entry.task, task_budget.max(12)), task_budget.max(12))
+        };
+        let mut spans = vec![
             Span::raw(format!("{pad}  ")),
             icon,
             Span::raw("  "),
@@ -701,8 +723,10 @@ pub fn render_subagent_strip(
                     })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                clip_str(&summary_text, task_cap),
+        ];
+        if !summary_text.is_empty() {
+            spans.push(Span::styled(
+                summary_text,
                 Style::default().fg(if entry.status == SubagentStatus::Running {
                     IVORY
                 } else if entry.status == SubagentStatus::Failed {
@@ -710,12 +734,21 @@ pub fn render_subagent_strip(
                 } else {
                     MUTED
                 }),
-            ),
-            Span::styled(
-                format!("  {}", fmt_elapsed_compact(elapsed_dur.as_secs())),
-                Style::default().fg(MUTED),
-            ),
-        ]));
+            ));
+        }
+        if let Some(live) = live_suffix {
+            let shown_live = if spans.len() == 4 {
+                live.trim_start_matches(" · ").to_owned()
+            } else {
+                live
+            };
+            spans.push(Span::styled(shown_live, Style::default().fg(BASH_MODE_COLOR)));
+        }
+        spans.push(Span::styled(
+            format!("  {}", fmt_elapsed_compact(elapsed_dur.as_secs())),
+            Style::default().fg(MUTED),
+        ));
+        rows.push(Line::from(spans));
     }
     if hidden > 0 {
         rows.push(Line::from(vec![
@@ -1287,17 +1320,37 @@ fn render_tasks_picker(
                     SubagentStatus::Completed => ("✓ done ", SAGE),
                     SubagentStatus::Failed => ("✕ fail ", ROSE),
                 };
-                let full = match &s.error {
+                let mut full = match &s.error {
                     Some(err) => format!("[{err}] {}", s.task),
                     None => s.task.clone(),
                 };
+                if !s.trace.is_empty() {
+                    full.push_str(&format!(
+                        "\ntrace (t{}): {}",
+                        s.turns.max(1),
+                        s.trace.join(" → ")
+                    ));
+                }
+                let live_tag = s
+                    .activity
+                    .as_deref()
+                    .filter(|_| s.status == SubagentStatus::Running)
+                    .map(|act| {
+                        if s.turns > 0 {
+                            format!(" · {act} · t{}", s.turns)
+                        } else {
+                            format!(" · {act}")
+                        }
+                    })
+                    .unwrap_or_default();
                 (
                     st,
                     col,
                     format!(
-                        "[sub:{}] {} ({})",
+                        "[sub:{}] {}{} ({})",
                         s.role,
-                        compact_subagent_task(&s.task, 54),
+                        compact_subagent_task(&s.task, 40),
+                        live_tag,
                         fmt_elapsed_compact(dur.as_secs())
                     ),
                     full,
@@ -1355,7 +1408,11 @@ fn render_tasks_picker(
 
         if expanded {
             if let Some(det) = selected_detail {
-                for seg in wrap_plain(&det, row_w.saturating_sub(6)).into_iter().take(3) {
+                for seg in det
+                    .lines()
+                    .flat_map(|line| wrap_plain(line, row_w.saturating_sub(6)))
+                    .take(3)
+                {
                     rows.push(Line::from(vec![
                         Span::styled("    ⎿  ", Style::default().fg(MUTED)),
                         Span::styled(seg, Style::default().fg(STONE).bg(SURFACE)),
