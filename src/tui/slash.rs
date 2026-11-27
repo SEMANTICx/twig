@@ -385,7 +385,6 @@ impl App {
                 self.last_shell = Some((cmd, output.clone(), exit_code));
                 self.transcript
                     .finish_tool(&id, Some(output), exit_code, Some(elapsed));
-                self.transcript.follow_tail();
                 self.git_stat_dirty = true;
             }
             LocalMsg::Review(Ok(text)) => {

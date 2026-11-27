@@ -467,7 +467,7 @@ textarea{flex:1;background:var(--bg);color:var(--txt);border:1px solid #3c342e;b
 <script>
 const tok=new URLSearchParams(location.search).get('token')||localStorage.getItem('twig_tok')||'';
 if(tok)localStorage.setItem('twig_tok',tok);
-let curSid='',curWt='',tab='chat',detail=null;
+let curSid='',curWt='',tab='chat',detail=null,lastHtml='',forceTail=true;
 const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+tok}:{'Content-Type':'application/json'};
 async function api(p,o={}){const r=await fetch(p,{...o,headers:hdrs()});return r.json();}
 function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
@@ -544,20 +544,23 @@ async function loadList(){
   }).join('');
   if(!curSid&&d.sessions.length)openSid(d.sessions[0].sid);
 }
-async function openSid(sid){curSid=sid;detail=await api('/api/session/'+sid);curWt=detail.worktree||curWt;render();}
-function newThread(){curSid='';detail={messages:[],pending:[],diff:'',branch:'new',worktree:curWt};render();}
-function setTab(t){tab=t;document.getElementById('t-chat').className=t==='chat'?'active':'';document.getElementById('t-diff').className=t==='diff'?'active':'';render();}
+async function openSid(sid,resetScroll=false){if(sid!==curSid)forceTail=true;if(resetScroll)forceTail=true;curSid=sid;detail=await api('/api/session/'+sid);curWt=detail.worktree||curWt;render();}
+function newThread(){curSid='';forceTail=true;lastHtml='';detail={messages:[],pending:[],diff:'',branch:'new',worktree:curWt};render();}
+function setTab(t){tab=t;lastHtml='';document.getElementById('t-chat').className=t==='chat'?'active':'';document.getElementById('t-diff').className=t==='diff'?'active':'';render();}
 function render(){
   if(!detail)return;
   document.getElementById('stitle').textContent=curSid?curSid.slice(0,12):'New Thread';
   document.getElementById('smeta').textContent=`${detail.branch||''} · ${detail.model||''} ${detail.running?'· ✻ running…':''}`;
   const p=document.getElementById('pane');
+  const nearBottom=forceTail||(p.scrollHeight-p.scrollTop-p.clientHeight<56);
   if(tab==='diff'){
     const lines=(detail.diff||'(working tree clean)').split('\n').map(l=>{
       const c=l.startsWith('+')?'d-add':l.startsWith('-')?'d-del':l.startsWith('@@')?'d-hunk':'';
       return `<span class="${c}">${esc(l)}</span>`;
     }).join('\n');
-    p.innerHTML=`<pre class="diff">${lines}</pre>`;return;
+    const next=`<pre class="diff">${lines}</pre>`;
+    if(next!==lastHtml){const prevTop=p.scrollTop;p.innerHTML=next;lastHtml=next;p.scrollTop=prevTop;}
+    return;
   }
   let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div style="font-size:12px;color:var(--muted)">${esc(JSON.stringify(a.args))}</div></div><div><button class="btn primary" onclick="approve('${a.id}',true)">Allow</button> <button class="btn" onclick="approve('${a.id}',false)">Deny</button></div></div>`).join('');
   html+=(detail.messages||[]).filter(m=>m.role!=='system').map(m=>{
@@ -565,12 +568,22 @@ function render(){
     if(m.role==='tool')return `<div class="msg tool">↳ ${esc(txt.slice(0,400))}</div>`;
     return `<div class="msg ${m.role}">${m.role==='assistant'?fmtMd(txt):esc(txt)}</div>`;
   }).join('');
-  p.innerHTML=html||'<div style="color:var(--muted)">Send a prompt below to begin.</div>';
+  const finalHtml=html||'<div style="color:var(--muted)">Send a prompt below to begin.</div>';
+  if(finalHtml!==lastHtml){
+    const prevTop=p.scrollTop;
+    p.innerHTML=finalHtml;
+    lastHtml=finalHtml;
+    p.scrollTop=nearBottom?p.scrollHeight:prevTop;
+  }else if(forceTail){
+    p.scrollTop=p.scrollHeight;
+  }
+  forceTail=false;
 }
 async function sendPrompt(){
   const inp=document.getElementById('inp');const text=inp.value.trim();if(!text)return;inp.value='';
+  forceTail=true;
   const r=await api('/api/send',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,prompt:text})});
-  if(r.sid){curSid=r.sid;setTimeout(()=>openSid(curSid),300);}
+  if(r.sid){curSid=r.sid;setTimeout(()=>openSid(curSid,true),300);}
 }
 async function approve(id,allow){await api('/api/approve',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,id,allow})});openSid(curSid);}
 async function commitNow(){if(!curSid)return;const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt})});alert(r.summary||r.error||'done');openSid(curSid);}

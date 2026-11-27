@@ -1304,11 +1304,11 @@ pub fn highlight_search(line: Line<'static>, query: &str, active: bool) -> Line<
     Line::from(new_spans)
 }
 
-/// Critically-damped exponential scroll viewport for silky 60fps motion without teleporting.
+/// Critically-damped exponential scroll viewport (`usize`-indexed, immune to `u16` wraparound).
 pub struct SmoothScroll {
-    pos: f32,
-    target: f32,
-    max: u16,
+    pos: f64,
+    target: f64,
+    max: usize,
     auto_follow: bool,
 }
 
@@ -1331,27 +1331,32 @@ impl SmoothScroll {
 
     pub fn follow_tail(&mut self) {
         self.auto_follow = true;
-        self.target = self.max as f32;
+        self.target = self.max as f64;
     }
 
     pub fn scroll_by(&mut self, delta: i32) {
-        let next = (self.target + delta as f32).clamp(0.0, self.max as f32);
+        let base = if delta < 0 && self.auto_follow {
+            self.pos.min(self.target)
+        } else {
+            self.target
+        };
+        let next = (base + delta as f64).clamp(0.0, self.max as f64);
         self.target = next;
         if delta < 0 {
             self.auto_follow = false;
-        } else if next >= self.max as f32 {
+        } else if delta > 0 && next >= self.max as f64 {
             self.auto_follow = true;
         }
     }
 
     pub fn jump_to(&mut self, line: usize) {
         self.auto_follow = false;
-        self.target = (line as f32).min(self.max as f32);
+        self.target = (line as f64).min(self.max as f64);
     }
 
-    pub fn sync_bounds(&mut self, max_scroll: u16, motion: MotionMode) {
+    pub fn sync_bounds(&mut self, max_scroll: usize, motion: MotionMode) {
         self.max = max_scroll;
-        let max_f = max_scroll as f32;
+        let max_f = max_scroll as f64;
         if self.auto_follow {
             self.target = max_f;
             if motion == MotionMode::Reduced || (max_f - self.pos).abs() > 24.0 {
@@ -1369,7 +1374,7 @@ impl SmoothScroll {
             self.pos = self.target;
             return;
         }
-        let factor = 1.0 - (-dt_secs.clamp(0.004, 0.1) * 18.0).exp();
+        let factor = 1.0 - (-(dt_secs.clamp(0.004, 0.1) as f64) * 18.0).exp();
         self.pos += diff * factor;
         if (self.target - self.pos).abs() < 0.25 {
             self.pos = self.target;
@@ -1380,12 +1385,12 @@ impl SmoothScroll {
         motion == MotionMode::Animated && (self.target - self.pos).abs() >= 0.25
     }
 
-    pub fn current_u16(&self) -> u16 {
-        self.pos.round().clamp(0.0, self.max as f32) as u16
+    pub fn current_offset(&self) -> usize {
+        self.pos.round().clamp(0.0, self.max as f64) as usize
     }
 
     pub fn show_tail_badge(&self) -> bool {
-        !self.auto_follow && self.current_u16() < self.max
+        !self.auto_follow && self.current_offset() < self.max
     }
 }
 
@@ -1867,11 +1872,11 @@ mod tests {
         scroll.scroll_by(-20);
         assert!(scroll.is_animating(MotionMode::Animated));
         scroll.step(0.016, MotionMode::Animated);
-        let mid = scroll.current_u16();
+        let mid = scroll.current_offset();
         assert!(mid < 40 && mid > 20, "expected intermediate ease, got {mid}");
 
         scroll.step(0.016, MotionMode::Reduced);
-        assert_eq!(scroll.current_u16(), 20);
+        assert_eq!(scroll.current_offset(), 20);
     }
 
     #[test]

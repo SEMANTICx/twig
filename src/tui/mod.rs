@@ -664,6 +664,12 @@ impl App {
                 self.transcript.scroll_by(12);
                 return Action::None;
             }
+            KeyCode::Home
+                if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
+            {
+                self.transcript.scroll_to_top();
+                return Action::None;
+            }
             KeyCode::End
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
@@ -1742,6 +1748,32 @@ mod tests {
         app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
         let drawer_frame = render_frame_text(&mut app, 120, 28);
         assert!(drawer_frame.contains("trace (t2): Read(src/tui/mod.rs)"));
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Scrolling up must NEVER snap back to bottom when background tools/deltas stream in.
+        app.transcript.clear();
+        app.motion = MotionMode::Reduced;
+        for i in 0..35 {
+            app.transcript.push_user(format!("Prompt line {i}"));
+            app.transcript.push_assistant(format!("Answer line {i}"));
+        }
+        let _ = render_frame_text(&mut app, 100, 24);
+        app.handle_mouse(MouseEventKind::ScrollUp);
+        app.handle_key(press(KeyCode::Home, KeyModifiers::NONE));
+        let top_frame = render_frame_text(&mut app, 100, 24);
+        assert!(top_frame.contains("Prompt line 0"));
+        assert!(top_frame.contains("live tail (End)"));
+
+        app.apply_event(&json!({
+            "ev": "tool.started", "id": "t99", "tool": "read_file", "args": {"path": "Cargo.toml"}, "tier": "auto"
+        }));
+        app.apply_event(&json!({"ev": "model.delta", "text": "More streaming output at bottom"}));
+        app.transcript.push_assistant("Background review completed".into());
+        let still_top = render_frame_text(&mut app, 100, 24);
+        assert!(
+            still_top.contains("Prompt line 0"),
+            "scroll position snapped back to bottom during tool/assistant updates!"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

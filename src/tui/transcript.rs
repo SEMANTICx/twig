@@ -111,7 +111,6 @@ impl Transcript {
 
     pub fn push_assistant(&mut self, text: String) {
         self.cells.push(Cell::Assistant(text));
-        self.scroll.follow_tail();
     }
 
     pub fn append_assistant_delta(&mut self, delta: &str) {
@@ -148,7 +147,6 @@ impl Transcript {
             exit_code: None,
             finished: false,
         }));
-        self.scroll.follow_tail();
     }
 
     pub fn push_tool_snapshot(
@@ -171,7 +169,6 @@ impl Transcript {
             exit_code,
             finished: true,
         }));
-        self.scroll.follow_tail();
     }
 
     pub fn append_tool_output(&mut self, id: &str, chunk: &str) {
@@ -234,6 +231,10 @@ impl Transcript {
 
     pub fn scroll_by(&mut self, delta: i32) {
         self.scroll.scroll_by(delta);
+    }
+
+    pub fn scroll_to_top(&mut self) {
+        self.scroll.jump_to(0);
     }
 
     pub fn follow_tail(&mut self) {
@@ -1142,14 +1143,15 @@ impl Transcript {
             self.search_matches.clear();
         }
 
-        let max_scroll = lines.len().saturating_sub(area.height as usize) as u16;
+        let view_h = area.height as usize;
+        let max_scroll = lines.len().saturating_sub(view_h);
         self.scroll.sync_bounds(max_scroll, opts.motion);
         self.scroll.step(opts.dt, opts.motion);
+        let top = self.scroll.current_offset().min(max_scroll);
+        let bottom = (top + view_h).min(lines.len());
+        let visible: Vec<Line<'static>> = lines.into_iter().skip(top).take(bottom - top).collect();
 
-        frame.render_widget(
-            Paragraph::new(lines).scroll((self.scroll.current_u16(), 0)),
-            area,
-        );
+        frame.render_widget(Paragraph::new(visible), area);
 
         if self.scroll.show_tail_badge() && area.width > 24 {
             let badge = " ↓ live tail (End) ";
