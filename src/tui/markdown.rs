@@ -997,40 +997,9 @@ fn render_fenced_block(
     out
 }
 
-/// Wrap already-parsed styled inline spans by Unicode terminal display width so
-/// inline Markdown (`**bold**`, `` `code` ``, `$latex$`, `[label](url)`) never breaks mid-delimiter.
+/// Wrap already-parsed styled inline spans by Unicode terminal display width (word/URL-aware).
 fn wrap_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Vec<Span<'static>>> {
-    let limit = max_width.max(4);
-    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut cur_line: Vec<Span<'static>> = Vec::new();
-    let mut cur_w = 0usize;
-
-    for span in spans {
-        let style = span.style;
-        let mut seg = String::new();
-        for ch in span.content.chars() {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + w > limit && (cur_w > 0 || !seg.is_empty()) {
-                if !seg.is_empty() {
-                    cur_line.push(Span::styled(std::mem::take(&mut seg), style));
-                }
-                lines.push(std::mem::take(&mut cur_line));
-                cur_w = 0;
-                if ch == ' ' {
-                    continue;
-                }
-            }
-            seg.push(ch);
-            cur_w += w;
-        }
-        if !seg.is_empty() {
-            cur_line.push(Span::styled(seg, style));
-        }
-    }
-    if !cur_line.is_empty() || lines.is_empty() {
-        lines.push(cur_line);
-    }
-    lines
+    super::math_table::wrap_styled_spans(spans, max_width.max(4))
 }
 
 /// Zero-dependency warm syntax highlighter for Rust/Python/TS/JS/Go/Bash/JSON/TOML.

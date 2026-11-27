@@ -36,6 +36,81 @@ fn clip_width(s: &str, max_w: usize) -> String {
     out
 }
 
+fn normalize_cell_breaks(raw: &str) -> String {
+    raw.replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("<BR/>", "\n")
+        .replace("<BR>", "\n")
+        .replace("<br>", "\n")
+}
+
+pub(super) fn wrap_styled_spans(spans: Vec<Span<'static>>, max_w: usize) -> Vec<Vec<Span<'static>>> {
+    let limit = max_w.max(2);
+    let mut lines: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur_line: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+
+    for span in spans {
+        let style = span.style;
+        let mut seg = String::new();
+        let mut chars = span.content.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch.is_ascii() && !ch.is_ascii_whitespace() {
+                let mut word = String::from(ch);
+                while let Some(&nx) = chars.peek() {
+                    if nx.is_ascii() && !nx.is_ascii_whitespace() {
+                        word.push(nx);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let word_w = display_width(&word);
+                if cur_w > 0 && cur_w + word_w > limit && word_w <= limit {
+                    if !seg.is_empty() {
+                        cur_line.push(Span::styled(std::mem::take(&mut seg), style));
+                    }
+                    lines.push(std::mem::take(&mut cur_line));
+                    cur_w = 0;
+                }
+                for wch in word.chars() {
+                    let w = UnicodeWidthChar::width(wch).unwrap_or(0);
+                    if cur_w + w > limit && (cur_w > 0 || !seg.is_empty()) {
+                        if !seg.is_empty() {
+                            cur_line.push(Span::styled(std::mem::take(&mut seg), style));
+                        }
+                        lines.push(std::mem::take(&mut cur_line));
+                        cur_w = 0;
+                    }
+                    seg.push(wch);
+                    cur_w += w;
+                }
+                continue;
+            }
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cur_w + w > limit && (cur_w > 0 || !seg.is_empty()) {
+                if !seg.is_empty() {
+                    cur_line.push(Span::styled(std::mem::take(&mut seg), style));
+                }
+                lines.push(std::mem::take(&mut cur_line));
+                cur_w = 0;
+                if ch == ' ' {
+                    continue;
+                }
+            }
+            seg.push(ch);
+            cur_w += w;
+        }
+        if !seg.is_empty() {
+            cur_line.push(Span::styled(seg, style));
+        }
+    }
+    if !cur_line.is_empty() || lines.is_empty() {
+        lines.push(cur_line);
+    }
+    lines
+}
+
 
 fn wrap_width(s: &str, max_w: usize) -> Vec<String> {
     let limit = max_w.max(4);
@@ -111,7 +186,9 @@ fn split_table_row(line: &str) -> Vec<String> {
     cells
 }
 
-/// Render consecutive GFM pipe-table lines into a CJK-width-aligned Unicode box table.
+/// Render consecutive GFM pipe-table lines into a Claude-CLI-style multi-line CJK-aligned
+/// Unicode box table (with automatic stacked vertical cards when columns exceed narrow viewports),
+/// never truncating cell prose with `…`.
 pub(super) fn render_gfm_table<F>(
     raw_rows: &[&str],
     max_width: usize,
@@ -123,18 +200,25 @@ where
     if raw_rows.len() < 2 || !is_table_separator(raw_rows[1]) {
         return None;
     }
-    let visible_inline_text = |raw: &str| -> String {
-        inline_fn(raw, Style::default().fg(IVORY))
-            .into_iter()
-            .map(|sp| sp.content.into_owned())
-            .collect()
+    let visible_max_line_width = |raw: &str| -> usize {
+        normalize_cell_breaks(raw)
+            .split('\n')
+            .map(|seg| {
+                inline_fn(seg.trim(), Style::default().fg(IVORY))
+                    .into_iter()
+                    .map(|sp| display_width(sp.content.as_ref()))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
     };
-    let header_cells = split_table_row(raw_rows[0]);
+    let mut header_cells = split_table_row(raw_rows[0]);
     let sep_cells = split_table_row(raw_rows[1]);
     let cols = header_cells.len().max(sep_cells.len());
     if cols == 0 {
         return None;
     }
+    header_cells.resize(cols, String::new());
 
     let aligns: Vec<ColAlign> = (0..cols)
         .map(|i| {
@@ -157,35 +241,145 @@ where
         data_rows.push(parsed);
     }
 
-    let mut col_w: Vec<usize> = (0..cols)
-        .map(|c| {
-            let h = header_cells.get(c).map(String::as_str).unwrap_or("");
-            display_width(&visible_inline_text(h)).max(2)
-        })
+    let mut natural_w: Vec<usize> = (0..cols)
+        .map(|c| visible_max_line_width(&header_cells[c]).max(2))
         .collect();
     for r in &data_rows {
         for (c, cell) in r.iter().enumerate().take(cols) {
-            col_w[c] = col_w[c].max(display_width(&visible_inline_text(cell)));
+            natural_w[c] = natural_w[c].max(visible_max_line_width(cell));
         }
     }
 
-    // Fit table cleanly within `max_width` (`│ cell │` adds `3 * cols + 1` border chars).
+    // Short identifier columns (`ID`, status codes <= 8 cols) keep their exact width;
+    // prose columns get at least 10 display cols (5 CJK chars) before falling back to stacked cards.
+    let min_w: Vec<usize> = natural_w
+        .iter()
+        .map(|&nw| if nw <= 8 { nw } else { 10 })
+        .collect();
     let border_overhead = cols * 3 + 1;
     let avail = max_width.saturating_sub(border_overhead);
-    if avail >= cols * 3 {
-        while col_w.iter().sum::<usize>() > avail {
-            if let Some((idx, &max_c)) = col_w.iter().enumerate().max_by_key(|&(_, &w)| w) {
-                if max_c <= 3 {
+    let min_sum: usize = min_w.iter().sum();
+
+    let border_style = Style::default().fg(HAIRLINE);
+    let hdr_style = Style::default()
+        .fg(ACCENT_PEAK)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(IVORY);
+
+    // Narrow viewport / ultra-wide column count fallback: render zero-loss stacked vertical cards.
+    if cols >= 3 && avail < min_sum {
+        let card_inner = max_width.saturating_sub(4).max(8);
+        let top_rule = format!("╭{}╮", "─".repeat(card_inner + 2));
+        let mid_rule = format!("├{}┤", "─".repeat(card_inner + 2));
+        let bot_rule = format!("╰{}╯", "─".repeat(card_inner + 2));
+        let mut out = vec![Line::from(Span::styled(top_rule, border_style))];
+        for (r_idx, row) in data_rows.iter().enumerate() {
+            if r_idx > 0 {
+                out.push(Line::from(Span::styled(mid_rule.clone(), border_style)));
+            }
+            for c in 0..cols {
+                let raw_val = row[c].trim();
+                if raw_val.is_empty() {
+                    continue;
+                }
+                let h_label = normalize_cell_breaks(&header_cells[c]).replace('\n', " ");
+                let prefix = format!("{}: ", h_label.trim());
+                let mut combined = vec![Span::styled(prefix, hdr_style)];
+                for (seg_i, seg) in normalize_cell_breaks(raw_val).split('\n').enumerate() {
+                    if seg_i > 0 {
+                        combined.push(Span::styled(" / ".to_owned(), Style::default().fg(MUTED)));
+                    }
+                    combined.extend(inline_fn(seg.trim(), body_style));
+                }
+                for wrapped in wrap_styled_spans(combined, card_inner) {
+                    let used: usize = wrapped
+                        .iter()
+                        .map(|sp| display_width(sp.content.as_ref()))
+                        .sum();
+                    let rpad = card_inner.saturating_sub(used);
+                    let mut line_spans = vec![Span::styled("│ ", border_style)];
+                    line_spans.extend(wrapped);
+                    line_spans.push(Span::raw(format!("{} ", " ".repeat(rpad))));
+                    line_spans.push(Span::styled("│", border_style));
+                    out.push(Line::from(line_spans));
+                }
+            }
+        }
+        out.push(Line::from(Span::styled(bot_rule, border_style)));
+        return Some(out);
+    }
+
+    // Proportional multi-line column width allocation (`sqrt`-weighted above `min_w`).
+    let nat_sum: usize = natural_w.iter().sum();
+    let mut col_w = if nat_sum <= avail {
+        natural_w.clone()
+    } else if avail <= cols * 2 {
+        vec![2; cols]
+    } else {
+        let mut w = min_w
+            .iter()
+            .map(|&mw| mw.min((avail / cols).max(2)))
+            .collect::<Vec<_>>();
+        let mut used: usize = w.iter().sum();
+        if used < min_sum && min_sum <= avail {
+            w = min_w.clone();
+            used = min_sum;
+        }
+        let rem = avail.saturating_sub(used);
+        if rem > 0 {
+            let weights: Vec<f64> = (0..cols)
+                .map(|c| {
+                    if natural_w[c] > w[c] {
+                        ((natural_w[c] - w[c]) as f64).sqrt()
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let w_sum: f64 = weights.iter().sum();
+            if w_sum > 0.0 {
+                for c in 0..cols {
+                    let add = ((rem as f64) * (weights[c] / w_sum)).floor() as usize;
+                    w[c] = (w[c] + add).min(natural_w[c]);
+                }
+            }
+            while w.iter().sum::<usize>() < avail {
+                if let Some(best) = (0..cols)
+                    .filter(|&c| w[c] < natural_w[c])
+                    .max_by_key(|&c| natural_w[c] - w[c])
+                {
+                    w[best] += 1;
+                } else {
                     break;
                 }
-                col_w[idx] -= 1;
-            } else {
+            }
+        }
+        w
+    };
+    while col_w.iter().sum::<usize>() > avail && avail >= cols * 2 {
+        if let Some((idx, _)) = col_w.iter().enumerate().max_by_key(|&(_, &cw)| cw) {
+            if col_w[idx] <= 2 {
                 break;
             }
+            col_w[idx] -= 1;
+        } else {
+            break;
         }
     }
 
-    let border_style = Style::default().fg(HAIRLINE);
+    let wrap_cell = |raw: &str, style: Style, width: usize| -> Vec<Vec<Span<'static>>> {
+        let norm = normalize_cell_breaks(raw);
+        let mut cell_lines = Vec::new();
+        for seg in norm.split('\n') {
+            let spans = inline_fn(seg.trim(), style);
+            cell_lines.extend(wrap_styled_spans(spans, width));
+        }
+        if cell_lines.is_empty() {
+            cell_lines.push(Vec::new());
+        }
+        cell_lines
+    };
+
     let make_rule = |left: &str, mid: &str, right: &str| -> Line<'static> {
         let segs: Vec<String> = col_w.iter().map(|&w| "─".repeat(w + 2)).collect();
         Line::from(Span::styled(
@@ -194,52 +388,61 @@ where
         ))
     };
 
-    let render_row = |cells: &[String], is_header: bool| -> Line<'static> {
-        let mut spans = vec![Span::styled("│", border_style)];
-        let base_style = if is_header {
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(IVORY)
+    let render_multiline_row =
+        |wrapped_cols: &[Vec<Vec<Span<'static>>>], is_header: bool| -> Vec<Line<'static>> {
+            let row_h = wrapped_cols.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            let mut lines = Vec::with_capacity(row_h);
+            for sub in 0..row_h {
+                let mut spans = vec![Span::styled("│", border_style)];
+                for c in 0..cols {
+                    let target_w = col_w[c];
+                    let cell_spans = wrapped_cols[c].get(sub).cloned().unwrap_or_default();
+                    let used: usize = cell_spans
+                        .iter()
+                        .map(|sp| display_width(sp.content.as_ref()))
+                        .sum();
+                    let pad = target_w.saturating_sub(used);
+                    let align = if is_header { ColAlign::Left } else { aligns[c] };
+                    let (lpad, rpad) = match align {
+                        ColAlign::Left => (0, pad),
+                        ColAlign::Right => (pad, 0),
+                        ColAlign::Center => (pad / 2, pad - pad / 2),
+                    };
+                    spans.push(Span::raw(format!(" {}", " ".repeat(lpad))));
+                    spans.extend(cell_spans);
+                    spans.push(Span::raw(format!("{} ", " ".repeat(rpad))));
+                    spans.push(Span::styled("│", border_style));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines
         };
-        for c in 0..cols {
-            let raw_cell = cells.get(c).map(String::as_str).unwrap_or("");
-            let vis = visible_inline_text(raw_cell);
-            let target_w = col_w[c];
-            let shown_spans = if display_width(&vis) > target_w {
-                vec![Span::styled(clip_width(&vis, target_w), base_style)]
-            } else if is_header {
-                vec![Span::styled(vis.clone(), base_style)]
-            } else {
-                inline_fn(raw_cell, base_style)
-            };
-            let used: usize = shown_spans
-                .iter()
-                .map(|sp| display_width(sp.content.as_ref()))
-                .sum();
-            let pad = target_w.saturating_sub(used);
-            let (lpad, rpad) = match aligns[c] {
-                ColAlign::Left => (0, pad),
-                ColAlign::Right => (pad, 0),
-                ColAlign::Center => (pad / 2, pad - pad / 2),
-            };
-            spans.push(Span::raw(format!(" {}", " ".repeat(lpad))));
-            spans.extend(shown_spans);
-            spans.push(Span::raw(format!("{} ", " ".repeat(rpad))));
-            spans.push(Span::styled("│", border_style));
-        }
-        Line::from(spans)
-    };
 
-    let mut out = Vec::with_capacity(data_rows.len() + 4);
+    let wrapped_hdr: Vec<Vec<Vec<Span<'static>>>> = (0..cols)
+        .map(|c| wrap_cell(&header_cells[c], hdr_style, col_w[c]))
+        .collect();
+    let wrapped_body: Vec<Vec<Vec<Vec<Span<'static>>>>> = data_rows
+        .iter()
+        .map(|r| {
+            (0..cols)
+                .map(|c| wrap_cell(&r[c], body_style, col_w[c]))
+                .collect()
+        })
+        .collect();
+    let any_multiline = wrapped_hdr.iter().any(|c| c.len() > 1)
+        || wrapped_body
+            .iter()
+            .any(|row| row.iter().any(|c| c.len() > 1));
+
+    let mut out = Vec::with_capacity(data_rows.len() * 2 + 4);
     out.push(make_rule("┌", "┬", "┐"));
-    let mut hdr = header_cells;
-    hdr.resize(cols, String::new());
-    out.push(render_row(&hdr, true));
+    out.extend(render_multiline_row(&wrapped_hdr, true));
     out.push(make_rule("├", "┼", "┤"));
-    for r in data_rows {
-        out.push(render_row(&r, false));
+    for (r_idx, row_cols) in wrapped_body.iter().enumerate() {
+        if r_idx > 0 && any_multiline {
+            out.push(make_rule("├", "┼", "┤"));
+        }
+        out.extend(render_multiline_row(row_cols, false));
     }
     out.push(make_rule("└", "┴", "┘"));
     Some(out)
@@ -1145,5 +1348,61 @@ mod tests {
 
         let eq = format_latex_math(r"\Delta y_i = \sum_{k=1}^{n} \alpha_k x^2 + \frac{a+b}{\sqrt{t}} \leq \infty");
         assert_eq!(eq, "Δyᵢ = ∑ₖ₌₁ⁿ αₖ x² + (a+b)/√t ≤ ∞");
+    }
+
+    #[test]
+    fn wide_7col_cjk_table_wraps_multiline_and_falls_back_to_cards_without_ellipsis() {
+        let rows = [
+            "| ID | 推文中的观点 | 可检验的主张 | 已披露信息 | 尚缺信息 | 后续怎么验证 | 状态 |",
+            "|---|---|---|---|---|---|---|",
+            "| H-01 | 因“英伟达可能超预期”在低点买入 | 条件判断：若财报超预期则走强 | 说自己在低点建仓 | 买入的具体标的与仓位 | 先定义观察资产与窗口 | 待验证；交易细节未披露 |",
+            "| H-02 | “加息十二月一定落地”宏观判断 | 宏观预测：十二月央行决议加息 | 有明确的加息时间点 | 推文所指年份与幅度 | 核对对应央行决议公告 | 不可直接评分 |",
+        ];
+
+        // 1. Desktop width (132 cols): proportional multi-line box table, zero `…` truncation!
+        let box_lines =
+            render_gfm_table(&rows, 132, |s, st| vec![Span::styled(s.to_owned(), st)]).unwrap();
+        let box_text: String = box_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(box_lines[0].to_string().starts_with('┌'));
+        assert!(!box_text.contains('…'), "table must wrap instead of truncating with …:\n{box_text}");
+        for phrase in [
+            "因“英伟达可能超预期”",
+            "在低点买入",
+            "说自己在低点建仓",
+            "买入的具体标的与",
+            "仓位",
+            "待验证；交易细节",
+            "未披露",
+            "核对对应央行决议",
+            "公告",
+        ] {
+            assert!(
+                box_text.contains(phrase),
+                "missing `{phrase}` in wrapped table:\n{box_text}"
+            );
+        }
+        // Every rendered row must have identical display width <= 132.
+        let w0 = display_width(&box_lines[0].to_string());
+        assert!(w0 <= 132);
+        for line in &box_lines {
+            assert_eq!(display_width(&line.to_string()), w0);
+        }
+
+        // 2. Narrow width (72 cols): stacked vertical cards, zero `…` truncation!
+        let card_lines =
+            render_gfm_table(&rows, 72, |s, st| vec![Span::styled(s.to_owned(), st)]).unwrap();
+        let card_text: String = card_lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(card_lines[0].to_string().starts_with('╭'));
+        assert!(!card_text.contains('…'));
+        assert!(card_text.contains("ID: H-01"));
+        assert!(card_text.replace([' ', '│', '\n'], "").contains("具体标的与仓位"));
     }
 }

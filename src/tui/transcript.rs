@@ -476,7 +476,7 @@ impl Transcript {
         };
         let left_margin = " ".repeat(pad_x);
         let inner = width.saturating_sub(pad_x * 2).max(14);
-        let prose_w = inner.saturating_sub(3).clamp(14, 108);
+        let prose_w = inner.saturating_sub(2).max(14);
         let last_idx = self.cells.len().saturating_sub(1);
 
         let mut cell_idx = 0usize;
