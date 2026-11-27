@@ -495,10 +495,6 @@ pub fn style_output_line(line: &str) -> Style {
 }
 
 /// Parse inline `` `code` ``, `**bold**`, `*italic*`, `$latex$` / `\(latex\)`, and `[text](url)` spans.
-fn parse_inline(text: &str, base: Style) -> Vec<Span<'static>> {
-    parse_inline_inner(text, base, None, 0)
-}
-
 fn parse_inline_inner(
     text: &str,
     base: Style,
@@ -805,20 +801,24 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
         // Markdown headings `#` .. `######`
         let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
         if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+            out.extend(links.borrow_mut().drain_footnotes());
             let rest = trimmed[hashes + 1..].trim();
             let heading = if hashes <= 2 {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD)
             };
-            for row_spans in wrap_spans(parse_inline(rest, heading), width) {
+            let parsed = parse_inline_inner(rest, heading, Some(&mut links.borrow_mut()), 0);
+            for row_spans in wrap_spans(parsed, width) {
                 out.push(Line::from(row_spans));
             }
+            out.extend(links.borrow_mut().drain_footnotes());
             idx += 1;
             continue;
         }
 
         if trimmed.starts_with('>') {
+            out.extend(links.borrow_mut().drain_footnotes());
             let mut quote_lines: Vec<&str> = Vec::new();
             while idx < raw_lines.len() {
                 let qt = raw_lines[idx].trim_start();
@@ -844,43 +844,33 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
                     .map(|rem| (badge, col, rem.trim()))
             });
 
+            let push_quote_line =
+                |out: &mut Vec<Line<'static>>, qtext: &str, bar_col: Color, text_style: Style| {
+                    let parsed =
+                        parse_inline_inner(qtext, text_style, Some(&mut links.borrow_mut()), 0);
+                    for row_spans in wrap_spans(parsed, width.saturating_sub(2)) {
+                        let mut spans = vec![Span::styled("▎ ", Style::default().fg(bar_col))];
+                        spans.extend(row_spans);
+                        out.push(Line::from(spans));
+                    }
+                };
             if let Some((badge, col, first_rem)) = alert {
                 out.push(Line::from(vec![
                     Span::styled("▎ ", Style::default().fg(col)),
                     Span::styled(badge, Style::default().fg(col).add_modifier(Modifier::BOLD)),
                 ]));
                 if !first_rem.is_empty() {
-                    for row_spans in wrap_spans(
-                        parse_inline(first_rem, Style::default().fg(IVORY)),
-                        width.saturating_sub(2),
-                    ) {
-                        let mut spans = vec![Span::styled("▎ ", Style::default().fg(col))];
-                        spans.extend(row_spans);
-                        out.push(Line::from(spans));
-                    }
+                    push_quote_line(&mut out, first_rem, col, Style::default().fg(IVORY));
                 }
                 for &ql in &quote_lines[1..] {
-                    for row_spans in wrap_spans(
-                        parse_inline(ql, Style::default().fg(IVORY)),
-                        width.saturating_sub(2),
-                    ) {
-                        let mut spans = vec![Span::styled("▎ ", Style::default().fg(col))];
-                        spans.extend(row_spans);
-                        out.push(Line::from(spans));
-                    }
+                    push_quote_line(&mut out, ql, col, Style::default().fg(IVORY));
                 }
             } else {
                 for ql in quote_lines {
-                    for row_spans in wrap_spans(
-                        parse_inline(ql, Style::default().fg(STONE)),
-                        width.saturating_sub(2),
-                    ) {
-                        let mut spans = vec![Span::styled("▎ ", Style::default().fg(ACCENT))];
-                        spans.extend(row_spans);
-                        out.push(Line::from(spans));
-                    }
+                    push_quote_line(&mut out, ql, ACCENT, Style::default().fg(STONE));
                 }
             }
+            out.extend(links.borrow_mut().drain_footnotes());
             continue;
         }
 
@@ -952,8 +942,12 @@ pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        let parsed = parse_inline_inner(line, body, Some(&mut links.borrow_mut()), 0);
-        for row_spans in wrap_spans(parsed, width) {
+        let cont_pad = lead_cols.min(12);
+        let parsed = parse_inline_inner(trimmed, body, Some(&mut links.borrow_mut()), 0);
+        for mut row_spans in wrap_spans(parsed, width.saturating_sub(cont_pad)) {
+            if cont_pad > 0 {
+                row_spans.insert(0, Span::raw(" ".repeat(cont_pad)));
+            }
             out.push(Line::from(row_spans));
         }
         idx += 1;
@@ -1977,13 +1971,15 @@ mod tests {
         assert!(text.contains('┌') && text.contains("11-27"), "gfm box table: {text}");
         assert!(text.contains("E = mc²"), "display math rendered: {text}");
 
-        let rich = "**重点核对 `H-01` 的 [市场判断](https://x.com/thankUcrypto/status/2126226625524343032)**\n\n- 一级要点\n  - 二级要点 [web.rs](file:///home/u/src/web.rs#L10-L20)\n    - 三级要点";
+        let rich = "## 标题 [规范](https://ui-sdk.dev/docs/agents)\n> 引用 [源码](/home/amedus/Dev/personal/twig/src/tui/markdown.rs:814)\n\n**重点核对 `H-01` 的 [市场判断](https://x.com/thankUcrypto/status/2126226625524343032)**\n\n- 一级要点\n  - 二级要点 [web.rs](file:///home/u/src/web.rs#L10-L20)\n    - 三级要点";
         let rich_out: String = render_markdown(rich, 80)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rich_out.contains("市场判断 [1]") && rich_out.contains("  [1] https://x.com/thankUcrypto/status/2126226625524343032"));
+        assert!(rich_out.contains("标题 规范 [1]") && rich_out.contains("  [1] https://ui-sdk.dev/docs/agents"));
+        assert!(rich_out.contains("▎ 引用 源码 [2]") && rich_out.contains("  [2] /home/amedus/Dev/personal/twig/src/tui/markdown.rs:814"));
+        assert!(rich_out.contains("市场判断 [3]") && rich_out.contains("  [3] https://x.com/thankUcrypto/status/2126226625524343032"));
         assert!(rich_out.contains(" H-01 ") && rich_out.contains("web.rs (#L10-L20)"));
         assert!(rich_out.contains("• 一级要点") && rich_out.contains("  ◦ 二级要点") && rich_out.contains("    ▪ 三级要点"));
     }
