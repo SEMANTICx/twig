@@ -22,7 +22,7 @@ unicode-width = "0.2"
 libc = "0.2"
 
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+pkg-url = "https://github.com/SEMANTICx/twig-dist/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 

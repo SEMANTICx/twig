@@ -96,10 +96,15 @@ fn stream_once(
     let auth = format!("Bearer {key}");
     let body_owned = body_str.to_owned();
     std::thread::spawn(move || {
-        let r = ureq::post(&url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15).min(timeout))
+            .timeout_write(Duration::from_secs(30).min(timeout))
+            .timeout_read(Duration::from_secs(90).min(timeout))
+            .build();
+        let r = agent
+            .post(&url)
             .set("Content-Type", "application/json")
             .set("Authorization", &auth)
-            .timeout(timeout)
             .send_string(&body_owned);
         match r {
             Ok(r)
@@ -197,6 +202,7 @@ fn stream_once(
                 if let Some(s) = delta["reasoning_content"]
                     .as_str()
                     .or_else(|| delta["reasoning"].as_str())
+                    .or_else(|| delta["thinking"].as_str())
                 {
                     if !s.is_empty() {
                         emit(json!({"ev": "model.reasoning", "text": s}));

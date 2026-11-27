@@ -25,15 +25,7 @@ impl Level {
     }
 }
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".venv",
-    "target",
-    "dist",
-    ".twig-worktrees",
-];
+use crate::config::IGNORED_DIRS;
 
 pub struct Guard {
     worktree: PathBuf,
@@ -94,7 +86,7 @@ impl Guard {
                 *count += 1;
                 if *count >= 2 {
                     return Some(
-                        "[loop-breaker] This exact tool call failed or returned no useful output twice in a row. Inspect the relevant file or try a different approach instead of repeating it.",
+                        "[loop-breaker] This exact tool call failed or returned no useful output twice in a row. Inspect the relevant file, try a different approach, or delegate a read-only root-cause consultation to `subagent(role=\"advisor\", task=\"...\")` instead of repeating it.",
                     );
                 }
             }
@@ -147,7 +139,7 @@ impl Guard {
                     Err(_) => continue,
                 };
                 if meta.is_dir() {
-                    if SKIP_DIRS.contains(&name.as_str()) || self.ignored(&path) {
+                    if IGNORED_DIRS.contains(&name.as_str()) || self.ignored(&path) {
                         continue;
                     }
                     stack.push(path);
@@ -227,12 +219,15 @@ mod tests {
     }
 
     fn nanoid() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::SystemTime;
-        SystemTime::now()
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
-            .to_string()
+            .as_nanos();
+        format!("{}-{ns}-{n}", std::process::id())
     }
 
     #[test]

@@ -106,7 +106,7 @@ fn status_without_reaping(child: &mut Child) -> io::Result<Option<i32>> {
 }
 
 pub struct Owner {
-    child: Child,
+    child: Option<Child>,
     #[cfg(unix)]
     capture: Option<UnixStream>,
     stop: Arc<AtomicBool>,
@@ -115,9 +115,11 @@ pub struct Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
-        kill_group(self.child.id());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            kill_group(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         self.stop.store(true, Ordering::Relaxed);
         if let Some(drain) = self.drain.take() {
             let _ = drain.join();
@@ -125,11 +127,79 @@ impl Drop for Owner {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn group_has_other_members(leader_pid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == leader_pid {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some(rparen) = stat.rfind(')') {
+            let pgrp = stat[rparen + 1..]
+                .split_whitespace()
+                .nth(2)
+                .and_then(|s| s.parse::<u32>().ok());
+            if pgrp == Some(leader_pid) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_has_other_members(_leader_pid: u32) -> bool {
+    true
+}
+
+#[cfg(unix)]
+fn finalize_live_owner(mut owner: Owner, saw_eof: bool) -> Option<Owner> {
+    let mut capture = owner.capture.take().expect("capture");
+    let pid = owner.child.as_ref().expect("child").id();
+    if saw_eof && !group_has_other_members(pid) {
+        drop(capture);
+        if let Some(mut child) = owner.child.take() {
+            let _ = child.wait();
+        }
+        return None;
+    }
+    if !saw_eof {
+        let stop = owner.stop.clone();
+        owner.drain = Some(std::thread::spawn(move || {
+            let mut buf = [0; 8192];
+            while !stop.load(Ordering::Relaxed) {
+                match capture.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+    Some(owner)
+}
+
 pub struct Output {
     pub text: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
-    pub owner: Owner,
+    pub owner: Option<Owner>,
 }
 
 fn format_live_output(bytes: &[u8], discarded: bool, timed_out: bool, timeout: Duration) -> String {
@@ -182,7 +252,7 @@ pub fn run_live(
         .stderr(Stdio::from(err))
         .spawn()?;
     let mut owner = Owner {
-        child,
+        child: Some(child),
         capture: Some(capture),
         stop: Default::default(),
         drain: None,
@@ -191,11 +261,15 @@ pub fn run_live(
     const CAP: usize = 1_048_576;
     let mut bytes = Vec::new();
     let mut discarded = false;
+    let mut saw_eof = false;
     let mut buf = [0; 8192];
-    let mut drain_once = |reader: &mut UnixStream| -> io::Result<()> {
+    let mut drain_once = |reader: &mut UnixStream, eof: &mut bool| -> io::Result<()> {
         for _ in 0..128 {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    *eof = true;
+                    break;
+                }
                 Ok(n) => {
                     if bytes.len() < CAP {
                         emit(String::from_utf8_lossy(&buf[..n]).into_owned());
@@ -212,37 +286,23 @@ pub fn run_live(
         Ok(())
     };
     let (code, timed_out) = loop {
-        drain_once(&mut reader)?;
-        if let Some(code) = status_without_reaping(&mut owner.child)? {
+        drain_once(&mut reader, &mut saw_eof)?;
+        let child_ref = owner.child.as_mut().expect("child");
+        if let Some(code) = status_without_reaping(child_ref)? {
             break (code, false);
         }
         if control.cancelled() {
-            kill_group(owner.child.id());
+            kill_group(child_ref.id());
             break (130, false);
         }
         if Instant::now() >= deadline {
-            kill_group(owner.child.id());
+            kill_group(child_ref.id());
             break (124, true);
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    drain_once(&mut reader)?;
-    let mut capture = owner.capture.take().expect("capture");
-    let stop = owner.stop.clone();
-    owner.drain = Some(std::thread::spawn(move || {
-        let mut buf = [0; 8192];
-        while !stop.load(Ordering::Relaxed) {
-            match capture.read(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
-    }));
+    drain_once(&mut reader, &mut saw_eof)?;
+    let owner = finalize_live_owner(owner, saw_eof);
     let text = format_live_output(&bytes, discarded, timed_out, timeout);
     Ok(Output {
         text,
@@ -291,7 +351,7 @@ pub fn run_live(
     }
     drop(tx);
     let mut owner = Owner {
-        child,
+        child: Some(child),
         stop: Default::default(),
         drain: None,
     };
@@ -311,17 +371,18 @@ pub fn run_live(
     };
     let (code, timed_out) = loop {
         drain_rx(&rx);
-        if let Some(code) = status_without_reaping(&mut owner.child)? {
+        let child_ref = owner.child.as_mut().expect("child");
+        if let Some(code) = status_without_reaping(child_ref)? {
             break (code, false);
         }
         if control.cancelled() {
-            kill_group(owner.child.id());
-            let _ = owner.child.kill();
+            kill_group(child_ref.id());
+            let _ = child_ref.kill();
             break (130, false);
         }
         if Instant::now() >= deadline {
-            kill_group(owner.child.id());
-            let _ = owner.child.kill();
+            kill_group(child_ref.id());
+            let _ = child_ref.kill();
             break (124, true);
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -332,7 +393,7 @@ pub fn run_live(
         text,
         exit_code: Some(code),
         timed_out,
-        owner,
+        owner: Some(owner),
     })
 }
 

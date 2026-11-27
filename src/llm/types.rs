@@ -31,7 +31,9 @@ impl Usage {
             cached_input_tokens: v
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
-                .or_else(|| v.get("cache_read_input_tokens").and_then(Value::as_u64)),
+                .or_else(|| v.get("cached_input_tokens").and_then(Value::as_u64))
+                .or_else(|| v.get("cache_read_input_tokens").and_then(Value::as_u64))
+                .or_else(|| v.get("cached_content_token_count").and_then(Value::as_u64)),
         }
     }
 }
@@ -93,7 +95,7 @@ impl Default for Roles {
     fn default() -> Self {
         let mut m = HashMap::new();
         let model = std::env::var("TWIG_MODEL").unwrap_or_else(|_| "aihub/gpt-6.1-sol".into());
-        for role in ["filter", "plan", "code", "judge"] {
+        for role in ["filter", "plan", "advisor", "code", "scout", "reviewer", "judge"] {
             m.insert(role.into(), model.clone());
         }
         Roles(m)
@@ -107,6 +109,7 @@ impl Roles {
             .or_else(|| match role {
                 "scout" => self.0.get("filter"),
                 "reviewer" => self.0.get("judge"),
+                "advisor" => self.0.get("plan"),
                 _ => None,
             })
             .or_else(|| self.0.get("code"))
@@ -182,6 +185,9 @@ pub trait Llm: Sync {
     fn roles(&self) -> &Roles;
     fn calls(&self) -> u64;
     fn effort(&self) -> Option<String> {
+        None
+    }
+    fn role_effort(&self, _role: &str) -> Option<String> {
         None
     }
     fn set_effort(&self, _effort: Option<&str>) {}

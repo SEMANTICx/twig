@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="${TWIG_REPO:-SEMANTICx/twig}"
+REPO="${TWIG_REPO:-SEMANTICx/twig-dist}"
 INSTALL_DIR="${TWIG_INSTALL_DIR:-$HOME/.local/bin}"
 
 OS="$(uname -s)"
@@ -36,7 +36,7 @@ else
 fi
 
 if [ -z "$TAG" ]; then
-  echo "twig install: could not resolve latest release tag (set TWIG_VERSION=v0.2.0 or build from source)" >&2
+  echo "twig install: could not resolve latest release tag from ${REPO} (set TWIG_VERSION=v0.2.0 to pin explicitly)" >&2
   exit 1
 fi
 

@@ -19,6 +19,20 @@ proves it works; a claim without a command output is not evidence.
 Do not ask for permission for ordinary work. Do not explain at length what you are
 about to do; do it and show the result.";
 
+/// Directories skipped by workspace walkers (`grep`, `glob`, and progress `Guard`).
+pub const IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "dist",
+    "build",
+    ".twig",
+    ".twig-workers",
+    ".twig-worktrees",
+];
+
 /// Runtime paths never refer to the compilation checkout.
 pub mod paths {
     use std::path::PathBuf;

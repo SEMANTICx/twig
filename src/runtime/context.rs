@@ -64,6 +64,9 @@ pub fn validate_tool_pairs(messages: &[Value]) -> Result<(), String> {
     }
 }
 
+const MICROCOMPACT_RECENT_TOOLS: usize = 6;
+const MICROCOMPACT_MIN_BYTES: usize = 1_200;
+
 impl Context {
     pub fn new(max_bytes: usize, artifact_dir: PathBuf) -> Self {
         Self {
@@ -72,6 +75,60 @@ impl Context {
             constraints: Vec::new(),
             artifact_refs: Vec::new(),
         }
+    }
+
+    /// Stage 1 deterministic zero-LLM compaction: archive older large `tool` outputs
+    /// to `artifact:tool-<id>.txt` while keeping recent tool outputs verbatim.
+    fn microcompact(&self, messages: &mut [Value]) -> usize {
+        let tool_positions: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| (m["role"] == "tool").then_some(i))
+            .collect();
+        if tool_positions.len() <= MICROCOMPACT_RECENT_TOOLS {
+            return 0;
+        }
+        let fold_count = tool_positions.len() - MICROCOMPACT_RECENT_TOOLS;
+        let mut folded = 0usize;
+        for &idx in &tool_positions[..fold_count] {
+            let Some(content) = messages[idx]["content"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            if content.len() <= MICROCOMPACT_MIN_BYTES || content.starts_with("[microcompacted ") {
+                continue;
+            }
+            let raw_id = messages[idx]["tool_call_id"].as_str().unwrap_or("old");
+            let safe_id: String = raw_id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(48)
+                .collect();
+            let fname = format!("tool-{safe_id}.txt");
+            let saved = std::fs::create_dir_all(&self.artifact_dir).is_ok()
+                && std::fs::write(self.artifact_dir.join(&fname), &content).is_ok();
+            let lines = content.lines().count();
+            let replacement = if saved {
+                format!(
+                    "[microcompacted tool output ({} bytes, {lines} lines) -> inspect via read(path=\"artifact:{fname}\", start_line=1)]",
+                    content.len()
+                )
+            } else {
+                let preview: String = content.chars().take(320).collect();
+                format!(
+                    "[microcompacted tool output ({} bytes, {lines} lines)]\n{preview}...",
+                    content.len()
+                )
+            };
+            messages[idx]["content"] = json!(replacement);
+            folded += 1;
+        }
+        folded
     }
 
     pub fn add_constraint(&mut self, constraint: impl Into<String>) {
@@ -88,14 +145,18 @@ impl Context {
         }
     }
 
-    /// Ensure all recorded user constraints appear verbatim in the live messages.
+    /// Ensure all recorded user constraints appear verbatim in the live messages
+    /// without mutating message index 0 (preserving KV prompt cache prefixes).
     pub fn sync_constraints(&self, messages: &mut Vec<Value>) {
         for constraint in &self.constraints {
-            if !messages
-                .iter()
-                .any(|m| m["role"] == "system" && m["content"] == constraint.as_str())
-            {
-                messages.insert(0, json!({"role": "system", "content": constraint}));
+            let present = messages.iter().any(|m| {
+                m["content"].as_str() == Some(constraint.as_str())
+                    || m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains(constraint.as_str()))
+            });
+            if !present {
+                messages.push(json!({"role": "system", "content": constraint}));
             }
         }
     }
@@ -163,8 +224,26 @@ impl Context {
             return Ok(None);
         }
         validate_tool_pairs(messages)?;
+        let folded = self.microcompact(messages);
+        let after_micro = bytes(messages);
+        if !force && folded > 0 && after_micro <= self.max_bytes {
+            return Ok(Some(Compaction {
+                before_bytes,
+                after_bytes: after_micro,
+                removed_messages: folded,
+                artifact: self.artifact_dir.clone(),
+            }));
+        }
         let first_user = messages.iter().position(|m| m["role"] == "user");
-        let pinned = |i: usize, m: &Value| m["role"] == "system" || Some(i) == first_user;
+        let is_transient_reminder = |m: &Value| {
+            m["role"] == "system"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.trim_start().starts_with("<system-reminder>"))
+        };
+        let pinned = |i: usize, m: &Value| {
+            (m["role"] == "system" && !is_transient_reminder(m)) || Some(i) == first_user
+        };
         let keep_budget = if force {
             (before_bytes / 3).min(self.max_bytes / 2)
         } else {
@@ -320,5 +399,82 @@ mod tests {
             serde_json::from_slice(&std::fs::read(event.artifact).unwrap()).unwrap();
         assert_eq!(archive["messages"].as_array().unwrap().len(), 5);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn microcompact_archives_old_tool_outputs_without_calling_llm() {
+        struct PanicLlm(Roles);
+        impl Llm for PanicLlm {
+            fn roles(&self) -> &Roles {
+                &self.0
+            }
+            fn calls(&self) -> u64 {
+                0
+            }
+            fn complete(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[Value],
+                _: Option<&Value>,
+            ) -> Result<Reply, String> {
+                panic!("LLM summarizer must not be called when microcompact satisfies budget");
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("twig-microcompact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = Context::new(4000, dir.clone());
+        let mut messages = vec![json!({"role": "user", "content": "Inspect all files"})];
+        for i in 0..8 {
+            let id = format!("c{i}");
+            let body = if i < 2 {
+                "L".repeat(2500)
+            } else {
+                "short".to_owned()
+            };
+            messages.push(json!({"role": "assistant", "tool_calls": [{"id": id, "type": "function", "function": {"name": "read", "arguments": "{}"}}]}));
+            messages.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": body}));
+        }
+        let res = ctx
+            .compact(&mut messages, &PanicLlm(Roles::default()), "m")
+            .unwrap()
+            .expect("microcompacted");
+        assert!(res.after_bytes <= 4000);
+        assert_eq!(res.removed_messages, 2);
+        assert!(dir.join("tool-c0.txt").is_file());
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("artifact:tool-c0.txt"));
+        validate_tool_pairs(&messages).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transient_system_reminders_are_not_pinned_during_compaction() {
+        use crate::llm::stub::StubLlm;
+        let dir = std::env::temp_dir().join(format!("twig-rem-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = Context::new(800, dir.clone());
+        ctx.add_constraint("never touch legacy/");
+        let mut messages = vec![
+            json!({"role": "user", "content": "initial task"}),
+            json!({"role": "system", "content": format!("<system-reminder>\n{}\n</system-reminder>", "S".repeat(1200))}),
+            json!({"role": "assistant", "content": "done 1"}),
+            json!({"role": "user", "content": "next"}),
+            json!({"role": "assistant", "content": "done 2"}),
+        ];
+        ctx.sync_constraints(&mut messages);
+        let llm = StubLlm::new(vec![StubLlm::text("concise summary")]);
+        let res = ctx.compact_now(&mut messages, &llm, "m").unwrap();
+        assert!(res.is_some());
+        assert!(!messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.starts_with("<system-reminder>"))));
+        assert!(messages
+            .iter()
+            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("never touch legacy/"))));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

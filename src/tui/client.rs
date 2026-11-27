@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -99,85 +99,25 @@ pub struct SessionSummary {
     pub label: String,
     pub turns: usize,
     pub age: String,
+    pub status: String,
+    pub branch: Option<String>,
 }
 
 /// Scan `~/.local/state/twig/sessions/*.jsonl` newest-first for `/resume`.
-pub fn list_sessions() -> Vec<SessionSummary> {
-    let dir = paths::state_dir().join("sessions");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(SystemTime, std::path::PathBuf)> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .map(|e| {
-            let mtime = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            (mtime, e.path())
+/// When `repo_filter` is `Some`, only sessions bound to that repository are returned.
+pub fn list_sessions(repo_filter: Option<&str>) -> Vec<SessionSummary> {
+    let filter_path = repo_filter.map(Path::new);
+    crate::runtime::session::scan_sessions(filter_path, 25)
+        .into_iter()
+        .map(|s| SessionSummary {
+            sid: s.sid,
+            label: s.label,
+            turns: s.turns,
+            age: s.age,
+            status: s.status,
+            branch: s.branch,
         })
-        .collect();
-    files.sort_by_key(|a| std::cmp::Reverse(a.0));
-
-    let now = SystemTime::now();
-    let mut out = Vec::new();
-    for (mtime, path) in files.into_iter().take(25) {
-        let Some(sid) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
-            continue;
-        };
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        let mut title: Option<String> = None;
-        let mut first_user: Option<String> = None;
-        let mut turns = 0usize;
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(row) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            match row["kind"].as_str() {
-                Some("session.renamed") => {
-                    if let Some(t) = row["title"].as_str() {
-                        title = Some(t.to_owned());
-                    }
-                }
-                Some("message") => match row["message"]["role"].as_str() {
-                    Some("user") if first_user.is_none() => {
-                        if let Some(c) = row["message"]["content"].as_str() {
-                            let one: String = c.replace('\n', " ").trim().chars().take(72).collect();
-                            if !one.is_empty() {
-                                first_user = Some(one);
-                            }
-                        }
-                    }
-                    Some("assistant") => turns += 1,
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-        let label = title
-            .or(first_user)
-            .unwrap_or_else(|| "(empty session)".to_owned());
-        let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
-        let age = if secs < 60 {
-            format!("{secs}s ago")
-        } else if secs < 3600 {
-            format!("{}m ago", secs / 60)
-        } else if secs < 86_400 {
-            format!("{}h ago", secs / 3600)
-        } else {
-            format!("{}d ago", secs / 86_400)
-        };
-        out.push(SessionSummary {
-            sid,
-            label,
-            turns,
-            age,
-        });
-    }
-    out
+        .collect()
 }
 
 /// Run a local quick shell command (`!cmd`) directly in `repo` without spending LLM tokens.
@@ -222,12 +162,14 @@ pub fn run_git_diff(repo: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&staged.stdout).into_owned())
 }
 
-/// Invoke `twig review <repo> <diff>` as an independent fresh read-only reviewer for `/review`.
+/// Invoke `twig review <repo> <diff>` as an independent fresh read-only reviewer for `/review`,
+/// formatting structured two-tier `blockers` vs `suggestions` cleanly.
 pub fn run_independent_review(repo: &str) -> Result<String, String> {
     let diff = run_git_diff(repo)?;
     if diff.trim().is_empty() {
         return Err("no unstaged or staged git changes to review".into());
     }
+    let sensitive = crate::runtime::subagent::diff_touches_sensitive_paths(&diff);
     let diff_path = std::env::temp_dir().join(format!("twig-review-{}.diff", std::process::id()));
     std::fs::write(&diff_path, &diff).map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -243,12 +185,259 @@ pub fn run_independent_review(repo: &str) -> Result<String, String> {
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         return Err(if !err.is_empty() { err } else { stdout });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok(format_review_output(&raw, sensitive))
 }
 
-/// Query available models from magpie (`GET /v1/models`) for the interactive `/model` picker.
+fn format_review_output(raw: &str, sensitive: bool) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(raw.trim()) else {
+        return raw.to_owned();
+    };
+    let approved = v.get("approved").and_then(Value::as_bool);
+    let summary = v
+        .get("review_summary")
+        .and_then(Value::as_str)
+        .or_else(|| v.pointer("/result/text").and_then(Value::as_str))
+        .unwrap_or("review completed");
+    let blockers = v
+        .get("blockers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let suggestions = v
+        .get("suggestions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let verdict = match approved {
+        Some(true) => "**APPROVED** (0 blockers)",
+        Some(false) => "**CHANGES REQUESTED**",
+        None => "**REVIEW COMPLETED**",
+    };
+    let effort_tag = if sensitive {
+        " · effort escalated to `xhigh` (sensitive paths touched)"
+    } else {
+        " · effort `high`"
+    };
+    let mut md = format!("### Independent Review: {verdict}{effort_tag}\n\n{summary}\n");
+    if !blockers.is_empty() {
+        md.push_str("\n#### Blockers (must fix)\n");
+        for b in &blockers {
+            let file = b["file"].as_str().unwrap_or("?");
+            let trigger = b["trigger"].as_str().unwrap_or("-");
+            let issue = b["issue"].as_str().unwrap_or("");
+            md.push_str(&format!("- **`{file}`** (trigger: `{trigger}`): {issue}\n"));
+        }
+    }
+    if !suggestions.is_empty() {
+        md.push_str("\n#### Suggestions (non-blocking)\n");
+        for s in &suggestions {
+            let file = s["file"].as_str().unwrap_or("?");
+            let note = s["note"]
+                .as_str()
+                .or_else(|| s["issue"].as_str())
+                .unwrap_or("");
+            md.push_str(&format!("- `{file}`: {note}\n"));
+        }
+    }
+    md
+}
+
+fn collect_repo_brief_context(repo: &str) -> String {
+    let mut ctx = String::new();
+    for doc in ["AGENTS.md", "CLAUDE.md", ".twig/preferences.md"] {
+        let p = Path::new(repo).join(doc);
+        if let Ok(body) = std::fs::read_to_string(p) {
+            let clipped: String = body.chars().take(4_000).collect();
+            ctx.push_str(&format!("## {doc}\n{clipped}\n\n"));
+            if doc == "AGENTS.md" {
+                break;
+            }
+        }
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["-C", repo, "ls-files"])
+        .output()
+    {
+        if out.status.success() {
+            let files: Vec<&str> = std::str::from_utf8(&out.stdout)
+                .unwrap_or("")
+                .lines()
+                .take(180)
+                .collect();
+            ctx.push_str(&format!("## Tracked files (sample)\n{}\n", files.join("\n")));
+        }
+    }
+    ctx
+}
+
+/// Generate a concise, logical human-readable walkthrough of the current `git diff` (`/walkthrough`).
+pub fn run_walkthrough(repo: &str) -> Result<String, String> {
+    use crate::llm::Llm;
+    let diff = run_git_diff(repo)?;
+    if diff.trim().is_empty() {
+        return Err("working tree clean — no diff to explain".into());
+    }
+    let clipped_diff: String = diff.chars().take(36_000).collect();
+    let provider = crate::llm::Provider::new();
+    let model = provider.roles().get("plan").to_owned();
+    let reply = provider.complete(
+        &model,
+        "You are a senior staff engineer producing a concise change walkthrough for code review. Group changes by logical intent rather than raw alphabetical file order, highlight key invariants/trade-offs, and list how to verify.",
+        &[json!({
+            "role": "user",
+            "content": format!("Produce a clear Markdown walkthrough of this git diff:\n\n```diff\n{clipped_diff}\n```")
+        })],
+        None,
+    )?;
+    Ok(reply.text)
+}
+
+fn run_readonly_planning_agent(repo: &str, role: &str, model: &str, prompt: &str) -> Result<String, String> {
+    if model.starts_with("cli:") {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let pool = crate::runtime::subagent::SubagentPool::new(crate::runtime::subagent::SubagentConfig {
+            twig: exe,
+            repository: PathBuf::from(repo),
+            runs_root: paths::state_dir().join("subagents"),
+            bwrap: "/usr/bin/bwrap".into(),
+            concurrency: 2,
+            timeout: Duration::from_secs(180),
+            max_output_bytes: 128_000,
+            network: true,
+        })
+        .map_err(|e| e.to_string())?;
+        let res = pool
+            .run_with_options(
+                crate::runtime::subagent::Role::Advisor,
+                prompt,
+                Some(model),
+                Some("high"),
+            )
+            .map_err(|e| e.to_string())?;
+        let text = res
+            .result
+            .as_ref()
+            .and_then(|r| r["text"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or(res.output);
+        return Ok(text);
+    }
+
+    let (mut cfg, _) = crate::config::HarnessConfig::resolve()?;
+    cfg.max_turns = 8;
+    let provider = crate::llm::Provider::new();
+    let scratch = std::env::temp_dir().join(format!(
+        "twig-dualplan-{}-{}-{}",
+        role,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+    let res = (|| -> Result<String, String> {
+        let mut daemon = crate::runtime::Daemon::new(&provider, repo, &scratch, "plan", &cfg)?;
+        daemon.dispatch("mode.set", &json!({"plan": true}), &mut |_| {})?;
+        daemon.dispatch("model.set", &json!({"model": model}), &mut |_| {})?;
+        let out = daemon.dispatch("turn", &json!({"input": prompt, "role": role}), &mut |_| {})?;
+        Ok(out["text"].as_str().unwrap_or("").to_owned())
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    res
+}
+
+/// Run blind independent tool-driven dual-model planning (`plan` + `advisor`) on the raw user goal
+/// (both inspect real code via read-only `outline`/`read`/`grep`/`glob` without seeing each other),
+/// then synthesize a concrete comparison & decision brief (`/dual-plan`).
+pub fn run_dual_plan(repo: &str, goal: &str) -> Result<String, String> {
+    use crate::llm::Llm;
+    let context = collect_repo_brief_context(repo);
+    let provider = crate::llm::Provider::new();
+    let plan_model = provider.roles().get("plan").to_owned();
+    let advisor_model = provider.roles().get("advisor").to_owned();
+
+    let prompt_a = format!(
+        "[Primary Planner — Read-Only Investigation]\n\
+         Use `outline`, `grep`, `glob`, and `read` to verify real file paths, structs, and signatures before writing your plan.\n\
+         Repository overview:\n{context}\n\nGoal:\n{goal}\n\n\
+         Produce a grounded implementation plan: exact files/functions to modify, invariants, edge cases, and verification steps."
+    );
+    let prompt_b = format!(
+        "[Independent Oracle/Advisor — Blind Read-Only Investigation]\n\
+         Independently inspect relevant files with `outline`, `grep`, `glob`, and `read`. Call out architectural traps, security/concurrency hazards, and simpler alternatives.\n\
+         Repository overview:\n{context}\n\nGoal:\n{goal}\n\n\
+         Produce a grounded independent design and risk analysis."
+    );
+
+    let (res_a, res_b) = std::thread::scope(|s| {
+        let pm = plan_model.as_str();
+        let am = advisor_model.as_str();
+        let pa = prompt_a.as_str();
+        let pb = prompt_b.as_str();
+        let ha = s.spawn(move || run_readonly_planning_agent(repo, "plan", pm, pa));
+        let hb = s.spawn(move || run_readonly_planning_agent(repo, "advisor", am, pb));
+        (
+            ha.join().unwrap_or_else(|_| Err("planner panicked".into())),
+            hb.join().unwrap_or_else(|_| Err("advisor panicked".into())),
+        )
+    });
+    let plan_a = res_a?;
+    let plan_b = res_b?;
+
+    if plan_model.starts_with("cli:") {
+        return Ok(format!(
+            "*Dual-Plan (`plan`: `{plan_model}` × `advisor`: `{advisor_model}`)*\n\n### Plan A (`{plan_model}`)\n{plan_a}\n\n### Plan B (`{advisor_model}`)\n{plan_b}"
+        ));
+    }
+
+    let synth = provider.complete(
+        &plan_model,
+        "Synthesize two independent blind code-verified engineering plans into one actionable brief using four sections: 1) Shared Consensus, 2) Adopted Advisor Insights, 3) Filtered Over-engineering / Hallucinations, 4) Open Decisions & Step-by-Step Plan.",
+        &[json!({
+            "role": "user",
+            "content": format!(
+                "Original Goal: {goal}\n\n--- Plan A (`{plan_model}`) ---\n{plan_a}\n\n--- Plan B (`{advisor_model}`) ---\n{plan_b}"
+            )
+        })],
+        None,
+    )?;
+    Ok(format!(
+        "*Dual-Plan (`plan`: `{plan_model}` × `advisor`: `{advisor_model}`)*\n\n{}",
+        synth.text
+    ))
+}
+
+/// Query available models from magpie (`GET /v1/models`) plus detected local CLI runners (`cli:*`) for `/model`.
 pub fn fetch_magpie_models() -> Result<Vec<String>, String> {
-    crate::llm::Provider::new().list_models()
+    let mut cli_runners = Vec::new();
+    for (bin, id) in [
+        ("codex", "cli:codex"),
+        ("claude", "cli:claude"),
+        ("gemini", "cli:gemini"),
+    ] {
+        let found = Command::new(bin)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        if found {
+            cli_runners.push(id.to_owned());
+        }
+    }
+    match crate::llm::Provider::new().list_models() {
+        Ok(mut models) => {
+            models.extend(cli_runners);
+            Ok(models)
+        }
+        Err(_e) if !cli_runners.is_empty() => Ok(cli_runners),
+        Err(e) => Err(e),
+    }
 }
 
 /// Run `twig doctor` in `repo` and return `(combined_output, succeeded)`.
@@ -278,7 +467,7 @@ const PREFERENCES_TEMPLATE: &str = "\
 - Keep edits minimal, focused, and well-tested.
 ";
 
-const PROJECT_JSON_TEMPLATE: &str = "{\n  \"notes\": \"Optional: add a 'check' command for automatic acceptance verification.\"\n}\n";
+const PROJECT_JSON_TEMPLATE: &str = "{\n  \"notes\": \"Optional: set 'check_on_change' (runs only when files change), 'post_edit_check' (runs after edit/write/apply_patch), or 'check' (runs every turn).\"\n}\n";
 
 /// Ensure `<repo>/.twig/preferences.md` exists; returns `(path, created)`.
 pub fn ensure_memory_file(repo: &str) -> Result<(PathBuf, bool), String> {
@@ -425,6 +614,16 @@ fn image_mime_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+fn has_valid_image_magic(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xFF\xD8\xFF"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        _ => false,
+    }
+}
+
 /// Read an image file and encode it as an OpenAI-compatible `data:image/...;base64,...` URL.
 pub fn load_image_data_url(repo: &str, raw_path: &str) -> Result<(String, String), String> {
     let trimmed = raw_path.trim().trim_matches(['"', '\'']);
@@ -447,6 +646,12 @@ pub fn load_image_data_url(repo: &str, raw_path: &str) -> Result<(String, String
         return Err(format!(
             "image too large ({}MB > 10MB limit)",
             bytes.len() / (1024 * 1024)
+        ));
+    }
+    if !has_valid_image_magic(mime, &bytes) {
+        return Err(format!(
+            "invalid {mime} header in {}",
+            path.display()
         ));
     }
     let label = path
@@ -534,40 +739,60 @@ pub fn paste_clipboard_image() -> Result<Option<(String, String)>, String> {
     }
 }
 
-/// Auto-detect `@path/to/image.png` mentions inside a prompt and load existing image files.
+/// Auto-detect `@path/to/image.png` mentions inside a prompt and load existing workspace image files.
+/// Confines auto-extracted `@...` paths to `repo` so pasted logs cannot silently exfiltrate outside files.
 pub fn extract_inline_images(repo: &str, text: &str) -> Vec<(String, String)> {
+    let Ok(canon_repo) = Path::new(repo).canonicalize() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     for token in text.split_whitespace() {
         let Some(candidate) = token.strip_prefix('@') else {
             continue;
         };
         let cleaned = candidate.trim_end_matches([',', '.', ';', ')', ']']);
-        if image_mime_for_path(Path::new(cleaned)).is_some() {
-            if let Ok(img) = load_image_data_url(repo, cleaned) {
-                out.push(img);
-            }
+        let pb = Path::new(cleaned);
+        if pb.is_absolute() || image_mime_for_path(pb).is_none() {
+            continue;
+        }
+        let joined = canon_repo.join(pb);
+        let Ok(canon_file) = joined.canonicalize() else {
+            continue;
+        };
+        if !canon_file.starts_with(&canon_repo) {
+            continue;
+        }
+        if let Ok(img) = load_image_data_url(repo, cleaned) {
+            out.push(img);
         }
     }
     out
 }
 
-/// Prompt sent by `/evolve` for human-reviewed session self-improvement.
+const MAX_MEMORY_CHARS: usize = 2_400;
+
+/// Prompt sent by `/evolve` for guard-first ratchet + bounded memory distillation.
 pub const EVOLVE_PROMPT: &str = "\
 Reflect on this session's friction, repeated errors, tool papercuts, or repo-specific conventions you discovered. \
-Propose ONE concise, high-leverage improvement to `.twig/preferences.md` or a project skill under `.twig/skills/<name>/SKILL.md` \
-(keep skills <500 lines with crisp triggers and verify with `twig skill doctor` once approved). \
-Do NOT edit Rust source code or locked harness files, and do NOT modify files yet—present the proposed change as a clear unified diff with a brief rationale so I can review and approve applying it.";
+Apply a strict Guard-First Ratchet: \
+(1) First check whether the lesson can be enforced mechanically via a unit test, lint, or `post_edit_check` in `.twig/project.json` — prefer executable guards over prose! \
+(2) Only distill non-automatable conventions into `.twig/preferences.md` (strictly keep total `.twig/preferences.md` <= 2,400 chars by merging/pruning stale bullets rather than appending endlessly) or a focused skill under `.twig/skills/<name>/SKILL.md` (<500 lines). \
+Do NOT modify files yet — present ONE concise unified diff proposal with rationale for human review.";
 
 /// Format an `mcp.list` RPC reply cleanly for the transcript (tools, prompts/skills, and resources).
 pub fn format_mcp_report(result: &Value) -> String {
     let servers = result["servers"].as_array().map(Vec::as_slice).unwrap_or(&[]);
     if servers.is_empty() {
-        return "no MCP servers configured (add `mcpServers` to `.twig/mcp.json` or `~/.config/twig/mcp.json`)".into();
+        return "no MCP servers configured (add `mcpServers` to `.twig/mcp.json`, or run `/mcp init-rea` to scaffold optional REA MCP)".into();
     }
     let mut lines = Vec::new();
     for s in servers {
         let name = s["server"].as_str().unwrap_or("?");
-        if s["ok"] == true {
+        if s["disabled"] == true {
+            lines.push(format!(
+                "- **{name}** — `disabled` (zero overhead; run `/mcp enable {name}` to turn on)"
+            ));
+        } else if s["ok"] == true {
             let tools: Vec<&str> = s["tools"]
                 .as_array()
                 .into_iter()
@@ -645,14 +870,22 @@ pub fn format_config_report() -> Result<String, String> {
     ))
 }
 
-/// Read `<repo>/.twig/preferences.md` for `/memory show`.
+/// Read `<repo>/.twig/preferences.md` for `/memory show` with bounded-budget indicator.
 pub fn read_memory_preview(repo: &str) -> Result<Option<String>, String> {
     let path = Path::new(repo).join(".twig/preferences.md");
     if !path.exists() {
         return Ok(None);
     }
     let body = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    Ok(Some(body))
+    let chars = body.chars().count();
+    let warn = if chars > MAX_MEMORY_CHARS {
+        " — OVER 2,400-CHAR CAP, run `/evolve` or `/memory` to consolidate!"
+    } else {
+        ""
+    };
+    Ok(Some(format!(
+        "*Memory budget: {chars} / {MAX_MEMORY_CHARS} chars{warn}*\n\n{body}"
+    )))
 }
 
 /// Format `.twig/` initialization results for `/init`.
@@ -890,6 +1123,8 @@ pub enum LocalMsg {
         elapsed: Duration,
     },
     Review(Result<String, String>),
+    Walkthrough(Result<String, String>),
+    DualPlan(Result<String, String>),
     Doctor(Result<(String, bool), String>),
     Models(Result<Vec<String>, String>),
     GitStat(Option<(usize, usize)>),
@@ -932,6 +1167,20 @@ impl LocalWorkers {
         });
     }
 
+    pub fn spawn_walkthrough(&self, repo: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::Walkthrough(run_walkthrough(&repo)));
+        });
+    }
+
+    pub fn spawn_dual_plan(&self, repo: String, goal: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(LocalMsg::DualPlan(run_dual_plan(&repo, &goal)));
+        });
+    }
+
     pub fn spawn_shell(&self, repo: String, id: String, cmd: String) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
@@ -953,13 +1202,50 @@ impl LocalWorkers {
     }
 }
 
-/// Format turn RPC parameters including any pending or inline `@image` attachments.
+/// Format turn RPC parameters including dynamic `@diff`/`@staged`/`@last` context
+/// expansions and any pending or inline `@image` attachments.
 pub fn build_turn_params(
     repo: &str,
-    text: String,
+    mut text: String,
     mut images: Vec<(String, String)>,
+    last_shell: Option<&(String, String, Option<i32>)>,
 ) -> (Value, Vec<String>) {
     images.extend(extract_inline_images(repo, &text));
+    let mut context_blocks = Vec::new();
+    let has_tok = |want: &str| {
+        text.split_whitespace()
+            .any(|t| t.trim_end_matches([',', '.', ';', ')', ']']) == want)
+    };
+    if has_tok("@diff") {
+        if let Ok(d) = Command::new("git").args(["-C", repo, "diff"]).output() {
+            let body: String = String::from_utf8_lossy(&d.stdout).chars().take(24_000).collect();
+            if !body.trim().is_empty() {
+                context_blocks.push(format!("<context source=\"@diff\">\n{body}\n</context>"));
+            }
+        }
+    }
+    if has_tok("@staged") {
+        if let Ok(d) = Command::new("git")
+            .args(["-C", repo, "diff", "--cached"])
+            .output()
+        {
+            let body: String = String::from_utf8_lossy(&d.stdout).chars().take(24_000).collect();
+            if !body.trim().is_empty() {
+                context_blocks.push(format!("<context source=\"@staged\">\n{body}\n</context>"));
+            }
+        }
+    }
+    if has_tok("@last") {
+        if let Some((cmd, out, code)) = last_shell {
+            let body: String = out.chars().take(16_000).collect();
+            context_blocks.push(format!(
+                "<context source=\"@last\" command={cmd:?} exit_code={code:?}>\n{body}\n</context>"
+            ));
+        }
+    }
+    if !context_blocks.is_empty() {
+        text = format!("{text}\n\n{}", context_blocks.join("\n\n"));
+    }
     if images.is_empty() {
         return (json!({"input": text}), Vec::new());
     }
@@ -1269,5 +1555,38 @@ mod tests {
             vec!["second".to_owned(), "first\nmultiline".to_owned()]
         );
         let _ = std::fs::remove_file(&hist_path);
+
+        let shell_snap = (
+            "cargo test".to_owned(),
+            "panicked at foo.rs:9".to_owned(),
+            Some(101),
+        );
+        let (params, _) = build_turn_params(
+            ".",
+            "fix @last please".into(),
+            Vec::new(),
+            Some(&shell_snap),
+        );
+        let expanded = params["input"].as_str().unwrap();
+        assert!(expanded.contains("source=\"@last\"") && expanded.contains("panicked at foo.rs:9"));
+
+        let img_base = std::env::temp_dir().join(format!("twig-img-confine-{}", std::process::id()));
+        let repo_dir = img_base.join("repo");
+        let outside_dir = img_base.join("outside");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let valid_png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        std::fs::write(repo_dir.join("ok.png"), valid_png).unwrap();
+        std::fs::write(repo_dir.join("fake.png"), b"-----BEGIN PRIVATE KEY-----").unwrap();
+        std::fs::write(outside_dir.join("escape.png"), valid_png).unwrap();
+
+        assert!(load_image_data_url(repo_dir.to_str().unwrap(), "fake.png").is_err());
+        let extracted = extract_inline_images(
+            repo_dir.to_str().unwrap(),
+            "inspect @ok.png @fake.png @../outside/escape.png",
+        );
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].0, "ok.png");
+        let _ = std::fs::remove_dir_all(&img_base);
     }
 }

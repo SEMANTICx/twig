@@ -21,6 +21,58 @@ fn commands(command: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Split a shell command joined strictly by unquoted `&&` operators (rejecting `;`, `|`, `||`,
+/// single `&`, redirects, subshells, and newlines). When `sh -c "A && B"` exits `0`, POSIX
+/// short-circuit semantics guarantee every segment `A` and `B` executed and exited `0`.
+fn and_chain_commands(command: &str) -> Vec<Vec<String>> {
+    if command.chars().any(|c| ";|<>$`(){}#\n\\".contains(c)) {
+        return Vec::new();
+    }
+    let bytes = command.as_bytes();
+    let mut segs = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'&' if !in_single && !in_double => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' && (i + 2 >= bytes.len() || bytes[i + 2] != b'&') {
+                    segs.push(&command[start..i]);
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                return Vec::new();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_single || in_double {
+        return Vec::new();
+    }
+    segs.push(&command[start..]);
+    let mut parsed = Vec::with_capacity(segs.len());
+    for seg in segs {
+        let Some(argv) = shlex::split(seg).filter(|v| !v.is_empty()) else {
+            return Vec::new();
+        };
+        parsed.push(argv);
+    }
+    parsed
+}
+
+fn norm_rel_path(p: &str) -> &str {
+    let mut s = p.trim();
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s
+}
+
 fn matches(argv: &[String], want: &[String]) -> bool {
     !want.is_empty() && argv.starts_with(want)
 }
@@ -48,23 +100,30 @@ pub fn grade(rows: &[Value], rules: &[Rule]) -> Value {
                     && r["tool"] == "bash"
                     && r["exit_code"] == 0
                     && r["args"]["command"].as_str().is_some_and(|c| {
-                        let parsed = commands(c);
-                        parsed.last().is_some_and(|a| matches(a, argv))
+                        and_chain_commands(c).iter().any(|a| matches(a, argv))
                     })
             }),
-            Rule::ReadFile { path } => rows.iter().any(|r| {
-                let output = r["output"].as_str().unwrap_or("");
-                if r["kind"] != "tool.result" || r["exit_code"] != 0 || output.is_empty() {
-                    return false;
-                }
-                (r["tool"] == "read" && r["args"]["path"] == path.as_str())
-                    || (r["tool"] == "bash"
-                        && r["exit_code"] == 0
-                        && r["args"]["command"].as_str().is_some_and(|c| {
-                            let want = vec!["cat".to_string(), path.clone()];
-                            commands(c).last().is_some_and(|a| matches(a, &want))
-                        }))
-            }),
+            Rule::ReadFile { path } => {
+                let want_norm = norm_rel_path(path);
+                rows.iter().any(|r| {
+                    let output = r["output"].as_str().unwrap_or("");
+                    if r["kind"] != "tool.result" || r["exit_code"] != 0 || output.is_empty() {
+                        return false;
+                    }
+                    (r["tool"] == "read"
+                        && r["args"]["path"]
+                            .as_str()
+                            .is_some_and(|p| norm_rel_path(p) == want_norm))
+                        || (r["tool"] == "bash"
+                            && r["exit_code"] == 0
+                            && r["args"]["command"].as_str().is_some_and(|c| {
+                                and_chain_commands(c).iter().any(|a| {
+                                    a.first().map(String::as_str) == Some("cat")
+                                        && a.get(1).is_some_and(|p| norm_rel_path(p) == want_norm)
+                                })
+                            }))
+                })
+            }
             Rule::NeverCommand { argv } => !rows.iter().any(|r| {
                 r["tool_calls"]
                     .as_array()
@@ -85,7 +144,7 @@ pub fn grade(rows: &[Value], rules: &[Rule]) -> Value {
                     && r["tool"] == "bash"
                     && r["args"]["command"]
                         .as_str()
-                        .is_some_and(|s| commands(s).is_empty())
+                        .is_some_and(|s| and_chain_commands(s).is_empty())
             });
             if ambiguous && !matches!(rule, Rule::NeverCommand { .. }) {
                 unsupported.push(json!({"rule": i, "reason": "compound shell syntax: execution cannot be established", "contract": rule}));
@@ -125,7 +184,20 @@ mod tests {
         ] {
             assert_ne!(grade(&[r], std::slice::from_ref(&rule))["pass"], true);
         }
+        assert_eq!(
+            grade(&[row("cd /workspace && python3 test.py", 0)], std::slice::from_ref(&rule))["pass"],
+            true
+        );
         assert_eq!(grade(&[row("python3 test.py", 0)], &[rule])["pass"], true);
+    }
+
+    #[test]
+    fn read_file_normalizes_dot_slash_and_cat_and_chain() {
+        let rule = Rule::ReadFile {
+            path: "SPEC.md".into(),
+        };
+        let row = json!({"kind":"tool.result","tool":"read","args":{"path":"./SPEC.md"},"exit_code":0,"output":"   1→# Spec"});
+        assert_eq!(grade(&[row], &[rule])["pass"], true);
     }
 
     #[test]

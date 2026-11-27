@@ -5,12 +5,14 @@
 //! supports non-busy-wait `wait` via condition variable, and cleans up running
 //! process groups on `cancel` or `Drop`.
 
-use std::io::Read;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::{net::UnixStream, process::CommandExt};
 use std::path::PathBuf;
+#[cfg(not(unix))]
+use std::process::ChildStdin;
 use std::process::Stdio;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -60,6 +62,10 @@ struct ManagedTask {
     command: String,
     pid: u32,
     started: Instant,
+    #[cfg(unix)]
+    stdin: Option<Mutex<UnixStream>>,
+    #[cfg(not(unix))]
+    stdin: Option<Mutex<ChildStdin>>,
     shared: Arc<(Mutex<TaskState>, Condvar)>,
     worker: Option<JoinHandle<()>>,
 }
@@ -198,7 +204,10 @@ impl TaskManager {
         let started = Instant::now();
 
         #[cfg(unix)]
-        let (pid, worker) = {
+        let (pid, stdin_pipe, worker) = {
+            let (stdin_writer, stdin_reader) =
+                UnixStream::pair().map_err(|e| format!("stdin pipe: {e}"))?;
+            let in_fd: OwnedFd = stdin_reader.into();
             let (mut reader, writer) = UnixStream::pair().map_err(|e| format!("pipe: {e}"))?;
             let out_fd: OwnedFd = writer
                 .try_clone()
@@ -209,7 +218,7 @@ impl TaskManager {
             let mut child = cmd
                 .current_dir(&self.worktree)
                 .process_group(0)
-                .stdin(Stdio::null())
+                .stdin(Stdio::from(in_fd))
                 .stdout(Stdio::from(out_fd))
                 .stderr(Stdio::from(err_fd))
                 .spawn()
@@ -234,20 +243,21 @@ impl TaskManager {
                     shared_bg.1.notify_all();
                 }
             });
-            (pid, worker)
+            (pid, Some(Mutex::new(stdin_writer)), worker)
         };
 
         #[cfg(not(unix))]
-        let (pid, worker) = {
+        let (pid, stdin_pipe, worker) = {
             let mut cmd = shell_command(effective);
             let mut child = cmd
                 .current_dir(&self.worktree)
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("spawn task: {e}"))?;
             let pid = child.id();
+            let stdin_writer = child.stdin.take().map(Mutex::new);
             let out_pipe = child.stdout.take();
             let err_pipe = child.stderr.take();
             let shared_bg = Arc::clone(&shared);
@@ -283,7 +293,7 @@ impl TaskManager {
                     shared_bg.1.notify_all();
                 }
             });
-            (pid, worker)
+            (pid, stdin_writer, worker)
         };
 
         self.next_id += 1;
@@ -294,6 +304,7 @@ impl TaskManager {
             command: trimmed.to_owned(),
             pid,
             started,
+            stdin: stdin_pipe,
             shared,
             worker: Some(worker),
         };
@@ -336,12 +347,42 @@ impl TaskManager {
         Ok(task.snapshot(true))
     }
 
+    pub fn send_input(&self, id: &str, input: &str, read_only: bool) -> Result<Value, String> {
+        if read_only {
+            return Err("refused: read-only mode does not allow sending input to tasks".into());
+        }
+        let task = self
+            .tasks
+            .iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| format!("unknown background task {id:?}"))?;
+        if !task.is_running() {
+            return Err(format!("background task {id:?} has already exited"));
+        }
+        let Some(ref pipe) = task.stdin else {
+            return Err(format!("background task {id:?} stdin is closed"));
+        };
+        let mut writer = pipe.lock().map_err(|_| "task stdin lock poisoned")?;
+        let mut payload = input.to_owned();
+        if !payload.ends_with('\n') {
+            payload.push('\n');
+        }
+        writer
+            .write_all(payload.as_bytes())
+            .and_then(|_| writer.flush())
+            .map_err(|e| format!("write to {id} stdin: {e}"))?;
+        drop(writer);
+        std::thread::sleep(Duration::from_millis(80));
+        Ok(task.snapshot(true))
+    }
+
     pub fn cancel(&mut self, id: &str) -> Result<Value, String> {
         let task = self
             .tasks
             .iter_mut()
             .find(|t| t.id == id)
             .ok_or_else(|| format!("unknown background task {id:?}"))?;
+        let _ = task.stdin.take();
         task.terminate();
         Ok(task.snapshot(true))
     }
@@ -396,6 +437,16 @@ mod tests {
         assert_eq!(cancelled["status"], "cancelled");
         assert_eq!(mgr.running_count(), 0);
         assert_eq!(mgr.list()["tasks"].as_array().unwrap().len(), 2);
+
+        // Interactive stdin send_input works and returns latest echoed output.
+        let interactive = mgr
+            .start("read line && echo got:$line", false)
+            .unwrap();
+        let int_id = interactive["id"].as_str().unwrap().to_owned();
+        let _ = mgr.send_input(&int_id, "ping123", false).unwrap();
+        let finished = mgr.wait(&int_id, 5, &ctrl).unwrap();
+        assert_eq!(finished["status"], "completed");
+        assert!(finished["output"].as_str().unwrap().contains("got:ping123"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

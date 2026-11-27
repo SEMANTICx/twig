@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  DIST_REPO: ${{ vars.TWIG_DIST_REPO || 'SEMANTICx/twig-dist' }}
+
 jobs:
   build:
     name: Build (${{ matrix.target }})
@@ -57,10 +60,13 @@ jobs:
       - name: Lint target with clippy
         run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Build stripped & path-sanitized release binary
+        shell: bash
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=twig --remap-path-prefix=${HOME}/.cargo=/cargo --remap-path-prefix=${HOME}/.rustup=/rustup"
+          cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package Unix tarball & checksum
+      - name: Package Unix tarball & checksum (zero source files)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
@@ -68,7 +74,7 @@ jobs:
           PKG="twig-${TAG}-${{ matrix.target }}"
           mkdir -p "dist/${PKG}"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${PKG}/"
-          cp README.md LICENSE "dist/${PKG}/"
+          cp scripts/DIST_README.md "dist/${PKG}/README.md"
           tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
@@ -76,7 +82,7 @@ jobs:
             (cd dist && shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
           fi
 
-      - name: Package Windows zip & checksum
+      - name: Package Windows zip & checksum (zero source files)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
@@ -84,7 +90,7 @@ jobs:
           $Pkg = "twig-$Tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "dist/$Pkg" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/$Pkg/"
-          Copy-Item "README.md", "LICENSE" "dist/$Pkg/"
+          Copy-Item "scripts/DIST_README.md" "dist/$Pkg/README.md"
           Compress-Archive -Path "dist/$Pkg" -DestinationPath "dist/$Pkg.zip" -Force
           $Hash = (Get-FileHash "dist/$Pkg.zip" -Algorithm SHA256).Hash.ToLower()
           "$Hash  $Pkg.zip" | Out-File -Encoding ascii "dist/$Pkg.zip.sha256"
@@ -99,11 +105,13 @@ jobs:
             dist/*.sha256
 
   publish:
-    name: Publish GitHub Release
+    name: Publish Private Backup & Public Dist Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -113,7 +121,7 @@ jobs:
       - name: Combine SHA256SUMS
         run: cat artifacts/*.sha256 > artifacts/SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Publish backup release to private source repo
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -122,3 +130,36 @@ jobs:
             artifacts/*.zip
             artifacts/*.sha256
             artifacts/SHA256SUMS.txt
+
+      - name: Sync orphan installers & publish binaries to public dist repo
+        if: env.DIST_TOKEN != ''
+        env:
+          DIST_TOKEN: ${{ secrets.DIST_REPO_TOKEN }}
+        shell: bash
+        run: |
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/scripts"
+          cp scripts/DIST_README.md "$STAGE/README.md"
+          cp scripts/install.sh "$STAGE/install.sh"
+          cp scripts/install.ps1 "$STAGE/install.ps1"
+          cp scripts/install.sh "$STAGE/scripts/install.sh"
+          cp scripts/install.ps1 "$STAGE/scripts/install.ps1"
+          chmod 755 "$STAGE/install.sh" "$STAGE/scripts/install.sh"
+          (
+            cd "$STAGE"
+            git init -q -b main
+            git config user.name "twig-release-bot"
+            git config user.email "noreply@users.noreply.github.com"
+            git add .
+            git commit -q -m "chore: sync installers for ${GITHUB_REF_NAME}"
+            git push -q --force "https://x-access-token:${DIST_TOKEN}@github.com/${DIST_REPO}.git" main:main
+          )
+          rm -rf "$STAGE"
+          GH_TOKEN="${DIST_TOKEN}" gh release create "${GITHUB_REF_NAME}" \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/*.sha256 artifacts/SHA256SUMS.txt \
+            --repo "${DIST_REPO}" \
+            --title "twig ${GITHUB_REF_NAME}" \
+            --notes "Official prebuilt binaries for twig ${GITHUB_REF_NAME}." \
+          || GH_TOKEN="${DIST_TOKEN}" gh release upload "${GITHUB_REF_NAME}" \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/*.sha256 artifacts/SHA256SUMS.txt \
+            --clobber --repo "${DIST_REPO}"

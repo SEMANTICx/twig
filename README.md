@@ -80,6 +80,13 @@ twig selfcheck
 # 3. Launch the interactive TUI in any repository
 cd /path/to/your/repo
 twig chat
+
+# 4. Run a headless single-shot task or manage first-class sessions from CLI/scripts
+twig exec --role plan "Inspect architecture and list bottlenecks"
+twig exec --check "cargo test" --json "Fix off-by-one in parser"
+twig exec --events "Trace and fix failing test"
+twig session list
+twig session search "parser"
 ```
 
 ---
@@ -109,7 +116,7 @@ twig chat
 | Prefix | Purpose |
 |---|---|
 | `/` | Fuzzy slash-command palette |
-| `@` | Repository file & inline image mention (`@src/main.rs`, `@shot.png`) |
+| `@` | Repository file, inline image (`@shot.png`), or live context (`@diff`, `@staged`, `@last`) |
 | `$` | Direct skill autocomplete & zero-RTT invocation (supports active + `[vault]` skills) |
 | `!` | Run a local shell command immediately in the repo without spending tokens |
 
@@ -117,17 +124,25 @@ twig chat
 
 | Command / Key | Action |
 |---|---|
-| `Shift+Tab` / `/plan` | Toggle read-only planning mode |
-| `Esc×2` / `/rewind` | Open interactive turn rewind picker (restore & edit earlier prompt) |
-| `/undo` | Revert the last `edit` or `write` tool change |
-| `/model` / `/effort` | Switch active model via gateway / set reasoning effort (`off`..`xhigh`), persisted across sessions |
+| `Shift+Tab` / `/plan` | Toggle read-only planning mode (automatically routes to `plan` role model) |
+| `/study [on\|off\|<target>]` | Toggle opt-in REA clean-room study mode (`[Observed]`/`[Derived]`/`[Inferred]`/`[Unknown]` provenance; 0 tokens when off) |
+| `/go [instructions]` | Exit `/plan` & `/study`, switch back to `code` role model, and execute the agreed plan/spec + tests |
+| `/roles [<role> <model> [effort]]` | Configure heterogeneous models or external CLI workers (`cli:codex`, `cli:claude`, `cli:gemini`) per role in `roles.json` |
+| `/operator` | Toggle Agent-as-Memory multi-session orchestration mode (zero token overhead when off) |
+| `/dual-plan <goal>` | Run blind independent tool-driven plans (`outline`/`read`/`grep`/`glob`) on `plan` × `advisor` models, then synthesize a brief |
+| `/btw <question>` | Ask an ephemeral side question reusing KV cache without polluting session history |
+| `/walkthrough` / `/commit [hint]` | Generate a logical walkthrough of `git diff` / stage & commit with a repo-style-matched message |
+| `/apply <sid>` / `/gc` | Apply a subagent session patch cleanly into the worktree (reversible via `/undo`) / clean up 0-byte & stale subagent remnants |
+| `Esc×2` / `/rewind [N] [--code]` | Rewind conversation turns (`Enter` chat-only, `r` / `--code` also restores Git worktree snapshot) |
+| `/undo` | Revert the last `edit`, `write`, or `apply_patch` file change |
+| `/model` / `/effort` | Switch active fallback model via gateway / set reasoning effort (`off`..`xhigh`) |
 | `/skills [list\|enable\|disable\|doctor]` | Inspect, hot-toggle, and lint 3-tier skills without restarting |
-| `/diff` / `/review` | Inspect git diff with line numbers / run an independent read-only subagent review |
-| `/tasks` / `/mcp` | Inspect running background shell tasks / configured MCP servers, prompts, and resources |
-| `/evolve` | Propose a human-reviewed `.twig/preferences.md` or project skill improvement from session friction |
-| `/memory` / `/init` | Edit `.twig/preferences.md` in `$EDITOR` / scaffold `.twig/` |
-| `/fork` / `/resume` / `/archive` / `/export` | Branch, resume, archive, or export sessions to Markdown |
-| `/compact` / `/verify` / `/status` / `/doctor` | Force lossless context compaction / verify BLAKE3 hash chain / inspect telemetry & environment |
+| `/diff` / `/review` | Inspect git diff / run two-tier (`blockers` vs `suggestions`) independent review with auto `xhigh` escalation on sensitive paths |
+| `/tasks` / `/mcp [enable\|disable\|init-rea]` | Inspect background tasks / list or hot-toggle MCP servers (including opt-in `rea-agents` scaffold) |
+| `/evolve` | Guard-first ratchet proposal (executable tests/`post_edit_check` first, bounded `<= 2.4K` `.twig/preferences.md` consolidation) |
+| `/memory` / `/init` | Edit `.twig/preferences.md` in `$EDITOR` (`/memory show` displays budget) / scaffold `.twig/` |
+| `/fork` / `/resume` / `/archive` / `/export` | Branch, repo-scoped resume (`a` toggles all repos), archive, or export sessions to Markdown |
+| `/compact` / `/verify` / `/status` / `/doctor` | Two-stage context compaction / verify BLAKE3 hash chain / inspect telemetry & environment |
 | `Ctrl+R` / `Ctrl+F` / `Ctrl+G` / `Ctrl+O` | Persistent prompt history / search transcript / compose in `$EDITOR` / expand tool outputs |
 | `Alt+V` / `Alt+Y` / `Alt+M` / `?` | Paste clipboard image / copy code block (`+Shift` full reply) / toggle mouse select / shortcut overlay |
 
@@ -139,12 +154,12 @@ twig chat
 
 | Tool | Behavior |
 |---|---|
-| `read`, `edit`, `write`, `grep`, `glob` | Worktree-confined structured file tools; `edit`/`write` push snapshots for `/undo`; `read` supports `artifact:<file>` pagination |
-| `bash` | Bounded 1 MiB shell runner (`sh -c` on Unix, `cmd /C` on Windows) with process-tree cleanup, optional Linux `bwrap` isolation, and tiered policy |
-| `task` | Session-scoped async background shell tasks (`start`, `status`, `wait`, `cancel`, `list`) with cancellation support |
-| `subagent` | Parallel isolated Git worktrees (`code`, `test`, `scout`, `reviewer`); read-only roles enforce read-only mode and auto-clean worktrees |
+| `outline`, `read`, `edit`, `write`, `apply_patch`, `grep`, `glob` | Worktree-confined structured tools: zero-dependency symbol `outline`, line-numbered `read` (`artifact:<file>`, `session:<sid>`, lazy subdirectory `AGENTS.md`/`CLAUDE.md`), Read-Before-Edit `mtime` lock (persisted across `/resume`), 4-level progressive indentation `edit`, multi-file `apply_patch`, and `.twig/project.json` `post_edit_check` / `check_on_change` hooks |
+| `bash` | Bounded 1 MiB shell runner (`sh -c` on Unix, `cmd /C` on Windows) with automatic process-group/FD reclamation, parallel `Auto` read batching, optional Linux `bwrap` isolation, and tiered policy |
+| `task` | Session-scoped async background shell tasks (`start`, `send` stdin, `status`, `wait`, `cancel`, `list`) with cancellation support |
+| `subagent` | Parallel & resumable (`resume_sid`) isolated Git worktrees (`code`, `test`, `scout`, `advisor`, `reviewer`); returns `sid`, `diff_stat`, and `artifact:subagent-<sid>.patch` |
 | `skill` | Progressive-disclosure skill catalog (`query`) and on-demand body loader (`name`), including cold-vault fallback |
-| `mcp` | Lazy stdio JSON-RPC 2.0 MCP client (`.twig/mcp.json` & config `mcp.json`) supporting tools, prompts, and resources with bounded timeouts & auto-recovery |
+| `mcp` | Lazy stdio JSON-RPC 2.0 MCP client (`.twig/mcp.json` & config `mcp.json`) supporting tools (`Audit` tier, blocked in read-only mode), prompts, and resources |
 | `todo` / `papercut` | Live progress checklist / structured harness defect reporting |
 
 ### 3-Tier Skill Management (`twig skill`)

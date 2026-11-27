@@ -72,6 +72,19 @@ const READ_ONLY: &[(&str, &[&str])] = &[
     ("file", &[]),
     ("tree", &[]),
     ("which", &[]),
+    ("readelf", &[]),
+    ("nm", &[]),
+    ("strings", &[]),
+    ("ldd", &[]),
+    ("objdump", &[]),
+    ("hexdump", &[]),
+    ("od", &[]),
+    ("sha256sum", &[]),
+    ("sha1sum", &[]),
+    ("md5sum", &[]),
+    ("b3sum", &[]),
+    ("ffprobe", &[]),
+    ("jq", &[]),
 ];
 
 /// Read-only git subcommands. `--output` writes a file, so it disqualifies.
@@ -85,16 +98,272 @@ const GIT_READ: &[&str] = &[
     "ls-files",
 ];
 
-fn read_only(seg: &[&str]) -> bool {
-    let Some(program) = seg.first() else {
+/// Returns `true` when `raw` points to a sensitive secret/credential file (e.g. `.env`,
+/// `.env.production`, SSH private keys, `.pem`/`.key`, `.npmrc`, `.netrc`), while allowing
+/// safe committed templates like `.env.example`, `.env.sample`, `.env.template`, or `.env.test`.
+pub fn is_sensitive_secret_path(raw: &str) -> bool {
+    let trimmed = raw
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim_start_matches('@');
+    let candidate = match trimmed.split_once('=') {
+        Some((flag, val)) if flag.starts_with('-') => val.trim_matches(['"', '\'']),
+        _ => trimmed,
+    };
+    if candidate.is_empty() || candidate.starts_with('-') {
+        return false;
+    }
+    let norm = candidate.replace('\\', "/");
+    let lower = norm.to_ascii_lowercase();
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    if base.is_empty() {
+        return false;
+    }
+    if base == ".env" {
+        return true;
+    }
+    if let Some(suffix) = base.strip_prefix(".env.") {
+        return !matches!(
+            suffix,
+            "example" | "sample" | "template" | "dist" | "schema" | "defaults" | "test" | "ci"
+        );
+    }
+    if matches!(
+        base,
+        ".npmrc"
+            | ".pypirc"
+            | ".netrc"
+            | ".git-credentials"
+            | "id_rsa"
+            | "id_ed25519"
+            | "id_ecdsa"
+            | "id_dsa"
+            | "credentials.json"
+            | "service-account.json"
+    ) {
+        return true;
+    }
+    if lower.ends_with("/.aws/credentials") || lower.ends_with("/.docker/config.json") {
+        return true;
+    }
+    matches!(
+        base.rsplit_once('.').map(|(_, ext)| ext),
+        Some("pem" | "key" | "p12" | "pfx" | "kdbx")
+    )
+}
+
+fn touches_sensitive_secret(cmd: &str) -> bool {
+    let Some(tokens) = lex_shell(cmd) else {
         return false;
     };
-    if *program == "git" {
+    let mut first_in_seg = true;
+    let mut skip_seg = false;
+    for tok in tokens {
+        match tok {
+            Token::Op(_) => {
+                first_in_seg = true;
+                skip_seg = false;
+            }
+            Token::Word(w) => {
+                if first_in_seg {
+                    first_in_seg = false;
+                    let base = w.rsplit('/').next().unwrap_or(&w);
+                    if base == "echo" || base == "printf" {
+                        skip_seg = true;
+                    }
+                    continue;
+                }
+                if !skip_seg && is_sensitive_secret_path(&w) {
+                    return true;
+                }
+            }
+            Token::Unsafe => {}
+        }
+    }
+    false
+}
+
+/// Returns `true` when `raw` targets harness control-plane configuration or session transcripts
+/// (`.twig/project.json`, `.twig/mcp.json`, `.twig/harness.json`, `~/.config/twig/*`,
+/// `~/.local/state/twig/*`, or `sessions/*.jsonl`), preventing prompt-injected self-tampering
+/// without explicit human approval (`Tier::Deny`).
+pub fn is_control_plane_path(raw: &str) -> bool {
+    let trimmed = raw.trim().trim_matches(['"', '\'']);
+    let candidate = match trimmed.split_once('=') {
+        Some((flag, val)) if flag.starts_with('-') => val.trim_matches(['"', '\'']),
+        _ => trimmed,
+    };
+    if candidate.is_empty() || candidate.starts_with('-') {
+        return false;
+    }
+    let norm = candidate.replace('\\', "/");
+    let clean = norm.trim_start_matches("./");
+    let lower = clean.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        ".twig/project.json" | ".twig/mcp.json" | ".twig/harness.json" | ".git/config"
+    ) || lower.ends_with("/.twig/project.json")
+        || lower.ends_with("/.twig/mcp.json")
+        || lower.ends_with("/.twig/harness.json")
+        || lower.ends_with("/.git/config")
+        || lower.starts_with(".git/hooks/")
+        || lower.contains("/.git/hooks/")
+        || lower.starts_with(".git/info/")
+        || lower.contains("/.git/info/")
+        || lower.starts_with(".githooks/")
+        || lower.contains("/.githooks/")
+        || lower.starts_with(".husky/")
+        || lower.contains("/.husky/")
+    {
+        return true;
+    }
+    if lower.contains("/.config/twig/")
+        || lower.ends_with("/.config/twig")
+        || lower.contains("/.local/state/twig/")
+        || lower.ends_with("/.local/state/twig")
+    {
+        return true;
+    }
+    (lower.contains("sessions/") || lower.contains("subagents/"))
+        && (lower.ends_with(".jsonl") || lower.ends_with(".lock"))
+}
+
+fn matches_meta_escape(cmd: &str) -> bool {
+    let Some(tokens) = lex_shell(cmd) else {
+        return false;
+    };
+    let check_seg = |raw: &[&str]| -> bool {
+        let mut s = raw;
+        while let Some(first) = s.first() {
+            let base = first.rsplit('/').next().unwrap_or(first);
+            if matches!(base, "sudo" | "env" | "command" | "builtin" | "noglob")
+                || (first.contains('=') && !first.starts_with('-'))
+            {
+                s = &s[1..];
+            } else {
+                break;
+            }
+        }
+        let Some(&raw_prog) = s.first() else {
+            return false;
+        };
+        let prog = raw_prog.rsplit('/').next().unwrap_or(raw_prog);
+        let rest = &s[1..];
+
+        // 1. Tmux / screen / keystroke self-drive injection into terminal panes.
+        if prog == "tmux"
+            && rest.iter().any(|t| {
+                matches!(
+                    *t,
+                    "send-keys" | "send" | "paste-buffer" | "load-buffer" | "set-buffer"
+                )
+            })
+        {
+            return true;
+        }
+        if prog == "screen"
+            && rest.contains(&"-X")
+            && rest.iter().any(|t| matches!(*t, "stuff" | "eval" | "readbuf" | "paste"))
+        {
+            return true;
+        }
+        if matches!(prog, "xdotool" | "ydotool" | "wtype" | "dotool") {
+            return true;
+        }
+        if prog == "osascript"
+            && rest
+                .iter()
+                .any(|t| t.contains("keystroke") || t.contains("key code"))
+        {
+            return true;
+        }
+
+        // 2. Spawning nested external agents with permission/sandbox bypass flags.
+        if rest.iter().any(|t| {
+            matches!(
+                *t,
+                "--dangerously-skip-permissions" | "--dangerously-bypass-approvals-and-sandbox"
+            )
+        }) || (matches!(prog, "claude" | "codex" | "gemini") && rest.contains(&"--yolo"))
+        {
+            return true;
+        }
+
+        // 3. Shell commands touching harness control-plane configs or session `.jsonl` records.
+        if !matches!(prog, "echo" | "printf")
+            && rest.iter().any(|t| is_control_plane_path(t))
+        {
+            return true;
+        }
+        false
+    };
+
+    let mut seg: Vec<&str> = Vec::new();
+    for tok in &tokens {
+        match tok {
+            Token::Word(w) => seg.push(w.as_str()),
+            Token::Op(_) => {
+                if check_seg(&seg) {
+                    return true;
+                }
+                seg.clear();
+            }
+            Token::Unsafe => {}
+        }
+    }
+    check_seg(&seg)
+}
+
+fn escapes_worktree_arg(tok: &str) -> bool {
+    if tok.starts_with('-') {
+        if let Some((_, val)) = tok.split_once('=') {
+            return escapes_worktree_arg(val);
+        }
+        return false;
+    }
+    tok == "~"
+        || tok.starts_with("~/")
+        || tok.starts_with("$HOME")
+        || tok.starts_with("${HOME}")
+        || (tok.starts_with('/') && tok != "/dev/null")
+        || tok == ".."
+        || tok.starts_with("../")
+        || tok.ends_with("/..")
+        || tok.contains("/../")
+}
+
+fn has_outside_worktree_reference(cmd: &str) -> bool {
+    let Some(tokens) = lex_shell(cmd) else {
+        return true;
+    };
+    let mut i = 0;
+    while i < tokens.len() {
+        if let Token::Word(w) = &tokens[i] {
+            if w == "-C" {
+                return true;
+            }
+            if escapes_worktree_arg(w) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn read_only(seg: &[&str]) -> bool {
+    let Some(raw_program) = seg.first() else {
+        return false;
+    };
+    let program = raw_program.rsplit('/').next().unwrap_or(raw_program);
+    if program == "git" {
         return seg.get(1).is_some_and(|sub| GIT_READ.contains(sub))
-            && !seg.iter().any(|t| t.starts_with("--output"));
+            && !seg
+                .iter()
+                .any(|t| *t == "-C" || t.starts_with("--output") || t.starts_with("--git-dir") || t.starts_with("--work-tree"));
     }
     READ_ONLY.iter().any(|(name, writes)| {
-        name == program
+        *name == program
             && !seg
                 .iter()
                 .any(|tok| writes.iter().any(|w| tok == w || tok.starts_with(&format!("{w}="))))
@@ -333,12 +602,20 @@ impl Policy {
 
     /// Remember a user-approved command shape for the remainder of this session.
     /// Moves future matching commands from `Deny` to `Audit` (still recorded, no repeat prompt).
+    /// Catastrophic host/filesystem commands never fold target paths to `*`.
     pub fn allow_for_session(&self, cmd: &str) -> String {
-        let sh = shape(cmd);
-        let key = if sh.is_empty() || sh == "<unsafe>" {
+        let key = if Self::is_catastrophic_deny(cmd)
+            || touches_sensitive_secret(cmd)
+            || matches_meta_escape(cmd)
+        {
             cmd.trim().to_owned()
         } else {
-            sh
+            let sh = shape(cmd);
+            if sh.is_empty() || sh == "<unsafe>" {
+                cmd.trim().to_owned()
+            } else {
+                sh
+            }
         };
         if !key.is_empty() {
             self.session_allows
@@ -349,113 +626,189 @@ impl Policy {
         key
     }
 
-/// Token-level destructive command check so flag reordering, extra whitespace, or
-/// short flags (e.g. `rm -fr /`, `git push -f`, `git push origin main --force`,
-/// `git clean -xdf`) cannot slip past substring rules.
-fn matches_semantic_deny(cmd: &str) -> bool {
-    let Some(tokens) = lex_shell(cmd) else {
-        return false;
-    };
-    let mut seg: Vec<&str> = Vec::new();
-    let check_seg = |raw: &[&str]| -> bool {
-        let mut s = raw;
-        while let Some(first) = s.first() {
-            if matches!(*first, "sudo" | "env" | "command" | "builtin" | "noglob")
-                || (first.contains('=') && !first.starts_with('-'))
-            {
-                s = &s[1..];
-            } else {
-                break;
-            }
+    fn is_catastrophic_target(t: &str) -> bool {
+        if matches!(
+            t,
+            "/" | "/*" | "~" | "~/" | "~/*" | "$HOME" | "${HOME}" | "*" | ".." | "/root" | "/etc" | "/usr" | "/var" | "/home" | "/Users"
+        ) || t.starts_with("$HOME/")
+            || t.starts_with("${HOME}/")
+        {
+            return true;
         }
-        let Some(&prog) = s.first() else {
-            return false;
-        };
-        let rest = &s[1..];
-        let has_short = |ch: char| {
-            rest.iter().any(|t| {
-                t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
-            })
-        };
-        match prog {
-            "shutdown" | "reboot" | "poweroff" | "halt" => true,
-            p if p == "mkfs" || p.starts_with("mkfs.") => true,
-            "dd" => rest.iter().any(|t| t.starts_with("of=/dev/")),
-            "chmod" => {
-                let recursive = has_short('R') || rest.contains(&"--recursive");
-                recursive && rest.contains(&"777") && rest.contains(&"/")
-            }
-            "rm" => {
-                let recursive =
-                    has_short('r') || has_short('R') || rest.contains(&"--recursive");
-                let force = has_short('f') || rest.contains(&"--force");
-                let dangerous_target = rest.iter().any(|t| {
-                    matches!(
-                        *t,
-                        "/" | "/*" | "~" | "~/" | "~/*" | "$HOME" | "${HOME}" | "*" | "." | ".."
-                    )
-                });
-                recursive && force && dangerous_target
-            }
-            "git" => match rest.first().copied() {
-                Some("push") => rest[1..].iter().any(|t| {
-                    *t == "-f"
-                        || *t == "--force"
-                        || t.starts_with("--force-")
-                        || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('f'))
-                }),
-                Some("reset") => rest[1..].contains(&"--hard"),
-                Some("clean") => {
-                    let sub = &rest[1..];
-                    let sub_short = |ch: char| {
-                        sub.iter().any(|t| {
-                            t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
-                        })
-                    };
-                    let force = sub_short('f') || sub.contains(&"--force");
-                    let dirs_or_ignored = sub_short('d') || sub_short('x') || sub_short('X');
-                    force && dirs_or_ignored
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    };
-    for tok in &tokens {
-        match tok {
-            Token::Word(w) => seg.push(w.as_str()),
-            Token::Op(_) => {
-                if check_seg(&seg) {
+        for root in ["/home/", "/Users/"] {
+            if let Some(rest) = t.strip_prefix(root) {
+                let trimmed = rest.trim_end_matches(['/', '*']);
+                if !trimmed.is_empty() && !trimmed.contains('/') {
                     return true;
                 }
-                seg.clear();
             }
-            Token::Unsafe => {}
         }
+        false
     }
-    check_seg(&seg)
-}
+
+    fn is_catastrophic_deny(cmd: &str) -> bool {
+        if [
+            "rm -rf /",
+            "rm -rf ~",
+            "rm -rf *",
+            "dd of=/dev/",
+            "mkfs",
+            ":(){",
+            "chmod -R 777 /",
+            "shutdown",
+            "reboot",
+        ]
+        .iter()
+        .any(|d| cmd.contains(d))
+        {
+            return true;
+        }
+        Self::check_tokens(cmd, true)
+    }
+
+    /// Token-level destructive command check so flag reordering, extra whitespace,
+    /// absolute binary paths (`/bin/rm`), subshells (`sh -c`), or short flags cannot slip past.
+    fn matches_semantic_deny(cmd: &str) -> bool {
+        Self::check_tokens(cmd, false)
+    }
+
+    fn check_tokens(cmd: &str, catastrophic_only: bool) -> bool {
+        let Some(tokens) = lex_shell(cmd) else {
+            return false;
+        };
+        let mut seg: Vec<&str> = Vec::new();
+        let check_seg = |raw: &[&str]| -> bool {
+            let mut s = raw;
+            while let Some(first) = s.first() {
+                let base = first.rsplit('/').next().unwrap_or(first);
+                if matches!(base, "sudo" | "env" | "command" | "builtin" | "noglob")
+                    || (first.contains('=') && !first.starts_with('-'))
+                {
+                    s = &s[1..];
+                } else {
+                    break;
+                }
+            }
+            let Some(&raw_prog) = s.first() else {
+                return false;
+            };
+            let prog = raw_prog.rsplit('/').next().unwrap_or(raw_prog);
+            let rest = &s[1..];
+            let has_short = |ch: char| {
+                rest.iter().any(|t| {
+                    t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
+                })
+            };
+            match prog {
+                "sh" | "bash" | "zsh" | "dash" => {
+                    if let Some(pos) = rest.iter().position(|t| *t == "-c" || (*t != "--" && t.starts_with('-') && !t.starts_with("--") && t[1..].contains('c'))) {
+                        if let Some(script) = rest.get(pos + 1) {
+                            if HARD_DENY.iter().any(|d| script.contains(d))
+                                || Self::check_tokens(script, catastrophic_only)
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                "shutdown" | "reboot" | "poweroff" | "halt" => true,
+                p if p == "mkfs" || p.starts_with("mkfs.") => true,
+                "dd" => rest.iter().any(|t| t.starts_with("of=/dev/")),
+                "chmod" => {
+                    let recursive = has_short('R') || rest.contains(&"--recursive");
+                    recursive && rest.contains(&"777") && rest.iter().any(|t| Self::is_catastrophic_target(t))
+                }
+                "find" => {
+                    rest.contains(&"-delete")
+                        && rest.iter().any(|t| !t.starts_with('-') && Self::is_catastrophic_target(t))
+                }
+                "rm" => {
+                    let recursive =
+                        has_short('r') || has_short('R') || rest.contains(&"--recursive");
+                    let force = has_short('f') || rest.contains(&"--force");
+                    let dangerous_target = rest
+                        .iter()
+                        .any(|t| !t.starts_with('-') && Self::is_catastrophic_target(t));
+                    recursive && (force || dangerous_target) && dangerous_target
+                }
+                "git" if !catastrophic_only => match rest.first().copied() {
+                    Some("push") => rest[1..].iter().any(|t| {
+                        *t == "-f"
+                            || *t == "--force"
+                            || t.starts_with("--force-")
+                            || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('f'))
+                    }),
+                    Some("reset") => rest[1..].contains(&"--hard"),
+                    Some("clean") => {
+                        let sub = &rest[1..];
+                        let sub_short = |ch: char| {
+                            sub.iter().any(|t| {
+                                t.starts_with('-') && !t.starts_with("--") && t[1..].contains(ch)
+                            })
+                        };
+                        let force = sub_short('f') || sub.contains(&"--force");
+                        let dirs_or_ignored = sub_short('d') || sub_short('x') || sub_short('X');
+                        force && dirs_or_ignored
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        };
+        for tok in &tokens {
+            match tok {
+                Token::Word(w) => seg.push(w.as_str()),
+                Token::Op(_) => {
+                    if check_seg(&seg) {
+                        return true;
+                    }
+                    seg.clear();
+                }
+                Token::Unsafe => {}
+            }
+        }
+        check_seg(&seg)
+    }
 
     /// Deny rules read the real command; allow rules read the folded shape.
     pub fn classify(&self, cmd: &str) -> Tier {
         let sh = shape(cmd);
-        if HARD_DENY.iter().any(|d| cmd.contains(d)) || Self::matches_semantic_deny(cmd) {
+        let exact_gate = touches_sensitive_secret(cmd) || matches_meta_escape(cmd);
+        if HARD_DENY.iter().any(|d| cmd.contains(d))
+            || Self::matches_semantic_deny(cmd)
+            || exact_gate
+        {
             let allows = self.session_allows.lock().expect("policy session allows");
-            if allows.contains(&sh) || allows.contains(cmd.trim()) {
+            let allowed = if Self::is_catastrophic_deny(cmd) || exact_gate {
+                allows.contains(cmd.trim())
+            } else {
+                allows.contains(&sh) || allows.contains(cmd.trim())
+            };
+            if allowed {
                 return Tier::Audit;
             }
             return Tier::Deny;
         }
-        if let Some(tier) = self.cache.lock().expect("policy cache").get(&sh) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return *tier;
+        let escapes = has_outside_worktree_reference(cmd);
+        if !escapes {
+            if let Some(tier) = self.cache.lock().expect("policy cache").get(&sh) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return *tier;
+            }
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
-        let tier = self.compound(&sh);
-        self.cache
-            .lock()
-            .expect("policy cache")
-            .insert(sh, tier);
+        let tier = if escapes {
+            Tier::Audit
+        } else {
+            self.compound(&sh)
+        };
+        if !escapes {
+            self.cache
+                .lock()
+                .expect("policy cache")
+                .insert(sh, tier);
+        }
         tier
     }
 
@@ -634,5 +987,54 @@ mod tests {
             "second command of the same shape must hit cache"
         );
         assert!(hits >= 1);
+    }
+
+    #[test]
+    fn outside_worktree_reads_downgrade_to_audit_and_catastrophic_denies_never_wildcard() {
+        let p = Policy::new();
+        // S1: outside-worktree reads must require Audit even though `cat *` is Auto inside worktree.
+        assert_eq!(p.classify("cat src/lib.rs"), Tier::Auto);
+        assert_eq!(p.classify("cat .env.example"), Tier::Auto);
+        assert_eq!(p.classify("cat ~/.bashrc"), Tier::Audit);
+        assert_eq!(p.classify("cat ../notes.txt"), Tier::Audit);
+        assert_eq!(p.classify("cat /etc/passwd"), Tier::Audit);
+        assert_eq!(p.classify("git -C /tmp/other status"), Tier::Audit);
+        assert_eq!(p.classify("rg token $HOME/.config"), Tier::Audit);
+
+        // Sensitive credentials (.env, private keys) pause for explicit human approval (`Deny`)
+        // and never wildcard across distinct secret files.
+        assert_eq!(p.classify("cat .env"), Tier::Deny);
+        assert_eq!(p.classify("head -n 20 .env.production"), Tier::Deny);
+        assert_eq!(p.classify("cat ~/.ssh/id_rsa"), Tier::Deny);
+        assert_eq!(p.classify("cat certs/server.key"), Tier::Deny);
+        assert_eq!(p.allow_for_session("cat .env.dev"), "cat .env.dev");
+        assert_eq!(p.classify("cat .env.dev"), Tier::Audit);
+        assert_eq!(p.classify("cat .env.production"), Tier::Deny);
+
+        // S2: path-prefixed binaries, subshells, find -delete, and /home/<user> are caught.
+        assert_eq!(p.classify("/bin/rm -rf /"), Tier::Deny);
+        assert_eq!(p.classify("/usr/bin/git push --force origin main"), Tier::Deny);
+        assert_eq!(p.classify("sh -c 'rm -rf ~'"), Tier::Deny);
+        assert_eq!(p.classify("rm -rf /home/alice"), Tier::Deny);
+        assert_eq!(p.classify("find / -delete"), Tier::Deny);
+
+        // Allowing one catastrophic target must never wildcard `rm -rf *` to allow `rm -rf /`.
+        assert_eq!(p.allow_for_session("rm -rf /home/alice"), "rm -rf /home/alice");
+        assert_eq!(p.classify("rm -rf /"), Tier::Deny);
+        // Repo-level denies like `git reset --hard` still fold arguments cleanly for session memory.
+        assert_eq!(p.allow_for_session("git reset --hard HEAD"), "git reset --hard *");
+        assert_eq!(p.classify("git reset --hard origin/main"), Tier::Audit);
+
+        // Meta-escape vectors (tmux keystroke injection, unsafe nested agent flags, control-plane tampering)
+        // pause at `Tier::Deny` for human choice and never wildcard across distinct commands.
+        assert_eq!(p.classify("tmux send-keys -t 0 '1' Enter"), Tier::Deny);
+        assert_eq!(p.classify("xdotool key Return"), Tier::Deny);
+        assert_eq!(p.classify("claude -p 'do x' --dangerously-skip-permissions"), Tier::Deny);
+        assert_eq!(p.classify("gemini -p 'do x' --yolo"), Tier::Deny);
+        assert_eq!(p.classify("cat ~/.local/state/twig/sessions/s1.jsonl"), Tier::Deny);
+        assert_eq!(p.classify("cp evil.json .twig/mcp.json"), Tier::Deny);
+        assert_eq!(p.classify("cp hook.sh .git/hooks/pre-commit"), Tier::Deny);
+        assert_eq!(p.classify("cp hook.sh .husky/pre-commit"), Tier::Deny);
+        assert_eq!(p.classify("tmux list-sessions"), Tier::Audit);
     }
 }

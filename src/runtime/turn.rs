@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 
 use super::guard::{Guard, Level};
-use super::policy::{Policy, Tier};
+use super::policy::{is_control_plane_path, is_sensitive_secret_path, Policy, Tier};
 use super::tools::Tools;
 use crate::control::Control;
 use crate::llm::{Llm, ToolCall};
@@ -101,6 +101,44 @@ fn record_tool_outcome(
     Ok(clipped)
 }
 
+fn forkable_messages(messages: &[Value]) -> &[Value] {
+    if let Some((idx, last_asst)) = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m["role"] == "assistant" && m.get("tool_calls").is_some())
+    {
+        let expected: Vec<&str> = last_asst["tool_calls"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        let all_resolved = expected.iter().all(|want| {
+            messages[idx + 1..]
+                .iter()
+                .any(|m| m["role"] == "tool" && m["tool_call_id"].as_str() == Some(*want))
+        });
+        if !all_resolved {
+            return &messages[..idx];
+        }
+    }
+    messages
+}
+
+fn patch_touches_gated_path(patch: &str) -> bool {
+    patch.lines().any(|line| {
+        line.trim()
+            .strip_prefix("*** Add File:")
+            .or_else(|| line.trim().strip_prefix("*** Update File:"))
+            .or_else(|| line.trim().strip_prefix("*** Delete File:"))
+            .is_some_and(|p| {
+                let trimmed = p.trim();
+                is_sensitive_secret_path(trimmed) || is_control_plane_path(trimmed)
+            })
+    })
+}
+
 pub fn execute_recorded_call(
     mut env: ExecEnv<'_>,
     call: &ToolCall,
@@ -117,6 +155,10 @@ pub fn execute_recorded_call(
     emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
     let output = if env.control.cancelled() {
         "cancelled before execution".into()
+    } else if call.name == "subagent" {
+        let forkable = forkable_messages(env.messages);
+        let mut batch = env.tools.run_subagents_batch(&[call], Some(forkable), emit);
+        batch.pop().map(|(t, _)| t).unwrap_or_default()
     } else {
         env.tools.run_live(call, env.control, emit)
     };
@@ -172,13 +214,28 @@ pub fn run_turn_live(
             .map_err(|e| e.to_string())?;
     }
 
-    let turns_used = messages
+    // Count model turns within the current user request (since the latest `role: "user"`
+    // message) so typing "continue" / a follow-up prompt gets a fresh turn budget instead
+    // of permanently bricking the session after a long audit.
+    let since_last_user = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .map_or(0, |idx| idx + 1);
+    let turns_used = messages[since_last_user..]
         .iter()
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .count() as u32
         + 1;
 
-    let level = guard.tick(turns_used);
+    // Interactive TUI sessions get 3x headroom (120 turns at default `max_turns = 40`)
+    // and a tool-free final synthesis turn when budget is reached so deep whole-repo audits
+    // always deliver a complete report instead of cutting off mid-thought with empty output.
+    let guard_turns = if interactive {
+        turns_used.div_ceil(3)
+    } else {
+        turns_used
+    };
+    let level = guard.tick(guard_turns);
     if level != Level::Ok {
         record
             .append(
@@ -188,26 +245,41 @@ pub fn run_turn_live(
             .map_err(|e| e.to_string())?;
         emit(json!({"ev": "guard.tripped", "level": level.as_str()}));
     }
+    let mut force_final_synthesis = false;
     match level {
         Level::Abort => {
-            return Ok(TurnResult {
-                done: true,
-                reason: "budget",
-                text: String::new(),
-                applied_steering,
-                deferred_calls: Vec::new(),
+            let already_synthesized = messages[since_last_user..].iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("<budget-synthesis>"))
             });
+            if interactive && !already_synthesized {
+                force_final_synthesis = true;
+                messages.push(json!({
+                    "role": "system",
+                    "content": "<system-reminder>\n<budget-synthesis>Turn budget for this request is reached. Tools are now disabled — synthesize all verified evidence gathered so far and write your complete, structured final answer to the user now.</budget-synthesis>\n</system-reminder>"
+                }));
+            } else {
+                return Ok(TurnResult {
+                    done: true,
+                    reason: "budget",
+                    text: String::new(),
+                    applied_steering,
+                    deferred_calls: Vec::new(),
+                });
+            }
         }
         Level::Narrow => tools.restrict_read_only(),
         Level::Warn | Level::Ok => {}
     }
 
     emit(json!({"ev": "turn.started", "model": model, "turns_used": turns_used}));
+    let schema_opt = (!force_final_synthesis).then(|| tools.schema());
     let reply = llm.stream(
         model,
         system,
         messages,
-        Some(&tools.schema()),
+        schema_opt.as_ref(),
         control,
         emit,
     )?;
@@ -270,7 +342,30 @@ pub fn run_turn_live(
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             )
-        } else if matches!(call.name.as_str(), "edit" | "write") {
+        } else if (matches!(call.name.as_str(), "read" | "edit" | "write")
+            && call
+                .args
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(is_sensitive_secret_path))
+            || (matches!(call.name.as_str(), "edit" | "write")
+                && call
+                    .args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_control_plane_path))
+            || (call.name == "apply_patch"
+                && call
+                    .args
+                    .get("patch")
+                    .and_then(Value::as_str)
+                    .is_some_and(patch_touches_gated_path))
+        {
+            Tier::Deny
+        } else if matches!(call.name.as_str(), "edit" | "write" | "apply_patch")
+            || (call.name == "mcp"
+                && matches!(call.args["action"].as_str().unwrap_or("call"), "call" | ""))
+        {
             Tier::Audit
         } else {
             Tier::Auto
@@ -287,6 +382,44 @@ pub fn run_turn_live(
 
     let mut idx = 0;
     while idx < planned.len() {
+        // Fan out consecutive Auto read-only calls (`read`, `grep`, `glob`, `skill`, `Tier::Auto bash`)
+        // in parallel while preserving exact deterministic record & message ordering.
+        if !control.cancelled() && Tools::is_parallel_readonly(&planned[idx].0, planned[idx].1) {
+            let mut end = idx + 1;
+            while end < planned.len()
+                && Tools::is_parallel_readonly(&planned[end].0, planned[end].1)
+            {
+                end += 1;
+            }
+            if end - idx >= 2 {
+                let slice = &planned[idx..end];
+                for (call, tier) in slice {
+                    record
+                        .append(
+                            "tool.started",
+                            json!({"id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
+                }
+                let refs: Vec<&ToolCall> = slice.iter().map(|(c, _)| c).collect();
+                let outcomes = tools.run_readonly_batch(&refs, control);
+                let mut env = ExecEnv {
+                    tools,
+                    guard,
+                    record,
+                    messages,
+                    control,
+                };
+                for ((call, tier), (output, exit_code)) in slice.iter().zip(outcomes) {
+                    record_tool_outcome(
+                        &mut env, call, *tier, output, exit_code, audit_sink, emit,
+                    )?;
+                }
+                idx = end;
+                continue;
+            }
+        }
         // Fan out consecutive Auto subagent calls in parallel while preserving
         // exact record & message ordering.
         if !control.cancelled()
@@ -312,7 +445,8 @@ pub fn run_turn_live(
                     emit(json!({"ev": "tool.started", "id": call.id, "tool": call.name, "args": call.args, "tier": tier.as_str()}));
                 }
                 let refs: Vec<&ToolCall> = slice.iter().map(|(c, _)| c).collect();
-                let outcomes = tools.run_subagents_batch(&refs, emit);
+                let forkable = forkable_messages(messages);
+                let outcomes = tools.run_subagents_batch(&refs, Some(forkable), emit);
                 let mut env = ExecEnv {
                     tools,
                     guard,
@@ -414,9 +548,6 @@ pub fn run_turn_live(
         )?;
     }
 
-    record
-        .append("messages.checkpoint", json!({"messages": messages}))
-        .map_err(|e| e.to_string())?;
     emit(json!({
         "ev": "turn.completed",
         "reason": "tools",
@@ -596,6 +727,59 @@ mod tests {
         .unwrap();
         assert_eq!(result.reason, "budget");
         assert_eq!(llm.calls(), 0, "an exhausted budget must not spend a call");
+
+        // A follow-up user turn ("继续") must receive a fresh per-request budget rather than bricking the session.
+        messages.push(json!({"role": "user", "content": "继续"}));
+        let llm2 = StubLlm::new(vec![StubLlm::text("resumed cleanly")]);
+        let mut guard2 = Guard::new(&dir, 2, 99, 1);
+        let resumed = run_turn(
+            TurnCtx {
+                llm: &llm2,
+                tools: &mut tools,
+                record: &mut record,
+                guard: &mut guard2,
+                policy: &Policy::new(),
+                messages: &mut messages,
+                system: "sys",
+                model: "m",
+            },
+            &mut |_, _| {},
+            &mut |_e| {},
+        )
+        .unwrap();
+        assert_eq!(resumed.reason, "final");
+        assert_eq!(resumed.text, "resumed cleanly");
+        assert_eq!(llm2.calls(), 1);
+
+        // Interactive TUI mode performs a tool-free final synthesis turn instead of dropping empty output on budget limit.
+        let mut msgs_int = vec![
+            json!({"role": "user", "content": "audit all"}),
+            json!({"role": "assistant", "content": "s1"}),
+            json!({"role": "assistant", "content": "s2"}),
+        ];
+        let llm3 = StubLlm::new(vec![StubLlm::text("complete final audit report")]);
+        let mut guard3 = Guard::new(&dir, 1, 99, 1);
+        let ctrl = Control::default();
+        let synth = run_turn_live(
+            TurnCtx {
+                llm: &llm3,
+                tools: &mut tools,
+                record: &mut record,
+                guard: &mut guard3,
+                policy: &Policy::new(),
+                messages: &mut msgs_int,
+                system: "sys",
+                model: "m",
+            },
+            &mut |_, _| {},
+            &mut |_e| {},
+            &ctrl,
+            true,
+        )
+        .unwrap();
+        assert!(synth.done);
+        assert_eq!(synth.reason, "final");
+        assert_eq!(synth.text, "complete final audit report");
     }
 
     #[test]

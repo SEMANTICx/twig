@@ -7,12 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::paths;
@@ -22,25 +22,28 @@ const MAX_MCP_OUTPUT_BYTES: usize = 64_000;
 const DEFAULT_MCP_TIMEOUT: Duration = Duration::from_secs(30);
 const INIT_MCP_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct McpFile {
     #[serde(rename = "mcpServers", default)]
     mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct McpServerConfig {
     command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    disabled: bool,
 }
 
 struct McpProcess {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<Result<String, String>>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<String>>,
     next_id: u64,
     tools: Vec<Value>,
     prompts: Vec<Value>,
@@ -57,18 +60,50 @@ fn clip_mcp_text(text: String) -> String {
 }
 
 impl McpProcess {
-    fn spawn(cfg: &McpServerConfig, init_timeout: Duration, control: &Control) -> Result<Self, String> {
+    fn spawn(
+        cfg: &McpServerConfig,
+        worktree: &Path,
+        init_timeout: Duration,
+        control: &Control,
+    ) -> Result<Self, String> {
         let mut cmd = Command::new(&cfg.command);
+        if worktree.is_dir() {
+            cmd.current_dir(worktree);
+        }
         cmd.args(&cfg.args)
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("spawn mcp {:?}: {e}", cfg.command))?;
         let stdin = child.stdin.take().ok_or("mcp missing stdin")?;
         let stdout = child.stdout.take().ok_or("mcp missing stdout")?;
+        let stderr = child.stderr.take().ok_or("mcp missing stderr")?;
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let stderr_sink = stderr_tail.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while reader.read_line(&mut line).ok().filter(|&n| n > 0).is_some() {
+                if let Ok(mut buf) = stderr_sink.lock() {
+                    buf.push_str(&line);
+                    if buf.len() > 2_048 {
+                        let keep: String = buf
+                            .chars()
+                            .rev()
+                            .take(2_048)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        *buf = keep;
+                    }
+                }
+                line.clear();
+            }
+        });
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -93,6 +128,7 @@ impl McpProcess {
             child,
             stdin,
             rx,
+            stderr_tail,
             next_id: 0,
             tools: Vec::new(),
             prompts: Vec::new(),
@@ -137,6 +173,23 @@ impl McpProcess {
         self.stdin.flush().map_err(|e| format!("mcp flush: {e}"))
     }
 
+    fn format_err(&self, base: impl Into<String>) -> String {
+        let base = base.into();
+        let tail = self
+            .stderr_tail
+            .lock()
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default();
+        if tail.is_empty() {
+            base
+        } else {
+            let last_lines: Vec<&str> = tail.lines().rev().take(6).collect();
+            let snippet = last_lines.into_iter().rev().collect::<Vec<_>>().join(" | ");
+            format!("{base} (stderr: {snippet})")
+        }
+    }
+
     fn request(
         &mut self,
         method: &str,
@@ -147,8 +200,10 @@ impl McpProcess {
         self.next_id += 1;
         let id = self.next_id;
         let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        writeln!(self.stdin, "{msg}").map_err(|e| format!("mcp write: {e}"))?;
-        self.stdin.flush().map_err(|e| format!("mcp flush: {e}"))?;
+        writeln!(self.stdin, "{msg}").map_err(|e| self.format_err(format!("mcp write: {e}")))?;
+        self.stdin
+            .flush()
+            .map_err(|e| self.format_err(format!("mcp flush: {e}")))?;
         let deadline = Instant::now() + timeout;
         let mut seen = 0usize;
         while seen < 256 {
@@ -157,7 +212,9 @@ impl McpProcess {
             }
             let rem = deadline.saturating_duration_since(Instant::now());
             if rem.is_zero() {
-                return Err(format!("mcp {method} timed out after {}ms", timeout.as_millis()));
+                return Err(
+                    self.format_err(format!("mcp {method} timed out after {}ms", timeout.as_millis())),
+                );
             }
             match self.rx.recv_timeout(rem.min(Duration::from_millis(50))) {
                 Ok(Ok(line)) => {
@@ -176,14 +233,15 @@ impl McpProcess {
                     }
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                 }
-                Ok(Err(e)) => return Err(e),
+                Ok(Err(e)) => return Err(self.format_err(e)),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("mcp server closed stdout".into());
+                    std::thread::sleep(Duration::from_millis(15));
+                    return Err(self.format_err("mcp server closed stdout"));
                 }
             }
         }
-        Err("mcp server did not respond".into())
+        Err(self.format_err("mcp server did not respond"))
     }
 
     fn tool_summaries(&self) -> Vec<Value> {
@@ -357,6 +415,7 @@ impl Drop for McpProcess {
 }
 
 pub struct McpRegistry {
+    worktree: PathBuf,
     configs: BTreeMap<String, McpServerConfig>,
     live: BTreeMap<String, McpProcess>,
     call_timeout: Duration,
@@ -382,6 +441,7 @@ impl McpRegistry {
             }
         }
         (!configs.is_empty()).then(|| Self {
+            worktree: worktree.to_path_buf(),
             configs,
             live: BTreeMap::new(),
             call_timeout: DEFAULT_MCP_TIMEOUT,
@@ -391,8 +451,9 @@ impl McpRegistry {
 
     pub fn server_names_summary(&self) -> String {
         self.configs
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, c)| !c.disabled)
+            .map(|(k, _)| k.clone())
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -409,7 +470,12 @@ impl McpRegistry {
                 .get(server)
                 .ok_or_else(|| format!("unknown MCP server {server:?}"))?
                 .clone();
-            let proc = McpProcess::spawn(&cfg, self.init_timeout, control)?;
+            if cfg.disabled {
+                return Err(format!(
+                    "MCP server {server:?} is currently disabled (run `/mcp enable {server}` to activate)"
+                ));
+            }
+            let proc = McpProcess::spawn(&cfg, &self.worktree, self.init_timeout, control)?;
             self.live.insert(server.to_owned(), proc);
         }
         self.live
@@ -422,6 +488,17 @@ impl McpRegistry {
         let ctrl = Control::default();
         let mut out = Vec::with_capacity(names.len());
         for name in names {
+            if self.configs.get(&name).is_some_and(|c| c.disabled) {
+                out.push(json!({
+                    "server": name,
+                    "ok": true,
+                    "disabled": true,
+                    "tools": [],
+                    "prompts": [],
+                    "resources": []
+                }));
+                continue;
+            }
             match self.ensure_live(&name, &ctrl) {
                 Ok(proc) => {
                     let tools = proc.tool_summaries();
@@ -430,6 +507,7 @@ impl McpRegistry {
                     out.push(json!({
                         "server": name,
                         "ok": true,
+                        "disabled": false,
                         "tools": tools,
                         "prompts": prompts,
                         "resources": resources
@@ -439,6 +517,67 @@ impl McpRegistry {
             }
         }
         json!({"servers": out})
+    }
+
+    /// Persist project-level MCP server toggles (`enable` / `disable` / `init_rea`) in `<worktree>/.twig/mcp.json`.
+    pub fn configure_project_file(worktree: &Path, params: &Value) -> Result<String, String> {
+        let action = params.get("action").and_then(Value::as_str).unwrap_or("list");
+        let path = worktree.join(".twig/mcp.json");
+        let mut parsed: McpFile = if path.exists() {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("read .twig/mcp.json: {e}"))?;
+            serde_json::from_str(&text).map_err(|e| format!("parse .twig/mcp.json: {e}"))?
+        } else {
+            McpFile::default()
+        };
+
+        let summary = match action {
+            "init_rea" => {
+                parsed.mcp_servers.entry("rea".into()).or_insert_with(|| McpServerConfig {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "rea-agents@latest".into(), "mcp".into()],
+                    env: BTreeMap::new(),
+                    disabled: true,
+                });
+                "registered `rea` MCP in .twig/mcp.json (disabled by default — run `/mcp enable rea` when needed)".to_owned()
+            }
+            "enable" | "disable" => {
+                let want_disabled = action == "disable";
+                let name = params
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| format!("`/mcp {action} <server>` requires a server name"))?;
+                if let Some(cfg) = parsed.mcp_servers.get_mut(name) {
+                    cfg.disabled = want_disabled;
+                } else {
+                    let global_path = paths::config_dir().join("mcp.json");
+                    let global_cfg = std::fs::read_to_string(global_path)
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<McpFile>(&t).ok())
+                        .and_then(|mut g| g.mcp_servers.remove(name));
+                    let Some(mut cfg) = global_cfg else {
+                        return Err(format!(
+                            "unknown MCP server {name:?} (tip: run `/mcp init-rea` to scaffold REA MCP)"
+                        ));
+                    };
+                    cfg.disabled = want_disabled;
+                    parsed.mcp_servers.insert(name.to_owned(), cfg);
+                }
+                format!(
+                    "MCP server `{name}` {} (saved to .twig/mcp.json)",
+                    if want_disabled { "disabled" } else { "enabled" }
+                )
+            }
+            other => return Err(format!("unknown mcp config action {other:?}")),
+        };
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let body = serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?;
+        std::fs::write(&path, format!("{body}\n")).map_err(|e| e.to_string())?;
+        Ok(summary)
     }
 
     pub fn invoke(
@@ -551,6 +690,42 @@ done
             .invoke("hung", "tools", "", json!({}), &ctrl)
             .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+
+        // Crashing MCP server surfaces stderr diagnostics AND runs in worktree cwd.
+        std::fs::write(dir.join("marker.txt"), "in-worktree").unwrap();
+        let crash_cfg = json!({
+            "mcpServers": {
+                "crash": {"command": "sh", "args": ["-c", "cat marker.txt >&2; echo 'missing API_TOKEN' >&2; exit 1"]}
+            }
+        });
+        std::fs::write(dir.join(".twig/mcp.json"), crash_cfg.to_string()).unwrap();
+        let mut crash_reg = McpRegistry::discover(&dir).unwrap();
+        let crash_err = crash_reg
+            .invoke("crash", "tools", "", json!({}), &ctrl)
+            .unwrap_err();
+        assert!(crash_err.contains("in-worktree"), "{crash_err}");
+        assert!(crash_err.contains("missing API_TOKEN"), "{crash_err}");
+
+        // Toggleable REA MCP (`init_rea` -> disabled by default -> `enable` -> `disable`).
+        let init_msg =
+            McpRegistry::configure_project_file(&dir, &json!({"action": "init_rea"})).unwrap();
+        assert!(init_msg.contains("disabled by default"), "{init_msg}");
+        let mut rea_reg = McpRegistry::discover(&dir).unwrap();
+        assert!(!rea_reg.server_names_summary().contains("rea"));
+        let rep = rea_reg.list_report();
+        assert!(rep["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["server"] == "rea" && s["disabled"] == true));
+        let en_msg = McpRegistry::configure_project_file(
+            &dir,
+            &json!({"action": "enable", "server": "rea"}),
+        )
+        .unwrap();
+        assert!(en_msg.contains("enabled"), "{en_msg}");
+        let rea_enabled = McpRegistry::discover(&dir).unwrap();
+        assert!(rea_enabled.server_names_summary().contains("rea"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

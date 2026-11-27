@@ -23,6 +23,19 @@ use super::markdown::{
 /// Codex & Claude Code parity slash command catalog.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan", "toggle read-only planning mode (Shift+Tab)"),
+    ("/study", "toggle REA epistemic clean-room study mode (/study [on|off|<target>])"),
+    ("/go", "exit /plan & /study, switch to `code` role, and execute agreed spec/plan"),
+    ("/operator", "toggle Agent-as-Memory multi-session operator mode"),
+    ("/roles", "view or set per-role models (/roles <role> <model> [effort])"),
+    ("/dual-plan ", "independent blind dual-model plan + synthesis"),
+    ("/btw ", "ask an ephemeral side question without polluting context"),
+    ("/walkthrough", "generate a human-readable walkthrough of git diff"),
+    ("/commit", "stage/inspect changes and commit with style-matched message"),
+    ("/pr", "commit, push branch, and open a clean Pull Request (/pr [--draft] [hint])"),
+    ("/worktree ", "live mid-session handoff to an isolated Git worktree (/worktree <name|back|list>)"),
+    ("/queue ", "queue follow-up prompt to run right after active turn (or Alt+Enter)"),
+    ("/apply ", "apply a subagent session patch into worktree (/undo reverts)"),
+    ("/gc", "clean up 0-byte session remnants and clean subagent worktrees"),
     ("/effort", "set reasoning effort (off/low/medium/high/xhigh)"),
     ("/model", "browse and switch active model via magpie"),
     ("/new", "start a new chat session"),
@@ -36,7 +49,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/review", "run independent read-only review on current changes"),
     ("/image ", "attach image file or paste clipboard image (Alt+V)"),
     ("/tasks", "list asynchronous background shell tasks"),
-    ("/mcp", "list configured MCP servers, prompts, and resources"),
+    ("/mcp", "list or toggle MCP servers (/mcp [enable|disable <name> | init-rea])"),
     ("/evolve", "propose human-reviewed .twig/preferences or skill upgrade"),
     ("/skills", "list/manage skills (/skills enable|disable|doctor, or $name)"),
     ("/memory", "edit .twig/preferences.md project memory in $EDITOR"),
@@ -65,6 +78,28 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 pub enum SlashCommand {
     Quit,
     SetPlan(bool),
+    SetOperator(Option<bool>),
+    SetStudy {
+        enabled: Option<bool>,
+        target: Option<String>,
+    },
+    ShowRoles,
+    ResetRoles,
+    SetRole {
+        role: String,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    DualPlan(String),
+    ExecutePlan(Option<String>),
+    SideQuestion(String),
+    RunWalkthrough,
+    CommitChanges(Option<String>),
+    CreatePr(Option<String>),
+    ManageWorktree(Option<String>),
+    QueueFollowUp(Option<String>),
+    ApplySession(String),
+    GcSessions,
     OpenEffortPicker,
     SetEffort(String),
     OpenModelPicker,
@@ -74,7 +109,10 @@ pub enum SlashCommand {
     SwitchSession(String),
     ForkSession,
     OpenRewindPicker,
-    RewindSession(usize),
+    RewindSession {
+        turns: usize,
+        restore_code: bool,
+    },
     RenameSession(String),
     ArchiveSession,
     UndoEdit,
@@ -83,7 +121,10 @@ pub enum SlashCommand {
     AttachImage(Option<String>),
     ClearImages,
     ListTasks,
-    ListMcp,
+    ManageMcp {
+        action: String,
+        server: Option<String>,
+    },
     EvolveSession,
     ManageSkills {
         action: String,
@@ -118,6 +159,31 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/plan" => Some(SlashCommand::SetPlan(!plan_mode)),
         "/plan on" => Some(SlashCommand::SetPlan(true)),
         "/plan off" => Some(SlashCommand::SetPlan(false)),
+        "/operator" => Some(SlashCommand::SetOperator(None)),
+        "/operator on" => Some(SlashCommand::SetOperator(Some(true))),
+        "/operator off" => Some(SlashCommand::SetOperator(Some(false))),
+        "/study" => Some(SlashCommand::SetStudy {
+            enabled: None,
+            target: None,
+        }),
+        "/study on" => Some(SlashCommand::SetStudy {
+            enabled: Some(true),
+            target: None,
+        }),
+        "/study off" => Some(SlashCommand::SetStudy {
+            enabled: Some(false),
+            target: None,
+        }),
+        "/roles" => Some(SlashCommand::ShowRoles),
+        "/roles reset" => Some(SlashCommand::ResetRoles),
+        "/walkthrough" => Some(SlashCommand::RunWalkthrough),
+        "/go" | "/execute" => Some(SlashCommand::ExecutePlan(None)),
+        "/commit" => Some(SlashCommand::CommitChanges(None)),
+        "/pr" => Some(SlashCommand::CreatePr(None)),
+        "/worktree" | "/wt" => Some(SlashCommand::ManageWorktree(None)),
+        "/queue" => Some(SlashCommand::QueueFollowUp(None)),
+        "/unqueue" | "/queue clear" => Some(SlashCommand::QueueFollowUp(Some("clear".into()))),
+        "/gc" => Some(SlashCommand::GcSessions),
         "/effort" => Some(SlashCommand::OpenEffortPicker),
         "/model" => Some(SlashCommand::OpenModelPicker),
         "/new" => Some(SlashCommand::NewSession),
@@ -131,7 +197,14 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/image" => Some(SlashCommand::AttachImage(None)),
         "/image clear" => Some(SlashCommand::ClearImages),
         "/tasks" => Some(SlashCommand::ListTasks),
-        "/mcp" => Some(SlashCommand::ListMcp),
+        "/mcp" => Some(SlashCommand::ManageMcp {
+            action: "list".into(),
+            server: None,
+        }),
+        "/mcp init-rea" | "/init --rea" => Some(SlashCommand::ManageMcp {
+            action: "init_rea".into(),
+            server: None,
+        }),
         "/evolve" => Some(SlashCommand::EvolveSession),
         "/skills" | "/playbooks" => Some(SlashCommand::ManageSkills {
             action: "list".into(),
@@ -165,10 +238,123 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
     if exact.is_some() {
         return exact;
     }
+    if let Some(arg) = trimmed.strip_prefix("/study ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::SetStudy {
+                enabled: Some(true),
+                target: Some(a.to_owned()),
+            });
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/mcp ") {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            ["init-rea" | "init_rea"] => {
+                return Some(SlashCommand::ManageMcp {
+                    action: "init_rea".into(),
+                    server: None,
+                });
+            }
+            ["enable", srv, ..] => {
+                return Some(SlashCommand::ManageMcp {
+                    action: "enable".into(),
+                    server: Some((*srv).to_owned()),
+                });
+            }
+            ["disable", srv, ..] => {
+                return Some(SlashCommand::ManageMcp {
+                    action: "disable".into(),
+                    server: Some((*srv).to_owned()),
+                });
+            }
+            _ => {
+                return Some(SlashCommand::ManageMcp {
+                    action: "list".into(),
+                    server: None,
+                });
+            }
+        }
+    }
     if let Some(arg) = trimmed.strip_prefix("/effort ") {
         let a = arg.trim();
         if !a.is_empty() {
             return Some(SlashCommand::SetEffort(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/roles ") {
+        let parts: Vec<&str> = arg.split_whitespace().collect();
+        match parts.as_slice() {
+            ["reset"] => return Some(SlashCommand::ResetRoles),
+            [role, "reset" | "default"] => {
+                return Some(SlashCommand::SetRole {
+                    role: (*role).to_owned(),
+                    model: None,
+                    effort: None,
+                });
+            }
+            [role, model] => {
+                return Some(SlashCommand::SetRole {
+                    role: (*role).to_owned(),
+                    model: Some((*model).to_owned()),
+                    effort: None,
+                });
+            }
+            [role, model, effort, ..] => {
+                return Some(SlashCommand::SetRole {
+                    role: (*role).to_owned(),
+                    model: Some((*model).to_owned()),
+                    effort: Some((*effort).to_owned()),
+                });
+            }
+            _ => return Some(SlashCommand::ShowRoles),
+        }
+    }
+    if let Some(arg) = trimmed
+        .strip_prefix("/dual-plan ")
+        .or_else(|| trimmed.strip_prefix("/council "))
+    {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::DualPlan(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/btw ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::SideQuestion(a.to_owned()));
+        }
+    }
+    if let Some(arg) = trimmed
+        .strip_prefix("/go ")
+        .or_else(|| trimmed.strip_prefix("/execute "))
+    {
+        let a = arg.trim();
+        return Some(SlashCommand::ExecutePlan((!a.is_empty()).then(|| a.to_owned())));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/commit ") {
+        let a = arg.trim();
+        return Some(SlashCommand::CommitChanges((!a.is_empty()).then(|| a.to_owned())));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/pr ") {
+        let a = arg.trim();
+        return Some(SlashCommand::CreatePr((!a.is_empty()).then(|| a.to_owned())));
+    }
+    if let Some(arg) = trimmed
+        .strip_prefix("/worktree ")
+        .or_else(|| trimmed.strip_prefix("/wt "))
+    {
+        let a = arg.trim();
+        return Some(SlashCommand::ManageWorktree((!a.is_empty()).then(|| a.to_owned())));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/queue ") {
+        let a = arg.trim();
+        return Some(SlashCommand::QueueFollowUp((!a.is_empty()).then(|| a.to_owned())));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/apply ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::ApplySession(a.to_owned()));
         }
     }
     if let Some(arg) = trimmed.strip_prefix("/model ") {
@@ -184,8 +370,16 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         }
     }
     if let Some(arg) = trimmed.strip_prefix("/rewind ") {
-        let n = arg.trim().parse::<usize>().unwrap_or(1).max(1);
-        return Some(SlashCommand::RewindSession(n));
+        let restore_code = arg.split_whitespace().any(|t| t == "--code" || t == "-c");
+        let n = arg
+            .split_whitespace()
+            .find_map(|t| t.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        return Some(SlashCommand::RewindSession {
+            turns: n,
+            restore_code,
+        });
     }
     if let Some(arg) = trimmed.strip_prefix("/rename ") {
         let a = arg.trim();
@@ -508,8 +702,10 @@ impl Composer {
         let prefix = &self.text[..self.cursor];
         let trimmed = prefix.trim_end();
         let cut = trimmed
-            .rfind(char::is_whitespace)
-            .map(|i| i + 1)
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         self.text.drain(cut..self.cursor);
         self.cursor = cut;
@@ -685,13 +881,14 @@ impl Composer {
     fn active_popup(&self) -> Option<PopupKind> {
         if self.text.starts_with('/') && !self.text.contains('\n') && !self.text.contains(' ') {
             let q = self.text.to_lowercase();
+            let bare = q.strip_prefix('/').unwrap_or(&q);
             let mut matches: Vec<(usize, String, String)> = SLASH_COMMANDS
                 .iter()
                 .filter_map(|(cmd, desc)| {
                     let low_cmd = cmd.trim_end().to_lowercase();
                     if low_cmd.starts_with(&q) {
                         Some((0, (*cmd).to_owned(), (*desc).to_owned()))
-                    } else if low_cmd.contains(&q[1..]) || desc.to_lowercase().contains(&q[1..]) {
+                    } else if low_cmd.contains(bare) || desc.to_lowercase().contains(bare) {
                         Some((1, (*cmd).to_owned(), (*desc).to_owned()))
                     } else {
                         None
@@ -707,13 +904,20 @@ impl Composer {
         }
         let before = &self.text[..self.cursor];
         let token_start = before
-            .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         let token = &before[token_start..];
         if let Some(query) = token.strip_prefix('@') {
+            let q = query.to_lowercase();
+            let mut items: Vec<String> = ["diff", "staged", "last"]
+                .into_iter()
+                .filter(|kw| q.is_empty() || kw.starts_with(&q))
+                .map(str::to_owned)
+                .collect();
             if !self.repo_files.is_empty() {
-                let q = query.to_lowercase();
                 let mut scored: Vec<(usize, &String)> = self
                     .repo_files
                     .iter()
@@ -729,17 +933,18 @@ impl Composer {
                     })
                     .collect();
                 scored.sort_by_key(|(rank, p)| (*rank, p.len()));
-                let items: Vec<String> = scored
-                    .into_iter()
-                    .take(12)
-                    .map(|(_, p)| p.clone())
-                    .collect();
-                if !items.is_empty() {
-                    return Some(PopupKind::Mention {
-                        at_byte: token_start,
-                        items,
-                    });
-                }
+                items.extend(
+                    scored
+                        .into_iter()
+                        .take(12usize.saturating_sub(items.len()))
+                        .map(|(_, p)| p.clone()),
+                );
+            }
+            if !items.is_empty() {
+                return Some(PopupKind::Mention {
+                    at_byte: token_start,
+                    items,
+                });
             }
         }
         if let Some(query) = token.strip_prefix('$') {
@@ -774,13 +979,21 @@ impl Composer {
     }
 
     pub fn desired_height(&self, total_width: usize, max_rows: u16) -> u16 {
-        let margin = if total_width < 46 { 3 } else { 6 };
-        let text_w = total_width.saturating_sub(margin).max(12);
+        let pad_x = if total_width >= 120 {
+            4
+        } else if total_width >= 80 {
+            3
+        } else if total_width >= 56 {
+            2
+        } else {
+            1
+        };
+        let text_w = total_width.saturating_sub(pad_x * 2 + 4).max(12);
         let lines = wrap_plain(&self.text, text_w);
         (lines.len() as u16 + 2).clamp(3, max_rows.max(3))
     }
 
-    /// Claude Code hairline composer with responsive horizontal margins (adapts down to phone width).
+    /// Claude Code hairline composer with symmetric outer margins.
     pub fn render(
         &self,
         frame: &mut Frame,
@@ -793,9 +1006,18 @@ impl Composer {
         if area.height < 3 || area.width < 10 {
             return;
         }
-        let compact = area.width < 46;
-        let rule_len = area.width.saturating_sub(2) as usize;
-        let rule_line = format!(" {}", "─".repeat(rule_len));
+        let pad_x: u16 = if area.width >= 120 {
+            4
+        } else if area.width >= 80 {
+            3
+        } else if area.width >= 56 {
+            2
+        } else {
+            1
+        };
+        let pad_str = " ".repeat(pad_x as usize);
+        let rule_len = area.width.saturating_sub(pad_x * 2) as usize;
+        let rule_line = format!("{pad_str}{}", "─".repeat(rule_len));
         let rule_style = Style::default().fg(rule_color);
 
         frame.render_widget(
@@ -821,22 +1043,20 @@ impl Composer {
             x: area.x,
             y: area.y + 1,
             width: area.width,
-            height: area.height.saturating_sub(2),
+            height: area.height.saturating_sub(2).max(1),
         };
-        let (prompt_head, prompt_cont, prompt_cols) = if compact {
-            (" ❯ ", "   ", 3u16)
-        } else {
-            ("  ❯ ", "    ", 4u16)
-        };
+        let prompt_head = format!("{pad_str}❯ ");
+        let prompt_cont = format!("{pad_str}  ");
+        let prompt_cols = pad_x + 2;
         let text_w = area
             .width
-            .saturating_sub(prompt_cols + 2)
+            .saturating_sub(prompt_cols + pad_x)
             .max(10) as usize;
 
         let rendered_lines: Vec<Line<'static>> = if self.text.is_empty() {
             vec![Line::from(vec![
                 Span::styled(
-                    prompt_head,
+                    prompt_head.clone(),
                     Style::default()
                         .fg(prompt_color)
                         .add_modifier(Modifier::BOLD),
@@ -848,7 +1068,11 @@ impl Composer {
                 .into_iter()
                 .enumerate()
                 .map(|(idx, segment)| {
-                    let prefix = if idx == 0 { prompt_head } else { prompt_cont };
+                    let prefix = if idx == 0 {
+                        prompt_head.clone()
+                    } else {
+                        prompt_cont.clone()
+                    };
                     let mut spans = vec![Span::styled(
                         prefix,
                         Style::default()
@@ -1125,6 +1349,30 @@ mod tests {
     fn parse_slash_covers_all_codex_and_twig_commands() {
         assert_eq!(parse_slash("/plan", true), Some(SlashCommand::SetPlan(false)));
         assert_eq!(parse_slash("/plan on", false), Some(SlashCommand::SetPlan(true)));
+        assert_eq!(parse_slash("/operator", false), Some(SlashCommand::SetOperator(None)));
+        assert_eq!(parse_slash("/roles", false), Some(SlashCommand::ShowRoles));
+        assert_eq!(
+            parse_slash("/roles advisor gemini-4 xhigh", false),
+            Some(SlashCommand::SetRole {
+                role: "advisor".into(),
+                model: Some("gemini-4".into()),
+                effort: Some("xhigh".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash("/dual-plan redesign auth", false),
+            Some(SlashCommand::DualPlan("redesign auth".into()))
+        );
+        assert_eq!(
+            parse_slash("/btw why is Lease flock?", false),
+            Some(SlashCommand::SideQuestion("why is Lease flock?".into()))
+        );
+        assert_eq!(parse_slash("/walkthrough", false), Some(SlashCommand::RunWalkthrough));
+        assert_eq!(
+            parse_slash("/apply sub-123", false),
+            Some(SlashCommand::ApplySession("sub-123".into()))
+        );
+        assert_eq!(parse_slash("/gc", false), Some(SlashCommand::GcSessions));
         assert_eq!(parse_slash("/effort", false), Some(SlashCommand::OpenEffortPicker));
         assert_eq!(
             parse_slash("/effort high", false),
@@ -1133,9 +1381,42 @@ mod tests {
         assert_eq!(parse_slash("/model", false), Some(SlashCommand::OpenModelPicker));
         assert_eq!(parse_slash("/new", false), Some(SlashCommand::NewSession));
         assert_eq!(parse_slash("/fork", false), Some(SlashCommand::ForkSession));
-        assert_eq!(parse_slash("/rewind 2", false), Some(SlashCommand::RewindSession(2)));
+        assert_eq!(
+            parse_slash("/rewind 2", false),
+            Some(SlashCommand::RewindSession {
+                turns: 2,
+                restore_code: false,
+            })
+        );
+        assert_eq!(
+            parse_slash("/rewind 2 --code", false),
+            Some(SlashCommand::RewindSession {
+                turns: 2,
+                restore_code: true,
+            })
+        );
         assert_eq!(parse_slash("/undo", false), Some(SlashCommand::UndoEdit));
-        assert_eq!(parse_slash("/mcp", false), Some(SlashCommand::ListMcp));
+        assert_eq!(
+            parse_slash("/mcp", false),
+            Some(SlashCommand::ManageMcp {
+                action: "list".into(),
+                server: None,
+            })
+        );
+        assert_eq!(
+            parse_slash("/mcp enable rea", false),
+            Some(SlashCommand::ManageMcp {
+                action: "enable".into(),
+                server: Some("rea".into()),
+            })
+        );
+        assert_eq!(
+            parse_slash("/study auth module", false),
+            Some(SlashCommand::SetStudy {
+                enabled: Some(true),
+                target: Some("auth module".into()),
+            })
+        );
         assert_eq!(parse_slash("/memory", false), Some(SlashCommand::EditMemory));
         assert_eq!(parse_slash("/init", false), Some(SlashCommand::InitProject));
         assert_eq!(parse_slash("/doctor", false), Some(SlashCommand::RunDoctor));
@@ -1174,5 +1455,37 @@ mod tests {
                 project: false,
             })
         );
+        assert_eq!(
+            parse_slash("/pr --draft ship it", false),
+            Some(SlashCommand::CreatePr(Some("--draft ship it".into())))
+        );
+        assert_eq!(
+            parse_slash("/worktree feat-ui", false),
+            Some(SlashCommand::ManageWorktree(Some("feat-ui".into())))
+        );
+        assert_eq!(
+            parse_slash("/queue run benchmarks", false),
+            Some(SlashCommand::QueueFollowUp(Some("run benchmarks".into())))
+        );
+        assert_eq!(
+            parse_slash("/unqueue", false),
+            Some(SlashCommand::QueueFollowUp(Some("clear".into())))
+        );
+    }
+
+    #[test]
+    fn composer_handles_multibyte_cjk_whitespace_without_panicking() {
+        let mut comp = Composer::new(".");
+        comp.repo_files = vec!["src/main.rs".into()];
+        for c in "中文\u{3000}@main".chars() {
+            comp.insert_char(c);
+        }
+        assert!(comp.has_popup());
+        assert!(comp.accept_popup());
+        assert_eq!(comp.text, "中文\u{3000}@src/main.rs ");
+        comp.delete_word_back();
+        assert_eq!(comp.text, "中文\u{3000}");
+        comp.delete_word_back();
+        assert_eq!(comp.text, "");
     }
 }

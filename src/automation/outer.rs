@@ -137,7 +137,11 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
             continue;
         }
         let (src, dst) = (entry.path(), to.join(&name));
-        if entry.file_type()?.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             copy_tree(&src, &dst)?;
         } else {
             std::fs::copy(&src, &dst)?;
@@ -168,10 +172,15 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let d = std::env::temp_dir().join(format!(
-            "twig-outer-{tag}-{}-{}",
+            "twig-outer-{tag}-{}-{}-{}",
             std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }

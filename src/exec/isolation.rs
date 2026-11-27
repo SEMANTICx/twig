@@ -172,9 +172,31 @@ pub fn eval_command(
             "TWIG_CONFIG",
             "/harness.json",
         ]);
-    for name in ["TWIG_BASE_URL", "TWIG_API_KEY", "TWIG_ROLES"] {
+    for name in [
+        "TWIG_BASE_URL",
+        "TWIG_API_KEY",
+        "TWIG_ROLES",
+        "TWIG_MODEL",
+        "TWIG_EFFORT",
+    ] {
         if let Ok(value) = std::env::var(name) {
             cmd.args(["--setenv", name, &value]);
+        }
+    }
+    if std::env::var_os("TWIG_ROLES").is_none() && std::env::var_os("TWIG_MODEL").is_none() {
+        use crate::llm::Llm;
+        let provider = crate::llm::Provider::new();
+        if let Ok(roles_json) = serde_json::to_string(&provider.roles().0) {
+            cmd.args(["--setenv", "TWIG_ROLES", &roles_json]);
+        }
+    }
+    if std::env::var_os("TWIG_EFFORT").is_none() {
+        let effort_file = crate::config::paths::state_dir().join("effort.txt");
+        if let Ok(raw) = std::fs::read_to_string(&effort_file) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                cmd.args(["--setenv", "TWIG_EFFORT", trimmed]);
+            }
         }
     }
     cmd.args(["--", "/twig", "serve", "/workspace", "/runs"]);

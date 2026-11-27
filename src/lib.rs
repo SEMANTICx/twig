@@ -21,6 +21,7 @@ pub mod record;
 pub mod runtime;
 pub mod tui;
 pub mod verify;
+pub mod web;
 
 // Narrow public façade & compatibility re-exports for CLI and integration tests.
 pub use config::paths;

@@ -31,6 +31,8 @@ pub struct Candidate {
     pub program: String,
     pub args: Vec<String>,
     timeout: Duration,
+    raw_cli: bool,
+    ignore_fields: Vec<String>,
 }
 
 impl Candidate {
@@ -39,6 +41,8 @@ impl Candidate {
             program: program.into(),
             args,
             timeout: DEFAULT_CANDIDATE_TIMEOUT,
+            raw_cli: false,
+            ignore_fields: Vec::new(),
         }
     }
 
@@ -47,11 +51,45 @@ impl Candidate {
         self
     }
 
-    /// JSON in, JSON out. A non-zero exit is the candidate's error channel.
+    pub fn with_raw_cli(mut self, raw: bool) -> Self {
+        self.raw_cli = raw;
+        self
+    }
+
+    pub fn with_ignore_fields(mut self, fields: Vec<String>) -> Self {
+        self.ignore_fields = fields;
+        self
+    }
+
+    /// JSON in, JSON out by default; when `raw_cli` is enabled or `input` carries
+    /// `{"_cli": {"args": [...], "stdin": "..."}}`, captures `{exit_code, stdout, stderr}`.
     pub fn run(&self, input: &Value) -> Result<Value, String> {
+        let cli_env = input.get("_cli");
+        let use_raw = self.raw_cli || cli_env.is_some();
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
-        let out = run_process(&mut cmd, input.to_string().as_bytes(), self.timeout, 1_048_576)
+        let stdin_bytes: Vec<u8> = if let Some(spec) = cli_env {
+            if let Some(extra) = spec.get("args").and_then(Value::as_array) {
+                for a in extra.iter().filter_map(Value::as_str) {
+                    cmd.arg(a);
+                }
+            }
+            spec.get("stdin")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec()
+        } else if use_raw {
+            match input {
+                Value::Null => Vec::new(),
+                Value::String(s) => s.as_bytes().to_vec(),
+                other => other.to_string().into_bytes(),
+            }
+        } else {
+            input.to_string().into_bytes()
+        };
+
+        let out = run_process(&mut cmd, &stdin_bytes, self.timeout, 1_048_576)
             .map_err(|e| format!("spawn {}: {e}", self.program))?;
         if out.timed_out {
             return Err(format!(
@@ -62,6 +100,13 @@ impl Candidate {
         if out.truncated {
             return Err("candidate output exceeds 1 MiB".into());
         }
+        if use_raw {
+            return Ok(json!({
+                "exit_code": out.exit_code.unwrap_or(-1),
+                "stdout": String::from_utf8_lossy(&out.stdout),
+                "stderr": String::from_utf8_lossy(&out.stderr),
+            }));
+        }
         if out.exit_code != Some(0) {
             return Err(format!(
                 "exit {}: {}",
@@ -71,6 +116,46 @@ impl Candidate {
         }
         serde_json::from_slice(&out.stdout).map_err(|e| format!("json: {e}"))
     }
+}
+
+fn strip_ignored_keys(val: &Value, ignored: &[String]) -> Value {
+    if ignored.is_empty() {
+        return val.clone();
+    }
+    match val {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if !ignored.iter().any(|ig| ig == k) {
+                    out.insert(k.clone(), strip_ignored_keys(v, ignored));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| strip_ignored_keys(v, ignored)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Dynamically run an oracle program against `inputs` and save its black-box behavior as a journal.
+pub fn record_oracle(path: &Path, oracle: &Candidate, inputs: &[Value]) -> io::Result<usize> {
+    let mut cases = Vec::with_capacity(inputs.len());
+    for inp in inputs {
+        match oracle.run(inp) {
+            Ok(out) => cases.push(Case {
+                input: inp.clone(),
+                output: Some(out),
+                error: None,
+            }),
+            Err(err) => cases.push(Case {
+                input: inp.clone(),
+                output: None,
+                error: Some(err),
+            }),
+        }
+    }
+    record(path, &cases)?;
+    Ok(cases.len())
 }
 
 /// Structural equality. Floats compare within `tol`; NaN equals NaN; a type
@@ -217,14 +302,18 @@ pub fn verify(path: &Path, candidate: &Candidate, min_cases: usize) -> Verdict {
                 got: got_err,
             }),
             (None, Ok(got)) => {
-                let want = case.output.clone().unwrap_or(Value::Null);
-                if eq_json(&want, &got, 1e-9) {
+                let want = strip_ignored_keys(
+                    &case.output.clone().unwrap_or(Value::Null),
+                    &candidate.ignore_fields,
+                );
+                let actual = strip_ignored_keys(&got, &candidate.ignore_fields);
+                if eq_json(&want, &actual, 1e-9) {
                     covered += 1;
                 } else {
                     fails.push(Fail {
                         input: case.input.clone(),
                         want: want.to_string(),
-                        got: got.to_string(),
+                        got: actual.to_string(),
                     });
                 }
             }
@@ -459,5 +548,28 @@ mod tests {
             .unwrap()
             .passed
         );
+    }
+
+    #[test]
+    fn raw_cli_oracle_recording_and_ignored_fields_work() {
+        let jpath = std::env::temp_dir().join(format!("twig-oracle-rec-{}.jsonl", std::process::id()));
+        let oracle = Candidate::new("tr", vec!["a-z".into(), "A-Z".into()]).with_raw_cli(true);
+        let seeds = vec![
+            json!({"_cli": {"args": [], "stdin": "hello twig\n"}}),
+            json!("clean room\n"),
+        ];
+        let count = record_oracle(&jpath, &oracle, &seeds).unwrap();
+        assert_eq!(count, 2);
+        let verdict = verify(&jpath, &oracle, 2);
+        assert!(verdict.ok, "{verdict:?}");
+        let _ = std::fs::remove_file(&jpath);
+
+        let noisy_path = journal(&[(
+            "{\"q\":1}",
+            "{\"q\":1,\"timestamp\":100}",
+        )]);
+        let masked = identity().with_ignore_fields(vec!["timestamp".into()]);
+        assert!(verify(&noisy_path, &masked, 1).ok);
+        let _ = std::fs::remove_file(&noisy_path);
     }
 }

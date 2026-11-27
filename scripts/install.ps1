@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:TWIG_REPO) { $env:TWIG_REPO } else { "SEMANTICx/twig" }
+$Repo = if ($env:TWIG_REPO) { $env:TWIG_REPO } else { "SEMANTICx/twig-dist" }
 $InstallDir = if ($env:TWIG_INSTALL_DIR) { $env:TWIG_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "twig\bin" }
 $Target = "x86_64-pc-windows-msvc"
 
@@ -12,7 +12,7 @@ if ($env:TWIG_VERSION) {
 }
 
 if (-not $Tag) {
-    throw "Could not resolve latest release tag. Set `$env:TWIG_VERSION = 'v0.2.0' or build from source."
+    throw "Could not resolve latest release tag from $Repo. Set `$env:TWIG_VERSION = 'v0.2.0' to pin explicitly."
 }
 
 $Pkg = "twig-$Tag-$Target"
