@@ -606,11 +606,21 @@ impl App {
                 }
             }
             Some("subagent.started") => {
-                let id = ev["id"].as_str().unwrap_or("").to_owned();
+                let raw_id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent").to_owned();
+                let id = if raw_id.is_empty() {
+                    format!("{role}-{}", self.subagents.len() + 1)
+                } else {
+                    raw_id.to_owned()
+                };
                 let task = ev["task"].as_str().unwrap_or("").trim().to_owned();
                 let parallel = ev["parallel"] == true;
                 self.update_status_header(format!("Subagent [{role}]"));
+                let mut child_tr = super::transcript::Transcript::new();
+                if !task.is_empty() {
+                    child_tr.push_user(task.clone());
+                }
+                self.subagent_transcripts.insert(id.clone(), child_tr);
                 self.subagents.push(super::overlays::SubagentEntry {
                     id,
                     role,
@@ -622,11 +632,16 @@ impl App {
                     error: None,
                     activity: None,
                     turns: 0,
+                    tool_count: 0,
                     trace: Vec::new(),
                 });
                 if self.subagents.len() > 16 {
                     let drop_n = self.subagents.len() - 16;
-                    self.subagents.drain(..drop_n);
+                    for dropped in self.subagents.drain(..drop_n) {
+                        if self.viewing_subagent.as_deref() != Some(dropped.id.as_str()) {
+                            self.subagent_transcripts.remove(&dropped.id);
+                        }
+                    }
                 }
                 if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
                     &mut self.overlay_picker
@@ -639,6 +654,7 @@ impl App {
                 let role = ev["role"].as_str().unwrap_or("subagent");
                 let activity = ev["activity"].as_str().unwrap_or("").trim();
                 let turns = ev["turns"].as_u64().unwrap_or(0) as u32;
+                let tool_count = ev["tool_count"].as_u64().unwrap_or(0) as u32;
                 let match_idx = (!id.is_empty())
                     .then(|| {
                         self.subagents.iter().position(|s| {
@@ -656,6 +672,9 @@ impl App {
                     if turns > entry.turns {
                         entry.turns = turns;
                     }
+                    if tool_count > entry.tool_count {
+                        entry.tool_count = tool_count;
+                    }
                     if !activity.is_empty() {
                         entry.activity = Some(activity.to_owned());
                         if !activity.starts_with("thinking")
@@ -671,6 +690,27 @@ impl App {
                         &mut self.overlay_picker
                     {
                         *subagents = self.subagents.clone();
+                    }
+                }
+            }
+            Some("subagent.stream") => {
+                let id = ev["id"].as_str().unwrap_or("");
+                let role = ev["role"].as_str().unwrap_or("subagent");
+                let key = if !id.is_empty() && self.subagent_transcripts.contains_key(id) {
+                    Some(id.to_owned())
+                } else {
+                    self.subagents
+                        .iter()
+                        .rev()
+                        .find(|s| {
+                            s.status == super::overlays::SubagentStatus::Running && s.role == role
+                        })
+                        .map(|s| s.id.clone())
+                };
+                if let Some(k) = key {
+                    let child = &ev["child"];
+                    if let Some(tr) = self.subagent_transcripts.get_mut(&k) {
+                        apply_child_stream_event(tr, child);
                     }
                 }
             }
@@ -705,25 +745,49 @@ impl App {
                             .iter()
                             .position(|s| s.status == super::overlays::SubagentStatus::Running)
                     });
-                if let Some(idx) = match_idx {
+                let done_id = if let Some(idx) = match_idx {
                     self.subagents[idx].status = next_status;
                     self.subagents[idx].elapsed_secs = Some(secs);
-                    self.subagents[idx].error = err_note;
+                    self.subagents[idx].error = err_note.clone();
                     self.subagents[idx].activity = None;
+                    self.subagents[idx].id.clone()
                 } else {
+                    let fallback_id = if id.is_empty() {
+                        format!("{role}-{}", self.subagents.len() + 1)
+                    } else {
+                        id.to_owned()
+                    };
                     self.subagents.push(super::overlays::SubagentEntry {
-                        id: id.to_owned(),
+                        id: fallback_id.clone(),
                         role: role.to_owned(),
                         task: String::new(),
                         parallel: false,
                         started_at: Instant::now(),
                         elapsed_secs: Some(secs),
                         status: next_status,
-                        error: err_note,
+                        error: err_note.clone(),
                         activity: None,
                         turns: 0,
+                        tool_count: 0,
                         trace: Vec::new(),
                     });
+                    fallback_id
+                };
+                if let Some(tr) = self.subagent_transcripts.get_mut(&done_id) {
+                    if ok {
+                        tr.push_notice(
+                            NoticeKind::Success,
+                            format!("subagent [{role}] completed in {secs}s (Esc ← main)"),
+                        );
+                    } else {
+                        tr.push_notice(
+                            NoticeKind::Error,
+                            format!(
+                                "subagent [{role}] failed: {}",
+                                err_note.as_deref().unwrap_or("error")
+                            ),
+                        );
+                    }
                 }
                 if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
                     &mut self.overlay_picker
@@ -1088,6 +1152,47 @@ impl App {
             SlashCommand::UndoEdit => {
                 self.undo_req =
                     self.send_rpc(client, "edit.undo", json!({}), "Reverting last edit…");
+            }
+            SlashCommand::SwitchAgent(target) => {
+                match target.as_deref() {
+                    Some("main" | "parent" | "root") => {
+                        self.viewing_subagent = None;
+                        self.flash("Returned to main session");
+                    }
+                    Some(q) => {
+                        let found = self
+                            .subagents
+                            .iter()
+                            .rev()
+                            .find(|s| s.id == q || s.role.eq_ignore_ascii_case(q))
+                            .map(|s| s.id.clone());
+                        if let Some(id) = found {
+                            self.viewing_subagent = Some(id);
+                        } else {
+                            self.flash(format!("No subagent matching `{q}`"));
+                        }
+                    }
+                    None => {
+                        if self.subagents.is_empty() {
+                            self.transcript.push_notice(
+                                NoticeKind::Info,
+                                "no subagents in this session yet (press Ctrl+T for tasks)",
+                            );
+                        } else if self.subagents.len() == 1 {
+                            if self.viewing_subagent.is_some() {
+                                self.viewing_subagent = None;
+                                self.flash("Returned to main session");
+                            } else {
+                                self.viewing_subagent = Some(self.subagents[0].id.clone());
+                            }
+                        } else {
+                            self.overlay_picker = Some(OverlayPicker::tasks(
+                                self.subagents.clone(),
+                                self.cached_tasks.clone(),
+                            ));
+                        }
+                    }
+                }
             }
             SlashCommand::ListTasks => {
                 self.tasks_req = self.send_rpc(
@@ -1540,5 +1645,50 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+}
+
+fn apply_child_stream_event(tr: &mut super::transcript::Transcript, ev: &Value) {
+    match ev["ev"].as_str() {
+        Some("model.reasoning") => {
+            if let Some(d) = ev["text"].as_str() {
+                tr.append_reasoning_delta(d);
+            }
+        }
+        Some("model.delta") => {
+            if let Some(d) = ev["text"].as_str() {
+                tr.append_assistant_delta(d);
+            }
+        }
+        Some("tool.started") => {
+            let id = ev["id"].as_str().unwrap_or("").to_owned();
+            let name = ev["tool"].as_str().unwrap_or("tool").to_owned();
+            let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
+            let summary = summarize_tool_args(&name, &ev["args"]);
+            tr.push_tool_started(id, name, summary, tier);
+        }
+        Some("tool.output") => {
+            tr.append_tool_output(
+                ev["id"].as_str().unwrap_or(""),
+                ev["text"].as_str().unwrap_or(""),
+            );
+        }
+        Some("tool.completed") => {
+            tr.finish_tool(
+                ev["id"].as_str().unwrap_or(""),
+                None,
+                ev["exit_code"].as_i64().map(|c| c as i32),
+                None,
+            );
+        }
+        Some("model.retry") => {
+            let attempt = ev["attempt"].as_u64().unwrap_or(1);
+            let secs = ev["backoff_secs"].as_u64().unwrap_or(1);
+            tr.push_notice(
+                NoticeKind::Warn,
+                format!("model transient error — retrying (attempt {attempt}, {secs}s)…"),
+            );
+        }
+        _ => {}
     }
 }

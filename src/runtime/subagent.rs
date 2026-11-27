@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::paths;
-use crate::exec::{run_process, run_process_streaming};
+use crate::exec::run_process_streaming;
 use crate::llm::Llm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,8 +685,9 @@ impl SubagentPool {
         )
     }
 
-    /// Execute a subagent while streaming out-of-band UI activity updates (`(activity, turns)`)
-    /// directly from child JSONL stdout without leaking any tokens into the parent LLM context.
+    /// Execute a subagent while streaming out-of-band UI events (`subagent.progress` and
+    /// `subagent.stream`) directly from child JSONL stdout without leaking any tokens into
+    /// the parent LLM context.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn run_resumable_live(
         &self,
@@ -697,7 +698,7 @@ impl SubagentPool {
         resume_sid: Option<&str>,
         parent_artifacts: Option<&Path>,
         fork_messages: Option<&[Value]>,
-        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
+        on_event: Option<&(dyn Fn(Value) + Send + Sync)>,
     ) -> io::Result<SubagentResult> {
         self.prepare_and_run(
             role,
@@ -709,7 +710,7 @@ impl SubagentPool {
             resume_sid,
             parent_artifacts,
             fork_messages,
-            on_progress,
+            on_event,
         )
     }
 
@@ -757,7 +758,7 @@ impl SubagentPool {
         resume_sid: Option<&str>,
         parent_artifacts: Option<&Path>,
         fork_messages: Option<&[Value]>,
-        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
+        on_event: Option<&(dyn Fn(Value) + Send + Sync)>,
     ) -> io::Result<SubagentResult> {
         if task.trim().is_empty() {
             return Err(io::Error::new(
@@ -862,7 +863,7 @@ impl SubagentPool {
             &run_dir,
             model_override,
             effort_override,
-            on_progress,
+            on_event,
         );
 
         if let Ok(ref mut ok_res) = result {
@@ -917,7 +918,7 @@ impl SubagentPool {
         run_dir: &Path,
         model_override: Option<&str>,
         effort_override: Option<&str>,
-        on_progress: Option<&(dyn Fn(&str, u32) + Send + Sync)>,
+        on_event: Option<&(dyn Fn(Value) + Send + Sync)>,
     ) -> io::Result<SubagentResult> {
         let host_worktree = worktree.canonicalize()?;
         let host_runs = run_dir.canonicalize()?;
@@ -974,8 +975,13 @@ impl SubagentPool {
         // External CLI worker bridge (`cli:codex`, `cli:claude`, `cli:gemini`) running inside
         // the isolated Git worktree with automatic diff & review extraction.
         if resolved_model.starts_with("cli:") {
-            if let Some(cb) = on_progress {
-                cb(&format!("running {resolved_model}"), 1);
+            if let Some(cb) = on_event {
+                cb(json!({
+                    "ev": "subagent.progress",
+                    "activity": format!("running {resolved_model}"),
+                    "turns": 1,
+                    "tool_count": 0
+                }));
             }
             let effective_task = task.replace(
                 "/runs/review.diff",
@@ -983,11 +989,20 @@ impl SubagentPool {
             );
             let mut ext_cmd =
                 build_external_cli_command(&resolved_model, role, &effective_task, &host_worktree)?;
-            let capture = run_process(
+            let capture = run_process_streaming(
                 &mut ext_cmd,
                 &[],
                 self.config.timeout,
                 self.config.max_output_bytes,
+                &mut |line| {
+                    if let Some(cb) = on_event {
+                        let snippet: String = line.chars().take(512).collect();
+                        cb(json!({
+                            "ev": "subagent.stream",
+                            "child": {"ev": "model.delta", "text": format!("{snippet}\n")}
+                        }));
+                    }
+                },
             )?;
             let text = String::from_utf8_lossy(&capture.stdout).trim().to_owned();
             let err_text = String::from_utf8_lossy(&capture.stderr).trim().to_owned();
@@ -1105,32 +1120,59 @@ impl SubagentPool {
             json!({"id":1,"method":"turn","params":{"input":effective_task,"role":role.as_str()}})
         ));
         let mut live_turns: u32 = 0;
+        let mut live_tools: u32 = 0;
         let capture = run_process_streaming(
             &mut command,
             request.as_bytes(),
             self.config.timeout,
             self.config.max_output_bytes,
             &mut |line| {
-                let Some(cb) = on_progress else {
+                let Some(cb) = on_event else {
                     return;
                 };
                 if !line.starts_with('{') || !line.contains("\"ev\"") {
                     return;
                 }
-                if !(line.contains("tool.started")
-                    || line.contains("turn.started")
-                    || line.contains("model.retry"))
-                {
-                    return;
-                }
-                let Ok(ev) = serde_json::from_str::<Value>(line) else {
+                let Ok(mut ev) = serde_json::from_str::<Value>(line) else {
                     return;
                 };
+                let kind = ev["ev"].as_str().unwrap_or("");
+                if kind == "tool.started" {
+                    live_tools = live_tools.saturating_add(1);
+                }
                 if let Some((activity, next_turns)) =
                     summarize_child_progress_event(&ev, live_turns)
                 {
                     live_turns = next_turns;
-                    cb(&activity, live_turns);
+                    cb(json!({
+                        "ev": "subagent.progress",
+                        "activity": activity,
+                        "turns": live_turns,
+                        "tool_count": live_tools
+                    }));
+                }
+                if matches!(
+                    kind,
+                    "turn.started"
+                        | "model.reasoning"
+                        | "model.delta"
+                        | "tool.started"
+                        | "tool.output"
+                        | "tool.completed"
+                        | "model.retry"
+                ) {
+                    if kind == "tool.output" {
+                        if let Some(t) = ev["text"].as_str() {
+                            if t.len() > 4096 {
+                                let clipped: String = t.chars().take(2048).collect();
+                                ev["text"] = Value::String(clipped);
+                            }
+                        }
+                    }
+                    cb(json!({
+                        "ev": "subagent.stream",
+                        "child": ev
+                    }));
                 }
             },
         )?;
@@ -1247,7 +1289,7 @@ fn summarize_child_progress_event(ev: &Value, current_turns: u32) -> Option<(Str
             let tool = ev["tool"].as_str().unwrap_or("tool");
             let args = &ev["args"];
             let label = match tool {
-                "read_file" => {
+                "read" | "read_file" => {
                     let p = args["path"].as_str().unwrap_or("");
                     if p.is_empty() {
                         "Read".into()
@@ -1255,7 +1297,7 @@ fn summarize_child_progress_event(ev: &Value, current_turns: u32) -> Option<(Str
                         format!("Read({})", compact_path_tail(p))
                     }
                 }
-                "edit_file" => {
+                "edit" | "edit_file" => {
                     let p = args["path"].as_str().unwrap_or("");
                     if p.is_empty() {
                         "Edit".into()
@@ -1263,12 +1305,20 @@ fn summarize_child_progress_event(ev: &Value, current_turns: u32) -> Option<(Str
                         format!("Edit({})", compact_path_tail(p))
                     }
                 }
-                "write_file" => {
+                "write" | "write_file" => {
                     let p = args["path"].as_str().unwrap_or("");
                     if p.is_empty() {
                         "Write".into()
                     } else {
                         format!("Write({})", compact_path_tail(p))
+                    }
+                }
+                "outline" => {
+                    let p = args["path"].as_str().unwrap_or("");
+                    if p.is_empty() {
+                        "Outline".into()
+                    } else {
+                        format!("Outline({})", compact_path_tail(p))
                     }
                 }
                 "apply_patch" => "Patch".into(),
@@ -1298,6 +1348,32 @@ fn summarize_child_progress_event(ev: &Value, current_turns: u32) -> Option<(Str
                         "Bash".into()
                     } else {
                         format!("Bash({})", compact_arg_snippet(c, 28))
+                    }
+                }
+                "skill" => {
+                    let n = args["name"].as_str().unwrap_or("");
+                    if n.is_empty() {
+                        "Skill".into()
+                    } else {
+                        format!("Skill({n})")
+                    }
+                }
+                "mcp" => {
+                    let s = args["server"].as_str().unwrap_or("");
+                    let t = args["tool"].as_str().unwrap_or("");
+                    if !s.is_empty() && !t.is_empty() {
+                        format!("MCP({s}/{t})")
+                    } else {
+                        "MCP".into()
+                    }
+                }
+                "todo" => "Todo".into(),
+                "task" => {
+                    let a = args["action"].as_str().unwrap_or("");
+                    if a.is_empty() {
+                        "Task".into()
+                    } else {
+                        format!("Task({a})")
                     }
                 }
                 "web_search" => {
@@ -1392,10 +1468,17 @@ mod tests {
         );
         assert_eq!(
             summarize_child_progress_event(
-                &json!({"ev": "tool.started", "tool": "read_file", "args": {"path": "src/runtime/subagent.rs"}}),
+                &json!({"ev": "tool.started", "tool": "read", "args": {"path": "src/runtime/subagent.rs"}}),
                 3
             ),
             Some(("Read(runtime/subagent.rs)".into(), 3))
+        );
+        assert_eq!(
+            summarize_child_progress_event(
+                &json!({"ev": "tool.started", "tool": "outline", "args": {"path": "src/tui/mod.rs"}}),
+                3
+            ),
+            Some(("Outline(tui/mod.rs)".into(), 3))
         );
         assert_eq!(
             summarize_child_progress_event(

@@ -51,6 +51,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/diff", "show current git diff with line numbers"),
     ("/review", "run independent read-only review on current changes"),
     ("/image ", "attach image file or paste clipboard image (Alt+V)"),
+    ("/agent", "peek into a subagent's live stream (Codex-style) or return to main"),
     ("/tasks", "list asynchronous background shell tasks"),
     ("/mcp", "list or toggle MCP servers (/mcp [enable|disable <name> | init-rea])"),
     ("/evolve", "propose human-reviewed .twig/preferences or skill upgrade"),
@@ -123,6 +124,7 @@ pub enum SlashCommand {
     RunReview,
     AttachImage(Option<String>),
     ClearImages,
+    SwitchAgent(Option<String>),
     ListTasks,
     CancelTask(String),
     ManageMcp {
@@ -205,6 +207,7 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/review" => Some(SlashCommand::RunReview),
         "/image" => Some(SlashCommand::AttachImage(None)),
         "/image clear" => Some(SlashCommand::ClearImages),
+        "/agent" | "/agents" => Some(SlashCommand::SwitchAgent(None)),
         "/tasks" => Some(SlashCommand::ListTasks),
         "/mcp" => Some(SlashCommand::ManageMcp {
             action: "list".into(),
@@ -257,6 +260,15 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
     };
     if exact.is_some() {
         return exact;
+    }
+    if let Some(arg) = trimmed
+        .strip_prefix("/agent ")
+        .or_else(|| trimmed.strip_prefix("/agents "))
+    {
+        let a = arg.trim();
+        return Some(SlashCommand::SwitchAgent(
+            (!a.is_empty()).then(|| a.to_owned()),
+        ));
     }
     if let Some(arg) = trimmed.strip_prefix("/study ") {
         let a = arg.trim();

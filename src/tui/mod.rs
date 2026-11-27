@@ -25,8 +25,8 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::Style;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
@@ -39,8 +39,8 @@ use self::client::{
 use self::composer::{Composer, SlashCommand};
 use self::markdown::{
     active_rule_color, breathing_star, fmt_elapsed_compact, render_footer, shimmer_is_sweeping,
-    summary_shimmer, FooterMode, FooterView, MotionMode, ACCENT, AMBER, HAIRLINE, HAIRLINE_FOCUS,
-    MUTED,
+    summary_shimmer, FooterMode, FooterView, MotionMode, ACCENT, AMBER, BASH_MODE_COLOR, HAIRLINE,
+    HAIRLINE_FOCUS, IVORY, MUTED,
 };
 use self::overlays::{
     btw_card_height, queued_strip_height, render_btw_card, render_queued_strip,
@@ -152,6 +152,8 @@ struct App {
     open_tasks_drawer: bool,
     todos: Vec<TodoEntry>,
     subagents: Vec<SubagentEntry>,
+    subagent_transcripts: std::collections::HashMap<String, Transcript>,
+    viewing_subagent: Option<String>,
     btw_card: Option<BtwCard>,
     pending_images: Vec<(String, String)>,
     transcript: Transcript,
@@ -236,6 +238,8 @@ impl App {
             open_tasks_drawer: false,
             todos: Vec::new(),
             subagents: Vec::new(),
+            subagent_transcripts: std::collections::HashMap::new(),
+            viewing_subagent: None,
             btw_card: None,
             pending_images: Vec::new(),
             transcript: Transcript::new(),
@@ -294,11 +298,35 @@ impl App {
         self.open_tasks_drawer = false;
         self.todos.clear();
         self.subagents.clear();
+        self.subagent_transcripts.clear();
+        self.viewing_subagent = None;
         self.btw_card = None;
         self.pending_images.clear();
         self.transcript.clear();
         self.approvals.clear();
         self.overlay_picker = None;
+    }
+
+    fn active_transcript_mut(&mut self) -> &mut Transcript {
+        if let Some(id) = self.viewing_subagent.as_deref() {
+            if self.subagent_transcripts.contains_key(id) {
+                return self.subagent_transcripts.get_mut(id).unwrap();
+            }
+        }
+        &mut self.transcript
+    }
+
+    fn cycle_subagent_view(&mut self) {
+        if self.subagents.len() <= 1 {
+            return;
+        }
+        let cur_idx = self
+            .viewing_subagent
+            .as_deref()
+            .and_then(|id| self.subagents.iter().position(|s| s.id == id))
+            .unwrap_or(0);
+        let next = &self.subagents[(cur_idx + 1) % self.subagents.len()];
+        self.viewing_subagent = Some(next.id.clone());
     }
 
     fn update_status_header(&mut self, next: String) {
@@ -483,7 +511,7 @@ impl App {
                     return Action::Slash(SlashCommand::ListTasks);
                 }
                 KeyCode::Char('o') => {
-                    let expanded = self.transcript.toggle_expand();
+                    let expanded = self.active_transcript_mut().toggle_expand();
                     self.flash(if expanded {
                         "Tool outputs: expanded"
                     } else {
@@ -492,7 +520,7 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('f') => {
-                    self.transcript.search_toggle();
+                    self.active_transcript_mut().search_toggle();
                     return Action::None;
                 }
                 KeyCode::Char('r') => {
@@ -565,6 +593,20 @@ impl App {
                     self.composer.set(&entry);
                     Action::None
                 }
+                PickerOutcome::ViewSubagent(sub_id) => {
+                    self.overlay_picker = None;
+                    if !self.subagent_transcripts.contains_key(&sub_id) {
+                        let mut tr = Transcript::new();
+                        if let Some(entry) = self.subagents.iter().find(|s| s.id == sub_id) {
+                            if !entry.task.is_empty() {
+                                tr.push_user(entry.task.clone());
+                            }
+                        }
+                        self.subagent_transcripts.insert(sub_id.clone(), tr);
+                    }
+                    self.viewing_subagent = Some(sub_id);
+                    Action::None
+                }
                 PickerOutcome::CancelTask(task_id) => {
                     self.overlay_picker = None;
                     Action::Slash(SlashCommand::CancelTask(task_id))
@@ -584,8 +626,8 @@ impl App {
             };
         }
 
-        if self.transcript.search_is_open() {
-            self.transcript.search_handle_key(key);
+        if self.active_transcript_mut().search_is_open() {
+            self.active_transcript_mut().search_handle_key(key);
             return Action::None;
         }
 
@@ -656,27 +698,40 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Tab
+                if key.modifiers.is_empty()
+                    && self.composer.is_empty()
+                    && self.viewing_subagent.is_some() =>
+            {
+                self.cycle_subagent_view();
+                return Action::None;
+            }
             KeyCode::PageUp => {
-                self.transcript.scroll_by(-12);
+                self.active_transcript_mut().scroll_by(-12);
                 return Action::None;
             }
             KeyCode::PageDown => {
-                self.transcript.scroll_by(12);
+                self.active_transcript_mut().scroll_by(12);
                 return Action::None;
             }
             KeyCode::Home
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
-                self.transcript.scroll_to_top();
+                self.active_transcript_mut().scroll_to_top();
                 return Action::None;
             }
             KeyCode::End
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
-                self.transcript.follow_tail();
+                self.active_transcript_mut().follow_tail();
                 return Action::None;
             }
             KeyCode::Esc => {
+                if self.viewing_subagent.is_some() {
+                    self.viewing_subagent = None;
+                    self.flash("Returned to main session");
+                    return Action::None;
+                }
                 if self.btw_card.is_some() {
                     self.btw_card = None;
                     return Action::None;
@@ -718,11 +773,11 @@ impl App {
 
         match key.code {
             KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.transcript.scroll_by(-3);
+                self.active_transcript_mut().scroll_by(-3);
                 return Action::None;
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.transcript.scroll_by(3);
+                self.active_transcript_mut().scroll_by(3);
                 return Action::None;
             }
             // Claude Code: pressing `↑` in an empty composer pops the latest queued follow-up back for editing!
@@ -769,8 +824,8 @@ impl App {
 
     fn handle_mouse(&mut self, kind: MouseEventKind) {
         match kind {
-            MouseEventKind::ScrollUp => self.transcript.scroll_by(-4),
-            MouseEventKind::ScrollDown => self.transcript.scroll_by(4),
+            MouseEventKind::ScrollUp => self.active_transcript_mut().scroll_by(-4),
+            MouseEventKind::ScrollDown => self.active_transcript_mut().scroll_by(4),
             _ => {}
         }
     }
@@ -833,7 +888,12 @@ impl App {
         let area = frame.area();
         let has_approval = !self.approvals.is_empty();
         let has_picker = self.overlay_picker.is_some();
-        let search_open = self.transcript.search_is_open();
+        let search_open = self
+            .viewing_subagent
+            .as_deref()
+            .and_then(|id| self.subagent_transcripts.get(id))
+            .map(|t| t.search_is_open())
+            .unwrap_or_else(|| self.transcript.search_is_open());
         let todo_h: u16 = if !has_approval && !has_picker && area.height > 14 {
             todo_strip_height(&self.todos)
         } else {
@@ -892,18 +952,103 @@ impl App {
             && self
                 .last_delta_at
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(600));
-        self.transcript.render(
-            frame,
-            chunks[0],
-            RenderOpts {
-                repo_path: &self.repo_path,
-                env_summary: &self.env_summary,
-                live_streaming,
-                run_elapsed,
-                dt,
-                motion: self.motion,
-            },
-        );
+        let view_sub_id = self.viewing_subagent.clone();
+        if let Some(sub_id) = view_sub_id.as_deref() {
+            let sub_meta = self.subagents.iter().find(|s| s.id == sub_id).cloned();
+            let sub_running = sub_meta
+                .as_ref()
+                .is_some_and(|s| s.status == SubagentStatus::Running);
+            let sub_elapsed = sub_meta
+                .as_ref()
+                .map(|s| {
+                    s.elapsed_secs
+                        .map(Duration::from_secs)
+                        .unwrap_or_else(|| s.started_at.elapsed())
+                })
+                .unwrap_or_default();
+            let banner_area = Rect {
+                x: chunks[0].x,
+                y: chunks[0].y,
+                width: chunks[0].width,
+                height: 1,
+            };
+            let body_area = Rect {
+                x: chunks[0].x,
+                y: chunks[0].y.saturating_add(1),
+                width: chunks[0].width,
+                height: chunks[0].height.saturating_sub(1),
+            };
+            let role = sub_meta.as_ref().map(|s| s.role.as_str()).unwrap_or("subagent");
+            let state_tag = match sub_meta.as_ref().map(|s| s.status) {
+                Some(SubagentStatus::Running) => "✦ live",
+                Some(SubagentStatus::Completed) => "✓ done",
+                Some(SubagentStatus::Failed) => "✕ failed",
+                None => "◈ view",
+            };
+            let act_part = sub_meta
+                .as_ref()
+                .and_then(|s| s.activity.as_deref())
+                .map(|a| format!(" · {a}"))
+                .unwrap_or_default();
+            let tc_part = sub_meta
+                .as_ref()
+                .filter(|s| s.tool_count > 0)
+                .map(|s| format!(" · {} tools", s.tool_count))
+                .unwrap_or_default();
+            let banner_bg = Color::Rgb(28, 36, 40);
+            let banner_line = Line::from(vec![
+                Span::styled(
+                    format!(" ◈ Subagent [{role}] "),
+                    Style::default()
+                        .fg(Color::Rgb(20, 20, 20))
+                        .bg(BASH_MODE_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {state_tag}{act_part}{tc_part}  "),
+                    Style::default().fg(IVORY).bg(banner_bg),
+                ),
+                Span::styled(
+                    if self.subagents.len() > 1 {
+                        "(Tab next · ^O expand · Esc ← main)"
+                    } else {
+                        "(^O expand · Esc ← main)"
+                    },
+                    Style::default().fg(MUTED).bg(banner_bg),
+                ),
+            ]);
+            frame.render_widget(
+                Paragraph::new(banner_line).style(Style::default().bg(banner_bg)),
+                banner_area,
+            );
+            if let Some(sub_tr) = self.subagent_transcripts.get_mut(sub_id) {
+                sub_tr.render(
+                    frame,
+                    body_area,
+                    RenderOpts {
+                        repo_path: &self.repo_path,
+                        env_summary: &self.env_summary,
+                        live_streaming: sub_running,
+                        run_elapsed: sub_elapsed,
+                        dt,
+                        motion: self.motion,
+                    },
+                );
+            }
+        } else {
+            self.transcript.render(
+                frame,
+                chunks[0],
+                RenderOpts {
+                    repo_path: &self.repo_path,
+                    env_summary: &self.env_summary,
+                    live_streaming,
+                    run_elapsed,
+                    dt,
+                    motion: self.motion,
+                },
+            );
+        }
 
         if todo_h > 0 {
             render_todo_strip(frame, chunks[1], &self.todos);
@@ -951,7 +1096,13 @@ impl App {
         }
 
         if search_open {
-            self.transcript.render_search_bar(frame, chunks[5]);
+            if let Some(sub_id) = self.viewing_subagent.as_deref() {
+                if let Some(sub_tr) = self.subagent_transcripts.get(sub_id) {
+                    sub_tr.render_search_bar(frame, chunks[5]);
+                }
+            } else {
+                self.transcript.render_search_bar(frame, chunks[5]);
+            }
         }
 
         if let Some(picker) = &self.overlay_picker {
@@ -1732,23 +1883,42 @@ mod tests {
         }));
         let cells_before = app.transcript.len();
         app.apply_event(&json!({
-            "ev": "subagent.progress", "id": "sub-1", "role": "scout", "activity": "Read(src/tui/mod.rs)", "turns": 2
+            "ev": "subagent.progress", "id": "sub-1", "role": "scout", "activity": "Read(src/tui/mod.rs)", "turns": 2, "tool_count": 5
         }));
         app.apply_event(&json!({
-            "ev": "subagent.progress", "id": "sub-2", "role": "scout", "activity": "Grep(SubagentPool)", "turns": 1
+            "ev": "subagent.progress", "id": "sub-2", "role": "scout", "activity": "Grep(SubagentPool)", "turns": 1, "tool_count": 2
         }));
-        // Out-of-band progress must never pollute the main transcript (0-token UI guarantee).
+        app.apply_event(&json!({
+            "ev": "subagent.stream", "id": "sub-1", "role": "scout",
+            "child": {"ev": "model.delta", "text": "Subagent-1 live finding: TUI uses Ratatui."}
+        }));
+        app.apply_event(&json!({
+            "ev": "subagent.stream", "id": "sub-2", "role": "scout",
+            "child": {"ev": "model.delta", "text": "Subagent-2 live finding: Tools run via mpsc."}
+        }));
+        // Out-of-band progress and child stream must never pollute the main transcript (0-token UI guarantee).
         assert_eq!(app.transcript.len(), cells_before);
-        let strip_frame = render_frame_text(&mut app, 120, 28);
-        assert!(strip_frame.contains("Read(src/tui/mod.rs) · t2"));
-        assert!(strip_frame.contains("Grep(SubagentPool) · t1"));
+        let strip_frame = render_frame_text(&mut app, 128, 28);
+        assert!(strip_frame.contains("Read(src/tui/mod.rs) · 5 tools · t2"));
+        assert!(strip_frame.contains("Grep(SubagentPool) · 2 tools · t1"));
 
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(app.overlay_picker, Some(OverlayPicker::Tasks { .. })));
         app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
         let drawer_frame = render_frame_text(&mut app, 120, 28);
         assert!(drawer_frame.contains("trace (t2): Read(src/tui/mod.rs)"));
+
+        // Codex-style live view switcher: `v` enters sub-1 live stream, `Tab` cycles to sub-2, `Esc` returns to main!
+        app.handle_key(press(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-1"));
+        let sub1_frame = render_frame_text(&mut app, 120, 28);
+        assert!(sub1_frame.contains("Subagent [scout]") && sub1_frame.contains("Subagent-1 live finding"));
+        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-2"));
+        let sub2_frame = render_frame_text(&mut app, 120, 28);
+        assert!(sub2_frame.contains("Subagent-2 live finding"));
         app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.viewing_subagent.is_none());
 
         // Scrolling up must NEVER snap back to bottom when background tools/deltas stream in.
         app.transcript.clear();

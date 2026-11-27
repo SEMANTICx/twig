@@ -493,6 +493,7 @@ pub struct SubagentEntry {
     pub error: Option<String>,
     pub activity: Option<String>,
     pub turns: u32,
+    pub tool_count: u32,
     pub trace: Vec<String>,
 }
 
@@ -686,13 +687,24 @@ pub fn render_subagent_strip(
         };
         let live_suffix = if entry.status == SubagentStatus::Running {
             entry.activity.as_deref().map(|act| {
-                let compact_act = clip_str(act, task_cap.min(40));
-                if entry.turns > 0 {
-                    format!(" · {compact_act} · t{}", entry.turns)
+                let compact_act = clip_str(act, task_cap.min(34));
+                let tc = if entry.tool_count > 0 {
+                    format!(" · {} tool{}", entry.tool_count, if entry.tool_count == 1 { "" } else { "s" })
                 } else {
-                    format!(" · {compact_act}")
+                    String::new()
+                };
+                if entry.turns > 0 {
+                    format!(" · {compact_act}{tc} · t{}", entry.turns)
+                } else {
+                    format!(" · {compact_act}{tc}")
                 }
             })
+        } else if entry.tool_count > 0 {
+            Some(format!(
+                " · {} tool{}",
+                entry.tool_count,
+                if entry.tool_count == 1 { "" } else { "s" }
+            ))
         } else {
             None
         };
@@ -784,6 +796,7 @@ pub enum PickerOutcome {
     ForkSession,
     FillComposer(String),
     ToggleResumeScope,
+    ViewSubagent(String),
     CancelTask(String),
     SaveMemory {
         note: String,
@@ -1188,6 +1201,9 @@ impl OverlayPicker {
                         *sel = (*sel + 1).min(total - 1);
                         PickerOutcome::None
                     }
+                    KeyCode::Char('v' | 'V') | KeyCode::Right if *sel < subagents.len() => {
+                        PickerOutcome::ViewSubagent(subagents[*sel].id.clone())
+                    }
                     KeyCode::Enter | KeyCode::Char(' ') if total > 0 => {
                         *expanded = !*expanded;
                         PickerOutcome::None
@@ -1283,7 +1299,7 @@ fn render_tasks_picker(
         Line::from(Span::styled(rule.clone(), Style::default().fg(BASH_MODE_COLOR))),
         Line::from(Span::styled(
             format!(
-                "  Subagents ({}) & Background Tasks ({})  (↑/↓ select · Enter expand · x kill task · Esc close)",
+                "  Subagents ({}) & Tasks ({})  (↑/↓ · v view live · Enter trace · x kill · Esc)",
                 subagents.len(),
                 tasks.len()
             ),
@@ -1331,18 +1347,17 @@ fn render_tasks_picker(
                         s.trace.join(" → ")
                     ));
                 }
+                let tc = if s.tool_count > 0 {
+                    format!(" · {}t", s.tool_count)
+                } else {
+                    String::new()
+                };
                 let live_tag = s
                     .activity
                     .as_deref()
                     .filter(|_| s.status == SubagentStatus::Running)
-                    .map(|act| {
-                        if s.turns > 0 {
-                            format!(" · {act} · t{}", s.turns)
-                        } else {
-                            format!(" · {act}")
-                        }
-                    })
-                    .unwrap_or_default();
+                    .map(|act| format!(" · {act}{tc}"))
+                    .unwrap_or(tc);
                 (
                     st,
                     col,

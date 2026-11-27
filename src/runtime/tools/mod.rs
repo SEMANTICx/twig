@@ -1028,14 +1028,12 @@ impl Tools {
                             }
                         }
                         composed_task.push_str(spec.task);
-                        let progress_cb = |activity: &str, turns: u32| {
-                            let _ = tx.send(json!({
-                                "ev": "subagent.progress",
-                                "id": cid,
-                                "role": spec.role_name,
-                                "activity": activity,
-                                "turns": turns,
-                            }));
+                        let event_cb = |mut ev: Value| {
+                            if let Some(obj) = ev.as_object_mut() {
+                                obj.insert("id".into(), Value::String(cid.clone()));
+                                obj.insert("role".into(), Value::String(spec.role_name.to_owned()));
+                            }
+                            let _ = tx.send(ev);
                         };
                         let run = pool.run_resumable_live(
                             spec.role,
@@ -1045,7 +1043,7 @@ impl Tools {
                             spec.resume_sid,
                             parent_artifacts,
                             spec.fork_context.then_some(parent_messages).flatten(),
-                            Some(&progress_cb),
+                            Some(&event_cb),
                         );
                         let elapsed_secs = started.elapsed().as_secs();
                         match run {
