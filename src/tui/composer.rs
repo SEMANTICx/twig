@@ -17,7 +17,8 @@ use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use super::markdown::{
-    display_width, wrap_plain, ACCENT, ACCENT_PEAK, IVORY, MUTED, STONE, SURFACE_HI,
+    display_width, wrap_plain, ACCENT, ACCENT_PEAK, BASH_MODE_COLOR, IVORY, MEMORY_MODE_COLOR,
+    MUTED, STONE, SURFACE_HI,
 };
 
 /// Codex & Claude Code parity slash command catalog.
@@ -121,6 +122,7 @@ pub enum SlashCommand {
     AttachImage(Option<String>),
     ClearImages,
     ListTasks,
+    CancelTask(String),
     ManageMcp {
         action: String,
         server: Option<String>,
@@ -525,6 +527,15 @@ impl Composer {
         self.text.is_empty()
     }
 
+    #[cfg(test)]
+    pub fn raw_text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_browsing_history(&self) -> bool {
+        self.history_idx.is_some()
+    }
+
     pub fn draft_expanded(&self) -> String {
         self.expand_pastes(&self.text)
     }
@@ -911,6 +922,10 @@ impl Composer {
             .unwrap_or(0);
         let token = &before[token_start..];
         if let Some(query) = token.strip_prefix('@') {
+            if query.contains('#') || query.contains(':') {
+                // User is specifying a `#L10-50` or `:10-50` line slice; stay out of the way!
+                return None;
+            }
             let q = query.to_lowercase();
             let mut items: Vec<String> = ["diff", "staged", "last"]
                 .into_iter()
@@ -1017,11 +1032,43 @@ impl Composer {
         };
         let pad_str = " ".repeat(pad_x as usize);
         let rule_len = area.width.saturating_sub(pad_x * 2) as usize;
-        let rule_line = format!("{pad_str}{}", "─".repeat(rule_len));
-        let rule_style = Style::default().fg(rule_color);
+        let is_bash = self.text.starts_with('!');
+        let is_mem = self.text.starts_with('#') && !self.text.contains('\n');
+        let (eff_rule_color, eff_prompt_color, glyph, mode_badge) = if is_bash {
+            (BASH_MODE_COLOR, BASH_MODE_COLOR, "$ ", Some(" ! bash mode · runs locally "))
+        } else if is_mem {
+            (
+                MEMORY_MODE_COLOR,
+                MEMORY_MODE_COLOR,
+                "♯ ",
+                Some(" # memory mode · Enter saves to preferences.md "),
+            )
+        } else {
+            (rule_color, prompt_color, "❯ ", None)
+        };
+        let rule_style = Style::default().fg(eff_rule_color);
+        let top_rule = if let Some(badge) = mode_badge.filter(|b| rule_len > b.len() + 6) {
+            let rem = rule_len.saturating_sub(display_width(badge) + 3);
+            Line::from(vec![
+                Span::styled(format!("{pad_str}───"), rule_style),
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(eff_rule_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("─".repeat(rem), rule_style),
+            ])
+        } else {
+            Line::from(Span::styled(
+                format!("{pad_str}{}", "─".repeat(rule_len)),
+                rule_style,
+            ))
+        };
+        let bot_rule = format!("{pad_str}{}", "─".repeat(rule_len));
 
         frame.render_widget(
-            Paragraph::new(Span::styled(rule_line.clone(), rule_style)),
+            Paragraph::new(top_rule),
             Rect {
                 x: area.x,
                 y: area.y,
@@ -1030,7 +1077,7 @@ impl Composer {
             },
         );
         frame.render_widget(
-            Paragraph::new(Span::styled(rule_line, rule_style)),
+            Paragraph::new(Span::styled(bot_rule, rule_style)),
             Rect {
                 x: area.x,
                 y: area.y + area.height - 1,
@@ -1045,7 +1092,7 @@ impl Composer {
             width: area.width,
             height: area.height.saturating_sub(2).max(1),
         };
-        let prompt_head = format!("{pad_str}❯ ");
+        let prompt_head = format!("{pad_str}{glyph}");
         let prompt_cont = format!("{pad_str}  ");
         let prompt_cols = pad_x + 2;
         let text_w = area
@@ -1058,7 +1105,7 @@ impl Composer {
                 Span::styled(
                     prompt_head.clone(),
                     Style::default()
-                        .fg(prompt_color)
+                        .fg(eff_prompt_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(placeholder.to_owned(), Style::default().fg(MUTED)),
@@ -1076,7 +1123,7 @@ impl Composer {
                     let mut spans = vec![Span::styled(
                         prefix,
                         Style::default()
-                            .fg(prompt_color)
+                            .fg(eff_prompt_color)
                             .add_modifier(Modifier::BOLD),
                     )];
                     spans.extend(style_composer_segment(&segment));

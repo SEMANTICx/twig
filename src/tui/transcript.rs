@@ -618,38 +618,66 @@ impl Transcript {
                     if prev_non_empty && !prev_is_trace {
                         lines.push(Line::from(""));
                     }
+                    let is_edit_tool = matches!(tool.name.as_str(), "edit" | "write" | "apply_patch");
                     let elapsed_dur = tool.elapsed.unwrap_or_else(|| tool.started_at.elapsed());
                     let icon_span = if !tool.finished {
                         breathing_star(elapsed_dur, motion, true)
                     } else if tool.exit_code.is_none() || tool.exit_code == Some(0) {
-                        Span::styled("◦", Style::default().fg(SAGE))
+                        Span::styled(
+                            if is_edit_tool { "●" } else { "◦" },
+                            Style::default().fg(SAGE).add_modifier(if is_edit_tool {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                        )
                     } else {
                         Span::styled("✕", Style::default().fg(ROSE).add_modifier(Modifier::BOLD))
                     };
 
-                    let summary_cap = inner.saturating_sub(32).clamp(16, 88);
+                    let display_title = match tool.name.as_str() {
+                        "edit" | "apply_patch" => "Update".to_owned(),
+                        other => title_tool_name(other),
+                    };
+                    let summary_cap = inner.saturating_sub(34).clamp(16, 88);
                     let mut header = vec![
                         Span::raw(left_margin.clone()),
                         icon_span,
                         Span::raw(" "),
-                        Span::styled(
+                    ];
+                    if !is_edit_tool {
+                        header.push(Span::styled(
                             format!("{} ", tool_glyph(&tool.name)),
                             Style::default().fg(MUTED),
-                        ),
-                        Span::styled(
-                            title_tool_name(&tool.name),
-                            Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
-                        ),
-                    ];
+                        ));
+                    }
+                    header.push(Span::styled(
+                        display_title,
+                        Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
+                    ));
                     if !tool.summary.is_empty() {
                         header.push(Span::styled("(", Style::default().fg(MUTED)));
                         header.push(Span::styled(
                             clip_str(&tool.summary, summary_cap),
-                            Style::default().fg(STONE),
+                            Style::default().fg(if is_edit_tool { IVORY } else { STONE }),
                         ));
                         header.push(Span::styled(")", Style::default().fg(MUTED)));
                     }
-                    if tool.tier != "auto" {
+                    if is_edit_tool && tool.finished && tool.exit_code.unwrap_or(0) == 0 {
+                        let (ins, del) = count_diff_changes(&tool.output);
+                        if ins > 0 {
+                            header.push(Span::styled(
+                                format!("  +{ins}"),
+                                Style::default().fg(SAGE).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        if del > 0 {
+                            header.push(Span::styled(
+                                format!(" -{del}"),
+                                Style::default().fg(ROSE).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                    } else if tool.tier != "auto" {
                         header.push(Span::styled(
                             format!(" · {}", tool.tier),
                             Style::default().fg(AMBER),
@@ -662,12 +690,27 @@ impl Transcript {
                     header.push(Span::styled(meta, Style::default().fg(MUTED)));
                     lines.push(Line::from(header));
 
-                    let out_lines: Vec<&str> = tool.output.lines().collect();
+                    let raw_lines: Vec<&str> = tool.output.lines().collect();
+                    // Strip noisy `diff --git` / `--- a/` / `+++ b/` headers on compact `Update` blocks.
+                    let out_lines: Vec<&str> = if is_edit_tool && !self.expand_tools {
+                        raw_lines
+                            .into_iter()
+                            .filter(|l| {
+                                !(l.starts_with("diff --git ")
+                                    || l.starts_with("--- ")
+                                    || l.starts_with("+++ "))
+                            })
+                            .collect()
+                    } else {
+                        raw_lines
+                    };
                     if !out_lines.is_empty() {
-                        let is_local_expanded = tool.tier == "local"
-                            || matches!(tool.name.as_str(), "diff" | "edit" | "apply_patch");
-                        let show_lines = if self.expand_tools || is_local_expanded {
+                        let is_diff_like = tool.tier == "local"
+                            || matches!(tool.name.as_str(), "diff" | "edit" | "write" | "apply_patch");
+                        let show_lines = if self.expand_tools || tool.tier == "local" || tool.name == "diff" {
                             200
+                        } else if is_edit_tool {
+                            8
                         } else if !tool.finished {
                             5
                         } else if tool.exit_code.is_some_and(|c| c != 0) {
@@ -676,9 +719,8 @@ impl Transcript {
                             1
                         };
                         let total = out_lines.len();
-                        let skip = total.saturating_sub(show_lines);
                         let is_compact_summary = !self.expand_tools
-                            && !is_local_expanded
+                            && !is_diff_like
                             && tool.finished
                             && tool.exit_code.unwrap_or(0) == 0;
 
@@ -702,9 +744,42 @@ impl Transcript {
                                 ));
                             }
                             lines.push(Line::from(spans));
-                        } else {
+                        } else if is_edit_tool && !self.expand_tools {
+                            // Claude Code compact edit hunk: show first `show_lines` lines (preserving `@@` header) + `… +N more lines` tail!
+                            let take_n = total.min(show_lines);
+                            let rem = total.saturating_sub(take_n);
                             let mut first_row = true;
                             let mut gutter = DiffGutterState::default();
+                            for row_spans in gutter.render_block(&out_lines[..take_n], inner.saturating_sub(8)) {
+                                let branch = if first_row { "  ⎿  " } else { "     " };
+                                first_row = false;
+                                let mut spans = vec![
+                                    Span::raw(left_margin.clone()),
+                                    Span::styled(branch, Style::default().fg(MUTED)),
+                                ];
+                                spans.extend(row_spans);
+                                lines.push(Line::from(spans));
+                            }
+                            if rem > 0 {
+                                lines.push(Line::from(vec![
+                                    Span::raw(left_margin.clone()),
+                                    Span::raw("     "),
+                                    Span::styled(
+                                        format!("… +{rem} lines (^O expand)"),
+                                        Style::default().fg(MUTED),
+                                    ),
+                                ]));
+                            }
+                        } else {
+                            let skip = total.saturating_sub(show_lines);
+                            let mut first_row = true;
+                            let mut gutter = DiffGutterState::default();
+                            // Feed skipped `@@` headers so line numbers in visible tail stay accurate!
+                            for &skipped in &out_lines[..skip] {
+                                if skipped.starts_with("@@ ") {
+                                    let _ = gutter.render_line(skipped, inner.saturating_sub(8));
+                                }
+                            }
                             if skip > 0 {
                                 lines.push(Line::from(vec![
                                     Span::raw(left_margin.clone()),
@@ -716,17 +791,15 @@ impl Transcript {
                                 ]));
                                 first_row = false;
                             }
-                            for raw in &out_lines[skip..] {
-                                for row_spans in gutter.render_line(raw, inner.saturating_sub(8)) {
-                                    let branch = if first_row { "  ⎿  " } else { "     " };
-                                    first_row = false;
-                                    let mut spans = vec![
-                                        Span::raw(left_margin.clone()),
-                                        Span::styled(branch, Style::default().fg(MUTED)),
-                                    ];
-                                    spans.extend(row_spans);
-                                    lines.push(Line::from(spans));
-                                }
+                            for row_spans in gutter.render_block(&out_lines[skip..], inner.saturating_sub(8)) {
+                                let branch = if first_row { "  ⎿  " } else { "     " };
+                                first_row = false;
+                                let mut spans = vec![
+                                    Span::raw(left_margin.clone()),
+                                    Span::styled(branch, Style::default().fg(MUTED)),
+                                ];
+                                spans.extend(row_spans);
+                                lines.push(Line::from(spans));
                             }
                         }
                     }
@@ -834,7 +907,13 @@ impl Transcript {
         left_margin: &str,
         inner: usize,
     ) -> Option<(usize, Line<'static>)> {
-        let is_foldable_tool = |t: &ToolCell| -> bool { t.finished && t.tier != "local" };
+        // Keep file-mutating tools (`edit`, `write`, `apply_patch`) visible as crisp `Update(...)`
+        // cards with word-level diff hunks rather than swallowing them into exploration folds.
+        let is_foldable_tool = |t: &ToolCell| -> bool {
+            t.finished
+                && t.tier != "local"
+                && !matches!(t.name.as_str(), "edit" | "write" | "apply_patch")
+        };
         let is_foldable_notice = |kind: NoticeKind, text: &str| -> bool {
             match kind {
                 NoticeKind::Error => false,
@@ -1181,6 +1260,19 @@ impl Transcript {
         }
         out
     }
+}
+
+fn count_diff_changes(diff_text: &str) -> (usize, usize) {
+    let mut ins = 0usize;
+    let mut del = 0usize;
+    for l in diff_text.lines() {
+        if l.starts_with('+') && !l.starts_with("+++ ") {
+            ins += 1;
+        } else if l.starts_with('-') && !l.starts_with("--- ") {
+            del += 1;
+        }
+    }
+    (ins, del)
 }
 
 #[cfg(test)]

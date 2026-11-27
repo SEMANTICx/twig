@@ -28,9 +28,13 @@ pub const HAIRLINE_FOCUS_RGB: (u8, u8, u8) = (154, 122, 104); // warm active hai
 pub const SURFACE_RGB: (u8, u8, u8) = (38, 35, 32); // #262320 warm subtle surface
 pub const SURFACE_HI_RGB: (u8, u8, u8) = (56, 49, 44); // #38312C selected row highlight
 
-/// Codex `diff_render.rs` dark TrueColor diff background tints.
+/// Codex/Claude dark TrueColor diff line & intra-line word-diff background tints.
 const DARK_TC_ADD_LINE_BG: Color = Color::Rgb(33, 58, 43); // #213A2B
 const DARK_TC_DEL_LINE_BG: Color = Color::Rgb(74, 34, 29); // #4A221D
+const DARK_TC_ADD_WORD_BG: Color = Color::Rgb(46, 108, 66); // #2E6C42 intra-line added token
+const DARK_TC_DEL_WORD_BG: Color = Color::Rgb(132, 48, 42); // #84302A intra-line removed token
+pub const BASH_MODE_COLOR: Color = Color::Rgb(110, 198, 216); // Claude `!` bash mode cyan
+pub const MEMORY_MODE_COLOR: Color = Color::Rgb(186, 148, 236); // Claude `#` memory mode lavender
 
 pub const ACCENT: Color = Color::Rgb(ACCENT_RGB.0, ACCENT_RGB.1, ACCENT_RGB.2);
 pub const ACCENT_PEAK: Color = Color::Rgb(ACCENT_PEAK_RGB.0, ACCENT_PEAK_RGB.1, ACCENT_PEAK_RGB.2);
@@ -261,6 +265,51 @@ pub struct DiffGutterState {
 
 impl DiffGutterState {
     pub fn render_line(&mut self, raw: &str, max_width: usize) -> Vec<Vec<Span<'static>>> {
+        self.render_line_paired(raw, None, max_width)
+    }
+
+    /// Render a slice of unified-diff lines, pairing consecutive `-` and `+` blocks
+    /// so changed tokens within modified lines get crisp Claude-style intra-line highlights.
+    pub fn render_block(&mut self, lines: &[&str], max_width: usize) -> Vec<Vec<Span<'static>>> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].starts_with('-') && !lines[i].starts_with("--- ") {
+                let del_start = i;
+                while i < lines.len() && lines[i].starts_with('-') && !lines[i].starts_with("--- ") {
+                    i += 1;
+                }
+                let del_end = i;
+                let add_start = i;
+                while i < lines.len() && lines[i].starts_with('+') && !lines[i].starts_with("+++ ") {
+                    i += 1;
+                }
+                let add_end = i;
+                let del_slice = &lines[del_start..del_end];
+                let add_slice = &lines[add_start..add_end];
+                let paired = del_slice.len().min(add_slice.len());
+                for (k, &dl) in del_slice.iter().enumerate() {
+                    let peer = (k < paired).then(|| &add_slice[k][1..]);
+                    out.extend(self.render_line_paired(dl, peer, max_width));
+                }
+                for (k, &al) in add_slice.iter().enumerate() {
+                    let peer = (k < paired).then(|| &del_slice[k][1..]);
+                    out.extend(self.render_line_paired(al, peer, max_width));
+                }
+            } else {
+                out.extend(self.render_line_paired(lines[i], None, max_width));
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn render_line_paired(
+        &mut self,
+        raw: &str,
+        peer_body: Option<&str>,
+        max_width: usize,
+    ) -> Vec<Vec<Span<'static>>> {
         if let Some((old_n, new_n)) = parse_hunk_header(raw) {
             self.old_line = Some(old_n);
             self.new_line = Some(new_n);
@@ -284,7 +333,7 @@ impl DiffGutterState {
         }
 
         let in_hunk = self.old_line.is_some() && self.new_line.is_some();
-        let (gutter_num, sign, body, line_style) = if let Some(rest) = raw.strip_prefix('+') {
+        let (gutter_num, sign, body, line_style, word_bg) = if let Some(rest) = raw.strip_prefix('+') {
             let num = self.new_line.inspect(|&n| {
                 self.new_line = Some(n + 1);
             });
@@ -293,6 +342,7 @@ impl DiffGutterState {
                 Some('+'),
                 rest,
                 Style::default().fg(SAGE).bg(DARK_TC_ADD_LINE_BG),
+                Some(DARK_TC_ADD_WORD_BG),
             )
         } else if let Some(rest) = raw.strip_prefix('-') {
             let num = self.old_line.inspect(|&n| {
@@ -303,6 +353,7 @@ impl DiffGutterState {
                 Some('-'),
                 rest,
                 Style::default().fg(ROSE).bg(DARK_TC_DEL_LINE_BG),
+                Some(DARK_TC_DEL_WORD_BG),
             )
         } else if in_hunk && raw.starts_with(' ') {
             let num = self.new_line.inspect(|&n| {
@@ -311,7 +362,7 @@ impl DiffGutterState {
             if let Some(o) = self.old_line {
                 self.old_line = Some(o + 1);
             }
-            (num, Some(' '), &raw[1..], Style::default().fg(STONE))
+            (num, Some(' '), &raw[1..], Style::default().fg(STONE), None)
         } else {
             return wrap_plain(raw, max_width)
                 .into_iter()
@@ -325,6 +376,38 @@ impl DiffGutterState {
         let sign_ch = sign.unwrap_or(' ');
         let gutter_bg = line_style.bg.unwrap_or(Color::Reset);
         let gutter_style = Style::default().fg(MUTED).bg(gutter_bg);
+
+        // Single-line intra-line word highlight when line fits within `content_w` and has a paired peer.
+        if let (Some(peer), Some(hi_bg)) = (peer_body, word_bg) {
+            if display_width(body) <= content_w {
+                let (pre, mid, suf) = split_intraline_change(body, peer);
+                if !mid.is_empty() && ( !pre.is_empty() || !suf.is_empty() ) {
+                    let mut spans = Vec::with_capacity(6);
+                    if show_gutter {
+                        if let Some(n) = gutter_num {
+                            spans.push(Span::styled(format!("{n:>4} "), gutter_style));
+                        }
+                    }
+                    spans.push(Span::styled(format!("{sign_ch} "), line_style));
+                    if !pre.is_empty() {
+                        spans.push(Span::styled(pre.to_owned(), line_style));
+                    }
+                    spans.push(Span::styled(
+                        mid.to_owned(),
+                        Style::default()
+                            .fg(IVORY)
+                            .bg(hi_bg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    let pad = content_w.saturating_sub(display_width(body));
+                    spans.push(Span::styled(
+                        format!("{suf}{}", " ".repeat(pad)),
+                        line_style,
+                    ));
+                    return vec![spans];
+                }
+            }
+        }
 
         wrap_plain(body, content_w)
             .into_iter()
@@ -362,6 +445,29 @@ impl DiffGutterState {
             })
             .collect()
     }
+}
+
+fn split_intraline_change<'a>(line: &'a str, peer: &str) -> (&'a str, &'a str, &'a str) {
+    let lc: Vec<(usize, char)> = line.char_indices().collect();
+    let pc: Vec<char> = peer.chars().collect();
+    let mut pre_n = 0usize;
+    while pre_n < lc.len() && pre_n < pc.len() && lc[pre_n].1 == pc[pre_n] {
+        pre_n += 1;
+    }
+    let mut suf_n = 0usize;
+    while pre_n + suf_n < lc.len()
+        && pre_n + suf_n < pc.len()
+        && lc[lc.len() - 1 - suf_n].1 == pc[pc.len() - 1 - suf_n]
+    {
+        suf_n += 1;
+    }
+    let start_b = lc.get(pre_n).map_or(line.len(), |&(b, _)| b);
+    let end_b = if suf_n == 0 {
+        line.len()
+    } else {
+        lc[lc.len() - suf_n].0
+    };
+    (&line[..start_b], &line[start_b..end_b], &line[end_b..])
 }
 
 fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
@@ -1405,15 +1511,15 @@ pub fn shortcut_overlay_lines(width: usize) -> Vec<Line<'static>> {
         ),
         row(
             "Shift+Tab",
-            "toggle plan mode (RO)",
-            "! · @ · $ · /",
-            "shell · file · skill · cmd",
+            "cycle edit / plan / gate",
+            "! · # · @ · /",
+            "bash · mem · file · cmd",
         ),
         row(
-            "Ctrl+O",
-            "expand/collapse tools",
-            "Ctrl+F",
-            "search transcript",
+            "Ctrl+O / Ctrl+T",
+            "fold tools / tasks drawer",
+            "Ctrl+B / Ctrl+F",
+            "detach bg / search chat",
         ),
         row(
             "Ctrl+G",
@@ -1448,6 +1554,7 @@ pub struct FooterView<'a> {
     pub title: Option<&'a str>,
     pub sid: &'a str,
     pub plan_mode: bool,
+    pub gate_edits: bool,
     pub operator_mode: bool,
     pub pending_images: usize,
     pub running_tasks: usize,
@@ -1633,6 +1740,11 @@ pub fn render_footer(frame: &mut Frame, area: Rect, view: &FooterView<'_>) {
         if view.plan_mode {
             spans.push(Span::styled(
                 if compact { " · ◈" } else { " · ◈ plan" },
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ));
+        } else if view.gate_edits {
+            spans.push(Span::styled(
+                if compact { " · 🔒" } else { " · 🔒 review-edits" },
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
             ));
         }

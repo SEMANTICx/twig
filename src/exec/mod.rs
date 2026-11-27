@@ -295,6 +295,24 @@ pub fn run_live(
             kill_group(child_ref.id());
             break (130, false);
         }
+        if control.take_background_request() {
+            let pid = child_ref.id();
+            drain_once(&mut reader, &mut saw_eof)?;
+            let mut text = format_live_output(&bytes, discarded, false, timeout);
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!(
+                "[detached to background via Ctrl+B (pid {pid}) — process continues running in session]"
+            ));
+            let owner = finalize_live_owner(owner, false);
+            return Ok(Output {
+                text,
+                exit_code: Some(0),
+                timed_out: false,
+                owner,
+            });
+        }
         if Instant::now() >= deadline {
             kill_group(child_ref.id());
             break (124, true);

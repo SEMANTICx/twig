@@ -43,8 +43,9 @@ use self::markdown::{
     MUTED,
 };
 use self::overlays::{
+    btw_card_height, queued_strip_height, render_btw_card, render_queued_strip,
     render_subagent_strip, render_todo_strip, subagent_strip_height, title_tool_name,
-    todo_strip_height, ApprovalKeyResult, ApprovalQueue, OverlayPicker, PickerOutcome,
+    todo_strip_height, ApprovalKeyResult, ApprovalQueue, BtwCard, OverlayPicker, PickerOutcome,
     SubagentEntry, SubagentStatus, TodoEntry,
 };
 use self::transcript::{NoticeKind, RenderOpts, Transcript};
@@ -73,12 +74,18 @@ enum Action {
     SendTurn(String),
     SendSteer(String),
     Cancel,
+    BackgroundActive,
     ResolveApproval {
         id: String,
         allow: bool,
         remember: bool,
+        note: Option<String>,
     },
     SetPlan(bool),
+    SetMode {
+        plan: bool,
+        gate_edits: bool,
+    },
     SetEffort(String),
     SwitchSession(String),
     SetModel(String),
@@ -102,6 +109,7 @@ struct App {
     model: String,
     effort: Option<String>,
     plan_mode: bool,
+    gate_edits: bool,
     operator_mode: bool,
     study_mode: bool,
     playbook: Option<String>,
@@ -139,8 +147,11 @@ struct App {
     last_shell_cmd: Option<String>,
     last_shell: Option<(String, String, Option<i32>)>,
     running_tasks: usize,
+    cached_tasks: Vec<Value>,
+    open_tasks_drawer: bool,
     todos: Vec<TodoEntry>,
     subagents: Vec<SubagentEntry>,
+    btw_card: Option<BtwCard>,
     pending_images: Vec<(String, String)>,
     transcript: Transcript,
     approvals: ApprovalQueue,
@@ -181,6 +192,7 @@ impl App {
             model: provider.roles().get("code").to_owned(),
             effort: provider.effort(),
             plan_mode: false,
+            gate_edits: false,
             operator_mode: false,
             study_mode: false,
             playbook: None,
@@ -218,8 +230,11 @@ impl App {
             last_shell_cmd: None,
             last_shell: None,
             running_tasks: 0,
+            cached_tasks: Vec::new(),
+            open_tasks_drawer: false,
             todos: Vec::new(),
             subagents: Vec::new(),
+            btw_card: None,
             pending_images: Vec::new(),
             transcript: Transcript::new(),
             approvals: ApprovalQueue::default(),
@@ -241,6 +256,7 @@ impl App {
         self.sid.clear();
         self.title = None;
         self.plan_mode = false;
+        self.gate_edits = false;
         self.operator_mode = false;
         self.study_mode = false;
         self.playbook = None;
@@ -271,8 +287,11 @@ impl App {
         self.queued_turns.clear();
         self.auto_send_next = None;
         self.running_tasks = 0;
+        self.cached_tasks.clear();
+        self.open_tasks_drawer = false;
         self.todos.clear();
         self.subagents.clear();
+        self.btw_card = None;
         self.pending_images.clear();
         self.transcript.clear();
         self.approvals.clear();
@@ -451,6 +470,15 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('d') if self.composer.is_empty() => return Action::Quit,
+                KeyCode::Char('b') if self.running => return Action::BackgroundActive,
+                KeyCode::Char('t') => {
+                    if matches!(self.overlay_picker, Some(OverlayPicker::Tasks { .. })) {
+                        self.overlay_picker = None;
+                        return Action::None;
+                    }
+                    self.open_tasks_drawer = true;
+                    return Action::Slash(SlashCommand::ListTasks);
+                }
                 KeyCode::Char('o') => {
                     let expanded = self.transcript.toggle_expand();
                     self.flash(if expanded {
@@ -534,6 +562,22 @@ impl App {
                     self.composer.set(&entry);
                     Action::None
                 }
+                PickerOutcome::CancelTask(task_id) => {
+                    self.overlay_picker = None;
+                    Action::Slash(SlashCommand::CancelTask(task_id))
+                }
+                PickerOutcome::SaveMemory { note, global } => {
+                    self.overlay_picker = None;
+                    match self::client::append_quick_memory(&self.repo_raw, &note, global) {
+                        Ok(where_saved) => {
+                            let msg = format!("Saved memory to {where_saved}: {note}");
+                            self.flash(&msg);
+                            self.transcript.push_notice(NoticeKind::Success, msg);
+                        }
+                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                    }
+                    Action::None
+                }
             };
         }
 
@@ -549,17 +593,42 @@ impl App {
                 id,
                 allow,
                 remember,
+                note,
             } => {
                 return Action::ResolveApproval {
                     id,
                     allow,
                     remember,
+                    note,
                 };
             }
         }
 
         if key.code == KeyCode::BackTab {
-            return Action::SetPlan(!self.plan_mode);
+            // Claude Code 3-mode Shift+Tab cycle:
+            // Default (auto-accept workspace edits) -> Plan (read-only) -> Review Edits (gate edits) -> Default
+            return if !self.plan_mode && !self.gate_edits {
+                Action::SetPlan(true)
+            } else if self.plan_mode {
+                Action::SetMode {
+                    plan: false,
+                    gate_edits: true,
+                }
+            } else {
+                Action::SetMode {
+                    plan: false,
+                    gate_edits: false,
+                }
+            };
+        }
+
+        if matches!(key.code, KeyCode::Char(' '))
+            && key.modifiers.is_empty()
+            && self.composer.is_empty()
+            && self.btw_card.is_some()
+        {
+            self.btw_card = None;
+            return Action::None;
         }
 
         if matches!(key.code, KeyCode::Char('?'))
@@ -599,6 +668,10 @@ impl App {
                 return Action::None;
             }
             KeyCode::Esc => {
+                if self.btw_card.is_some() {
+                    self.btw_card = None;
+                    return Action::None;
+                }
                 if self.footer_mode == FooterMode::ShortcutOverlay {
                     self.set_footer_mode(FooterMode::Contextual);
                     return Action::None;
@@ -643,6 +716,38 @@ impl App {
                 self.transcript.scroll_by(3);
                 return Action::None;
             }
+            // Claude Code: pressing `↑` in an empty composer pops the latest queued follow-up back for editing!
+            KeyCode::Up
+                if key.modifiers.is_empty()
+                    && self.composer.is_empty()
+                    && !self.composer.is_browsing_history()
+                    && !self.queued_turns.is_empty() =>
+            {
+                if let Some(popped) = self.queued_turns.pop_back() {
+                    self.composer.set(&popped);
+                    self.flash("Popped queued follow-up into composer for editing");
+                }
+                return Action::None;
+            }
+            // Claude Code: pressing `↓` in an empty composer focuses the Subagents & Tasks drawer!
+            KeyCode::Down
+                if key.modifiers.is_empty()
+                    && self.composer.is_empty()
+                    && !self.composer.is_browsing_history()
+                    && (!self.subagents.is_empty()
+                        || self.running_tasks > 0
+                        || !self.cached_tasks.is_empty()) =>
+            {
+                if self.running_tasks > 0 && self.cached_tasks.is_empty() {
+                    self.open_tasks_drawer = true;
+                    return Action::Slash(SlashCommand::ListTasks);
+                }
+                self.overlay_picker = Some(OverlayPicker::tasks(
+                    self.subagents.clone(),
+                    self.cached_tasks.clone(),
+                ));
+                return Action::None;
+            }
             _ => {}
         }
 
@@ -677,6 +782,7 @@ impl App {
             title: self.title.as_deref(),
             sid: &self.sid,
             plan_mode: self.plan_mode,
+            gate_edits: self.gate_edits,
             operator_mode: self.operator_mode,
             pending_images: self.pending_images.len(),
             running_tasks: self.running_tasks,
@@ -724,6 +830,16 @@ impl App {
         } else {
             0
         };
+        let btw_h: u16 = if !has_approval && !has_picker && area.height > 14 {
+            btw_card_height(self.btw_card.as_ref(), area.width as usize)
+        } else {
+            0
+        };
+        let queued_h: u16 = if !has_approval && !has_picker && area.height > 12 {
+            queued_strip_height(&self.queued_turns)
+        } else {
+            0
+        };
         let activity_h: u16 = if self.running && !has_approval && !has_picker {
             1
         } else {
@@ -734,7 +850,7 @@ impl App {
         let bottom_panel_h: u16 = if let Some(picker) = &self.overlay_picker {
             picker.desired_height().min(max_bottom)
         } else if has_approval {
-            (if area.height < 16 { 6 } else { 8 }).min(max_bottom)
+            self.approvals.desired_height(area.width).min(max_bottom)
         } else {
             let max_c = if area.height < 18 { 5 } else { 8 };
             self.composer.desired_height(area.width as usize, max_c).min(max_bottom)
@@ -752,6 +868,8 @@ impl App {
             .constraints([
                 Constraint::Min(3),
                 Constraint::Length(todo_h),
+                Constraint::Length(btw_h),
+                Constraint::Length(queued_h),
                 Constraint::Length(activity_h),
                 Constraint::Length(search_h),
                 Constraint::Length(bottom_panel_h),
@@ -780,6 +898,12 @@ impl App {
 
         if todo_h > 0 {
             render_todo_strip(frame, chunks[1], &self.todos);
+        }
+        if let (true, Some(card)) = (btw_h > 0, self.btw_card.as_ref()) {
+            render_btw_card(frame, chunks[2], card);
+        }
+        if queued_h > 0 {
+            render_queued_strip(frame, chunks[3], &self.queued_turns);
         }
 
         if activity_h > 0 {
@@ -811,20 +935,20 @@ impl App {
             let act_hint = if area.width < 58 {
                 format!(" ({pretty_elapsed}{q_badge} · esc)")
             } else {
-                format!("  ({pretty_elapsed}{q_badge} · esc interrupt · enter steer · alt+enter queue)")
+                format!("  ({pretty_elapsed}{q_badge} · esc interrupt · ^B bg · enter steer · alt+enter queue)")
             };
             spans.push(Span::styled(act_hint, Style::default().fg(MUTED)));
-            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[2]);
+            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[4]);
         }
 
         if search_open {
-            self.transcript.render_search_bar(frame, chunks[3]);
+            self.transcript.render_search_bar(frame, chunks[5]);
         }
 
         if let Some(picker) = &self.overlay_picker {
-            picker.render(frame, chunks[4]);
+            picker.render(frame, chunks[6]);
         } else if has_approval {
-            self.approvals.render(frame, chunks[4]);
+            self.approvals.render(frame, chunks[6]);
         } else {
             let narrow_ui = area.width < 58;
             let (rule_color, prompt_color, placeholder) = if self.running {
@@ -837,7 +961,13 @@ impl App {
                 (
                     AMBER,
                     AMBER,
-                    if !self.composer.is_empty() { "" } else if narrow_ui { "Plan (RO)… (S-Tab)" } else { "Plan mode (read-only) — ask twig to explore or design… (Shift+Tab to exit)" },
+                    if !self.composer.is_empty() { "" } else if narrow_ui { "Plan (RO)… (S-Tab)" } else { "Plan mode (read-only) — ask twig to explore or design… (Shift+Tab cycles)" },
+                )
+            } else if self.gate_edits {
+                (
+                    AMBER,
+                    ACCENT,
+                    if !self.composer.is_empty() { "" } else if narrow_ui { "Review edits… (S-Tab)" } else { "Review edits mode — asks approval with diff preview before editing… (Shift+Tab cycles)" },
                 )
             } else if !self.composer.is_empty() {
                 (HAIRLINE_FOCUS, ACCENT, "")
@@ -845,12 +975,12 @@ impl App {
                 (
                     HAIRLINE,
                     ACCENT,
-                    if narrow_ui { "Ask twig… (/ @ $ !)" } else { "Ask twig anything… (/ command · @ file · $ skill · ! shell)" },
+                    if narrow_ui { "Ask twig… (/ @ $ !)" } else { "Ask twig anything… (/ command · @ file#L · $ skill · ! shell · # memory)" },
                 )
             };
             self.composer.render(
                 frame,
-                chunks[4],
+                chunks[6],
                 rule_color,
                 prompt_color,
                 placeholder,
@@ -858,12 +988,12 @@ impl App {
             );
             if !search_open {
                 self.composer
-                    .render_popup(frame, chunks[4], chunks[0].height);
+                    .render_popup(frame, chunks[6], chunks[0].height);
             }
         }
 
         if subagent_h > 0 {
-            render_subagent_strip(frame, chunks[5], &self.subagents, self.motion);
+            render_subagent_strip(frame, chunks[7], &self.subagents, self.motion);
         }
 
         let flash = self
@@ -874,21 +1004,21 @@ impl App {
         let right_hint = if let Some(picker) = &self.overlay_picker {
             picker.hint()
         } else if !self.approvals.is_empty() {
-            "↑/↓ select · Enter · a always · Esc"
+            "↑/↓ · Enter · a always · Tab feedback · n deny"
         } else if self.transcript.search_is_open() {
             "Enter next · Esc close"
         } else if !self.composer.is_empty() && self.running {
-            "Enter steer · Alt+Enter queue · ^O tools"
+            "Enter steer · Alt+Enter queue · ^B bg"
         } else if !self.composer.is_empty() {
             "Enter send · Shift+Enter newline · ^G"
-        } else if self.plan_mode {
-            "Shift+Tab exit · ^O tools · ?"
+        } else if self.plan_mode || self.gate_edits {
+            "Shift+Tab mode · ^O tools · ?"
         } else if self.transcript.is_expanded() {
-            "tools:on · ^O fold · ?"
+            "tools:on · ^O fold · ^T · ?"
         } else {
-            "^O tools · Shift+Tab plan · ^R · ?"
+            "^O tools · Shift+Tab · ^T · ?"
         };
-        render_footer(frame, chunks[6], &self.footer_view(flash, right_hint));
+        render_footer(frame, chunks[8], &self.footer_view(flash, right_hint));
     }
 
     fn connect_session(
@@ -1050,21 +1180,63 @@ impl App {
             Action::Cancel => {
                 let _ = client.send("cancel", json!({}));
             }
-            Action::ResolveApproval { id, allow, remember } => {
+            Action::BackgroundActive => {
+                if client.send("background", json!({})).is_ok() {
+                    self.flash("Detached active command to background (^B)");
+                }
+            }
+            Action::ResolveApproval {
+                id,
+                allow,
+                remember,
+                note,
+            } => {
                 self.send_rpc(
                     client,
                     "approval.resolve",
-                    json!({"id": id, "allow": allow, "remember": remember}),
+                    json!({"id": id, "allow": allow, "remember": remember, "note": note}),
                     "",
                 );
             }
             Action::SetPlan(next) => {
-                if self.send_rpc(client, "mode.set", json!({"plan": next}), "").is_some() {
+                if self
+                    .send_rpc(
+                        client,
+                        "mode.set",
+                        json!({"plan": next, "gate_edits": false}),
+                        "",
+                    )
+                    .is_some()
+                {
                     self.plan_mode = next;
+                    self.gate_edits = false;
                     let msg = if next {
-                        "Plan mode ON (read-only · Shift+Tab to exit)"
+                        "Plan mode ON (read-only · Shift+Tab cycles modes)"
                     } else {
-                        "Plan mode OFF (full edit access)"
+                        "Auto-accept edits ON (standard mode)"
+                    };
+                    self.flash(msg);
+                    self.transcript.push_notice(NoticeKind::Playbook, msg);
+                }
+            }
+            Action::SetMode { plan, gate_edits } => {
+                if self
+                    .send_rpc(
+                        client,
+                        "mode.set",
+                        json!({"plan": plan, "gate_edits": gate_edits}),
+                        "",
+                    )
+                    .is_some()
+                {
+                    self.plan_mode = plan;
+                    self.gate_edits = gate_edits;
+                    let msg = if plan {
+                        "Plan mode ON (read-only · Shift+Tab cycles modes)"
+                    } else if gate_edits {
+                        "Review edits mode ON (asks approval with diff preview before edits · Shift+Tab cycles)"
+                    } else {
+                        "Auto-accept edits ON (standard mode · Shift+Tab cycles)"
                     };
                     self.flash(msg);
                     self.transcript.push_notice(NoticeKind::Playbook, msg);
@@ -1254,7 +1426,8 @@ mod tests {
             Action::ResolveApproval {
                 id: "call_1".into(),
                 allow: true,
-                remember: false
+                remember: false,
+                note: None,
             }
         );
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
@@ -1263,7 +1436,8 @@ mod tests {
             Action::ResolveApproval {
                 id: "call_1".into(),
                 allow: true,
-                remember: true
+                remember: true,
+                note: None,
             }
         );
         app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
@@ -1272,7 +1446,8 @@ mod tests {
             Action::ResolveApproval {
                 id: "call_1".into(),
                 allow: false,
-                remember: false
+                remember: false,
+                note: None,
             }
         );
         app.approvals.clear();
@@ -1403,5 +1578,149 @@ mod tests {
         assert!(approval_frame.contains("Approve Bash?"));
         assert!(approval_frame.contains("1. Yes, allow once"));
         assert!(approval_frame.contains("2. Always allow this pattern"));
+    }
+
+    #[test]
+    fn claude_cli_benchmark_ux_diff_approval_modes_queue_and_drawers_work() {
+        let dir = std::env::temp_dir().join(format!("twig-claude-ux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "line1\nline2_target\nline3\nline4\n").unwrap();
+
+        let mut app = App::new(dir.to_str().unwrap());
+
+        // 1. Shift+Tab 3-mode cycle: Default -> Plan -> Review Edits -> Default
+        assert_eq!(
+            app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Action::SetPlan(true)
+        );
+        app.plan_mode = true;
+        assert_eq!(
+            app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Action::SetMode {
+                plan: false,
+                gate_edits: true
+            }
+        );
+        app.plan_mode = false;
+        app.gate_edits = true;
+        assert!(render_frame_text(&mut app, 110, 24).contains("review-edits"));
+        assert_eq!(
+            app.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Action::SetMode {
+                plan: false,
+                gate_edits: false
+            }
+        );
+        app.gate_edits = false;
+
+        // 2. Edit stays unfolded as `● Update(...) +1 -1` with word-level diff even while Read/Grep fold!
+        app.transcript.push_user("修改配置".into());
+        app.transcript.push_tool_snapshot(
+            "r1".into(),
+            "read".into(),
+            "src/lib.rs".into(),
+            "auto".into(),
+            "line1\n".into(),
+            Some(0),
+        );
+        app.transcript.push_tool_snapshot(
+            "g1".into(),
+            "grep".into(),
+            "line2".into(),
+            "auto".into(),
+            "src/lib.rs:2".into(),
+            Some(0),
+        );
+        app.transcript.push_tool_snapshot(
+            "e1".into(),
+            "edit".into(),
+            "src/lib.rs".into(),
+            "audit".into(),
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n line1\n-let port = 8080;\n+let port = 9090;\n line3\n".into(),
+            Some(0),
+        );
+        let chat_view = render_frame_text(&mut app, 110, 28);
+        assert!(chat_view.contains("▸ 2 tools (1 read · 1 search)"));
+        assert!(chat_view.contains("● Update(src/lib.rs)") && chat_view.contains("+1") && chat_view.contains("-1"));
+        assert!(chat_view.contains("let port = 9090;"));
+
+        // 3. Approval panel renders Edit diff preview & supports inline Option 3 feedback typing!
+        app.apply_event(&json!({
+            "ev": "approval.requested",
+            "id": "ed_1",
+            "name": "edit",
+            "args": {"path": "src/lib.rs", "old_string": "let a = 1;", "new_string": "let a = 2;"}
+        }));
+        let ed_frame = render_frame_text(&mut app, 110, 28);
+        assert!(ed_frame.contains("Approve Edit?") && ed_frame.contains("let a = 2;"));
+        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for ch in "use const".chars() {
+            app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::ResolveApproval {
+                id: "ed_1".into(),
+                allow: false,
+                remember: false,
+                note: Some("use const".into()),
+            }
+        );
+        app.approvals.clear();
+
+        // 4. Composer `!` bash mode & `#` memory quick-save mode
+        app.composer.set("!cargo check");
+        assert!(render_frame_text(&mut app, 100, 24).contains("! bash mode"));
+        app.composer.set("");
+        assert_eq!(app.dispatch_input("# Always run deslop-please"), Action::None);
+        assert!(matches!(app.overlay_picker, Some(OverlayPicker::MemorySave { .. })));
+        assert_eq!(app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)), Action::None);
+        assert!(
+            std::fs::read_to_string(dir.join(".twig/preferences.md"))
+                .unwrap()
+                .contains("Always run deslop-please")
+        );
+
+        // 5. Running `Ctrl+B` background detach + Queued pill + `↑` pop-to-edit + `/btw` floating card + `↓` drawer
+        app.running = true;
+        assert_eq!(
+            app.handle_key(press(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Action::BackgroundActive
+        );
+        app.composer.set("检查一下 @src/lib.rs#L2-3");
+        app.handle_key(press(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(app.queued_turns.len(), 1);
+        assert!(render_frame_text(&mut app, 110, 28).contains("↳ Queued"));
+        // Pressing `↑` in empty composer pops queued message right back into composer!
+        app.handle_key(press(KeyCode::Up, KeyModifiers::NONE));
+        assert!(app.queued_turns.is_empty());
+        assert_eq!(app.composer.raw_text(), "检查一下 @src/lib.rs#L2-3");
+        let (turn_params, _) = self::client::build_turn_params(
+            dir.to_str().unwrap(),
+            app.composer.take_submitted(),
+            Vec::new(),
+            None,
+        );
+        assert!(turn_params["input"].as_str().unwrap().contains("line2_target"));
+
+        // `/btw` card floats above composer and dismisses on Space
+        app.btw_card = Some(BtwCard {
+            question: "why flock?".into(),
+            answer: Some("Crash-safe kernel release.".into()),
+        });
+        assert!(render_frame_text(&mut app, 110, 28).contains("Crash-safe kernel release."));
+        app.handle_key(press(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(app.btw_card.is_none());
+
+        // `↓` in empty composer opens Subagents & Tasks drawer
+        app.running = false;
+        app.apply_event(&json!({
+            "ev": "subagent.started", "role": "scout", "task": "Map tui modules", "parallel": false
+        }));
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.overlay_picker, Some(OverlayPicker::Tasks { .. })));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

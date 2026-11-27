@@ -25,8 +25,9 @@ use crate::control::Control;
 use crate::exec::{isolation, run_live as exec_run_live, Owner};
 use crate::llm::ToolCall;
 
-const GUARD_RO: u8 = 0b01;
-const PLAN_RO: u8 = 0b10;
+const GUARD_RO: u8 = 0b001;
+const PLAN_RO: u8 = 0b010;
+const GATE_EDITS: u8 = 0b100;
 
 pub struct Tools {
     worktree: PathBuf,
@@ -121,14 +122,36 @@ impl Tools {
     pub fn apply_plan_mode(&mut self, enabled: bool) -> bool {
         if enabled {
             self.read_only_mask |= PLAN_RO;
+            self.read_only_mask &= !GATE_EDITS;
         } else {
             self.read_only_mask &= !PLAN_RO;
         }
-        self.read_only_mask != 0
+        self.is_read_only()
+    }
+
+    /// Configure interactive permission mode (`plan` read-only vs `gate_edits` review-before-edit)
+    /// inside the unified bitmask without weakening any active guard latch.
+    pub fn configure_mode(&mut self, plan: bool, gate_edits: bool) -> (bool, bool) {
+        if plan {
+            self.read_only_mask |= PLAN_RO;
+            self.read_only_mask &= !GATE_EDITS;
+        } else {
+            self.read_only_mask &= !PLAN_RO;
+            if gate_edits {
+                self.read_only_mask |= GATE_EDITS;
+            } else {
+                self.read_only_mask &= !GATE_EDITS;
+            }
+        }
+        (self.is_read_only(), self.gates_edits())
     }
 
     pub fn is_read_only(&self) -> bool {
-        self.read_only_mask != 0
+        (self.read_only_mask & (GUARD_RO | PLAN_RO)) != 0
+    }
+
+    pub fn gates_edits(&self) -> bool {
+        (self.read_only_mask & GATE_EDITS) != 0
     }
 
     /// Frozen system prompt instructions owned by the toolset (never varies per turn,
@@ -383,6 +406,19 @@ impl Tools {
 
     pub fn list_tasks(&self) -> Value {
         self.tasks.list()
+    }
+
+    pub fn cancel_task(&mut self, params: &Value) -> Result<Value, String> {
+        let id = params["id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or("tasks.cancel requires task id")?;
+        let snap = self.tasks.cancel(id)?;
+        Ok(json!({
+            "cancelled": snap,
+            "running": self.tasks.running_count(),
+            "tasks": self.tasks.list()["tasks"],
+        }))
     }
 
     pub fn running_tasks_count(&self) -> usize {

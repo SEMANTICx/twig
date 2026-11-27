@@ -360,6 +360,8 @@ pub fn run_turn_live(
                     .get("patch")
                     .and_then(Value::as_str)
                     .is_some_and(patch_touches_gated_path))
+            || (matches!(call.name.as_str(), "edit" | "write" | "apply_patch")
+                && tools.gates_edits())
         {
             Tier::Deny
         } else if matches!(call.name.as_str(), "edit" | "write" | "apply_patch")
@@ -484,11 +486,11 @@ pub fn run_turn_live(
                 )
                 .map_err(|e| e.to_string())?;
             let decision = if interactive {
-                control.approval_decision(&call.id)
+                control.approval_decision_full(&call.id)
             } else {
                 None
             };
-            let Some((allow, remember)) = decision else {
+            let Some((allow, remember, note)) = decision else {
                 return Ok(TurnResult {
                     done: true,
                     reason: "awaiting_approval",
@@ -497,34 +499,49 @@ pub fn run_turn_live(
                     deferred_calls: planned[idx..].to_vec(),
                 });
             };
-            if allow && remember && matches!(call.name.as_str(), "bash" | "task") {
-                let cmd = call
-                    .args
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let pattern = policy.allow_for_session(cmd);
-                record
-                    .append("policy.allowed", json!({"pattern": pattern}))
-                    .map_err(|e| e.to_string())?;
-                emit(json!({"ev": "policy.allowed", "pattern": pattern}));
+            if allow && remember {
+                if matches!(call.name.as_str(), "bash" | "task") {
+                    let cmd = call
+                        .args
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let pattern = policy.allow_for_session(cmd);
+                    record
+                        .append("policy.allowed", json!({"pattern": pattern}))
+                        .map_err(|e| e.to_string())?;
+                    emit(json!({"ev": "policy.allowed", "pattern": pattern}));
+                } else if matches!(call.name.as_str(), "edit" | "write" | "apply_patch") {
+                    let (ro, _) = tools.configure_mode(false, false);
+                    emit(json!({
+                        "ev": "mode.changed",
+                        "plan": false,
+                        "gate_edits": false,
+                        "read_only": ro
+                    }));
+                }
             }
+            let clean_note = note.as_deref().map(str::trim).filter(|s| !s.is_empty());
             record
                 .append(
                     "approval.resolved",
-                    json!({"id": call.id, "allow": allow, "remember": remember}),
+                    json!({"id": call.id, "allow": allow, "remember": remember, "note": clean_note}),
                 )
                 .map_err(|e| e.to_string())?;
-            emit(json!({"ev": "approval.resolved", "id": call.id, "allow": allow, "remember": remember}));
+            emit(json!({"ev": "approval.resolved", "id": call.id, "allow": allow, "remember": remember, "note": clean_note}));
             if !allow {
+                let deny_out = match clean_note {
+                    Some(n) => format!("denied by user — do this instead: {n}"),
+                    None => "denied by user".to_owned(),
+                };
                 record
                     .append(
                         "tool.result",
-                        json!({"id": call.id, "tool": call.name, "args": call.args, "tier": "deny", "output": "denied by user", "exit_code": null}),
+                        json!({"id": call.id, "tool": call.name, "args": call.args, "tier": "deny", "output": deny_out, "exit_code": null}),
                     )
                     .map_err(|e| e.to_string())?;
                 let message =
-                    json!({"role": "tool", "tool_call_id": call.id, "content": "denied by user"});
+                    json!({"role": "tool", "tool_call_id": call.id, "content": deny_out});
                 messages.push(message.clone());
                 record
                     .append("message", json!({"message": message}))

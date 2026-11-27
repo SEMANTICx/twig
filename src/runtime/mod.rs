@@ -339,6 +339,7 @@ impl<'a> Daemon<'a> {
                     "effort": self.effort,
                     "title": self.title,
                     "plan": self.plan_mode,
+                    "gate_edits": self.tools.gates_edits(),
                     "operator": self.operator_mode,
                     "read_only": self.tools.is_read_only(),
                     "context_bytes": self.context.used_bytes(&self.messages),
@@ -369,6 +370,7 @@ impl<'a> Daemon<'a> {
                     "model": model,
                     "effort": self.effort,
                     "plan": self.plan_mode,
+                    "gate_edits": self.tools.gates_edits(),
                     "operator": self.operator_mode,
                     "study": self.study_mode,
                     "read_only": self.tools.is_read_only(),
@@ -674,6 +676,7 @@ impl<'a> Daemon<'a> {
                 Ok(res)
             }
             "tasks.list" => Ok(self.tools.list_tasks()),
+            "tasks.cancel" => self.tools.cancel_task(params),
             "skill.manage" => {
                 let store = SkillStore::default_for(Some(&self.worktree));
                 let action = params["action"].as_str().unwrap_or("list");
@@ -709,18 +712,14 @@ impl<'a> Daemon<'a> {
             }
 
             "mode.set" => {
-                let next = params
-                    .get("plan")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(!self.plan_mode);
+                let next = params.get("plan").and_then(Value::as_bool).unwrap_or(!self.plan_mode);
+                let gate = params.get("gate_edits").and_then(Value::as_bool).unwrap_or_else(|| self.tools.gates_edits());
                 self.plan_mode = next;
                 strip_transient_reminders(&mut self.messages);
-                let read_only = self.tools.apply_plan_mode(next);
-                self.record
-                    .append("mode.changed", json!({"plan": next}))
-                    .map_err(|e| e.to_string())?;
-                emit(json!({"ev": "mode.changed", "plan": next, "read_only": read_only}));
-                Ok(json!({"plan": next, "read_only": read_only}))
+                let (read_only, gate_edits) = self.tools.configure_mode(next, gate);
+                self.record.append("mode.changed", json!({"plan": next, "gate_edits": gate_edits})).map_err(|e| e.to_string())?;
+                emit(json!({"ev": "mode.changed", "plan": next, "gate_edits": gate_edits, "read_only": read_only}));
+                Ok(json!({"plan": next, "gate_edits": gate_edits, "read_only": read_only}))
             }
 
             "git.commit" => {
@@ -1251,36 +1250,28 @@ impl<'a> Daemon<'a> {
                 // the command never started, so execute once on allow or record denial.
                 let name = pending["name"].as_str().unwrap_or("bash").to_owned();
                 let args = pending["args"].clone();
-                if allow && remember && matches!(name.as_str(), "bash" | "task") {
-                    let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                    let pattern = self.policy.allow_for_session(cmd);
-                    self.record
-                        .append("policy.allowed", json!({"pattern": pattern}))
-                        .map_err(|e| e.to_string())?;
-                    emit(json!({"ev": "policy.allowed", "pattern": pattern}));
+                let note = params.get("note").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                if allow && remember {
+                    if matches!(name.as_str(), "bash" | "task") {
+                        let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
+                        let pattern = self.policy.allow_for_session(cmd);
+                        self.record.append("policy.allowed", json!({"pattern": pattern})).map_err(|e| e.to_string())?;
+                        emit(json!({"ev": "policy.allowed", "pattern": pattern}));
+                    } else if matches!(name.as_str(), "edit" | "write" | "apply_patch") {
+                        let (ro, _) = self.tools.configure_mode(self.plan_mode, false);
+                        emit(json!({"ev": "mode.changed", "plan": self.plan_mode, "gate_edits": false, "read_only": ro}));
+                    }
                 }
-                self.record
-                    .append(
-                        "approval.resolved",
-                        json!({"id": id, "allow": allow, "remember": remember}),
-                    )
-                    .map_err(|e| e.to_string())?;
-                emit(json!({"ev": "approval.resolved", "id": id, "allow": allow, "remember": remember}));
+                self.record.append("approval.resolved", json!({"id": id, "allow": allow, "remember": remember, "note": note})).map_err(|e| e.to_string())?;
+                emit(json!({"ev": "approval.resolved", "id": id, "allow": allow, "remember": remember, "note": note}));
 
                 let output = if !allow {
-                    self.record
-                        .append(
-                            "tool.result",
-                            json!({"id": id, "tool": name, "args": args, "tier": "deny", "output": "denied by user", "exit_code": null}),
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let message =
-                        json!({"role": "tool", "tool_call_id": id, "content": "denied by user"});
+                    let deny_msg = note.map_or_else(|| "denied by user".to_owned(), |n| format!("denied by user — do this instead: {n}"));
+                    self.record.append("tool.result", json!({"id": id, "tool": name, "args": args, "tier": "deny", "output": deny_msg, "exit_code": null})).map_err(|e| e.to_string())?;
+                    let message = json!({"role": "tool", "tool_call_id": id, "content": deny_msg});
                     self.messages.push(message.clone());
-                    self.record
-                        .append("message", json!({"message": message}))
-                        .map_err(|e| e.to_string())?;
-                    "denied by user".to_owned()
+                    self.record.append("message", json!({"message": message})).map_err(|e| e.to_string())?;
+                    deny_msg
                 } else {
                     let call = ToolCall {
                         id: id.to_owned(),
@@ -1335,6 +1326,7 @@ impl<'a> Daemon<'a> {
                     "guard": {"samples": samples, "stall": stall, "digest": digest},
                     "policy": {"hits": hits, "misses": misses, "size": size},
                     "plan": self.plan_mode,
+                    "gate_edits": self.tools.gates_edits(),
                     "operator": self.operator_mode,
                     "study": self.study_mode,
                     "read_only": self.tools.is_read_only(),
@@ -1437,6 +1429,10 @@ impl<'a> Daemon<'a> {
                                 control.cancel();
                                 Some(Ok(json!({"cancelled": true})))
                             }
+                            "background" => {
+                                control.request_background();
+                                Some(Ok(json!({"backgrounded": true})))
+                            }
                             "steer" => {
                                 let text = params["input"].as_str().unwrap_or("");
                                 if text.trim().is_empty() {
@@ -1449,10 +1445,11 @@ impl<'a> Daemon<'a> {
                             "approval.resolve"
                                 if control.waiting().as_deref() == params["id"].as_str() =>
                             {
-                                control.resolve_with_scope(
+                                control.resolve_full(
                                     params["id"].as_str().unwrap_or("").into(),
                                     params["allow"].as_bool().unwrap_or(false),
                                     params["remember"].as_bool().unwrap_or(false),
+                                    params.get("note").and_then(Value::as_str).map(str::to_owned),
                                 );
                                 Some(Ok(json!({"queued": true})))
                             }

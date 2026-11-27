@@ -17,7 +17,9 @@ use super::client::{
 };
 use super::composer::{parse_slash, SlashCommand};
 use super::markdown::{format_status_notice, FooterMode};
-use super::overlays::{parse_todos, summarize_tool_args, title_tool_name, OverlayPicker};
+use super::overlays::{
+    parse_todos, summarize_tool_args, title_tool_name, BtwCard, OverlayPicker,
+};
 use super::transcript::NoticeKind;
 use crate::llm::Llm;
 use super::{Action, App};
@@ -47,6 +49,9 @@ impl App {
                 }
                 if let Some(plan) = result.get("plan").and_then(Value::as_bool) {
                     self.plan_mode = plan;
+                }
+                if let Some(ge) = result.get("gate_edits").and_then(Value::as_bool) {
+                    self.gate_edits = ge;
                 }
                 if let Some(op) = result.get("operator").and_then(Value::as_bool) {
                     self.operator_mode = op;
@@ -142,13 +147,24 @@ impl App {
                     if let Some(r) = result.get("running").and_then(Value::as_u64) {
                         self.running_tasks = r as usize;
                     }
-                    let report = format_tasks_report(&result);
-                    if report.starts_with("no background") {
-                        self.transcript.push_notice(NoticeKind::Info, report);
+                    if let Some(arr) = result.get("tasks").and_then(Value::as_array) {
+                        self.cached_tasks = arr.clone();
+                    }
+                    if self.open_tasks_drawer {
+                        self.open_tasks_drawer = false;
+                        self.overlay_picker = Some(OverlayPicker::tasks(
+                            self.subagents.clone(),
+                            self.cached_tasks.clone(),
+                        ));
                     } else {
-                        self.transcript
-                            .push_notice(NoticeKind::Playbook, "background tasks");
-                        self.transcript.push_assistant(report);
+                        let report = format_tasks_report(&result);
+                        if report.starts_with("no background") {
+                            self.transcript.push_notice(NoticeKind::Info, report);
+                        } else {
+                            self.transcript
+                                .push_notice(NoticeKind::Playbook, "background tasks");
+                            self.transcript.push_assistant(report);
+                        }
                     }
                 }
                 if self.skills_req == Some(id) {
@@ -188,16 +204,13 @@ impl App {
                 }
                 if self.btw_req == Some(id) {
                     self.btw_req = None;
-                    let q = result["question"].as_str().unwrap_or("btw");
-                    let ans = result["answer"].as_str().unwrap_or("");
+                    let q = result["question"].as_str().unwrap_or("btw").to_owned();
+                    let ans = result["answer"].as_str().unwrap_or("").to_owned();
                     self.absorb_usage(&result["usage"]);
-                    self.transcript.push_notice(
-                        NoticeKind::Info,
-                        format!("btw (ephemeral, zero context pollution) · {q}"),
-                    );
-                    if !ans.is_empty() {
-                        self.transcript.push_assistant(ans.to_owned());
-                    }
+                    self.btw_card = Some(BtwCard {
+                        question: q,
+                        answer: Some(ans),
+                    });
                 }
                 if self.apply_req == Some(id) {
                     self.apply_req = None;
@@ -539,6 +552,9 @@ impl App {
                 if let Some(plan) = ev["plan"].as_bool() {
                     self.plan_mode = plan;
                 }
+                if let Some(ge) = ev["gate_edits"].as_bool() {
+                    self.gate_edits = ge;
+                }
             }
             Some("operator.changed") => {
                 if let Some(op) = ev["enabled"].as_bool() {
@@ -768,6 +784,16 @@ impl App {
             return Action::None;
         }
 
+        if let Some(mem) = trimmed.strip_prefix('#') {
+            if !trimmed.contains('\n') {
+                let note = mem.trim();
+                if !note.is_empty() {
+                    self.overlay_picker = Some(OverlayPicker::memory_save(note.to_owned()));
+                }
+                return Action::None;
+            }
+        }
+
         if let Some(cmd) = parse_slash(trimmed, self.plan_mode) {
             return match cmd {
                 SlashCommand::Quit => Action::Quit,
@@ -786,6 +812,7 @@ impl App {
                     id,
                     allow,
                     remember: false,
+                    note: None,
                 },
                 SlashCommand::OpenEffortPicker => {
                     self.overlay_picker = Some(OverlayPicker::effort(self.effort.clone()));
@@ -974,7 +1001,20 @@ impl App {
                     client,
                     "tasks.list",
                     json!({}),
-                    "Listing background tasks…",
+                    if self.open_tasks_drawer {
+                        ""
+                    } else {
+                        "Listing background tasks…"
+                    },
+                );
+            }
+            SlashCommand::CancelTask(task_id) => {
+                self.open_tasks_drawer = true;
+                self.tasks_req = self.send_rpc(
+                    client,
+                    "tasks.cancel",
+                    json!({"id": task_id}),
+                    &format!("Cancelled background task {task_id}"),
                 );
             }
             SlashCommand::ManageSkills {
@@ -1111,11 +1151,15 @@ impl App {
                 workers.spawn_dual_plan(self.repo_raw.clone(), goal);
             }
             SlashCommand::SideQuestion(q) => {
+                self.btw_card = Some(BtwCard {
+                    question: q.clone(),
+                    answer: None,
+                });
                 self.btw_req = self.send_rpc(
                     client,
                     "session.btw",
                     json!({"question": q}),
-                    "Asking ephemeral /btw question…",
+                    "",
                 );
             }
             SlashCommand::ExecutePlan(extra) => {

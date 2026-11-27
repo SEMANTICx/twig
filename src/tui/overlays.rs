@@ -13,8 +13,9 @@ use serde_json::Value;
 
 use super::client::SessionSummary;
 use super::markdown::{
-    clip_str, display_width, fmt_elapsed_compact, MotionMode, ACCENT, ACCENT_PEAK, AMBER, IVORY,
-    MUTED, ROSE, SAGE, STONE, SURFACE, SURFACE_HI,
+    clip_str, display_width, fmt_elapsed_compact, wrap_plain, DiffGutterState, MotionMode, ACCENT,
+    ACCENT_PEAK, AMBER, BASH_MODE_COLOR, HAIRLINE, IVORY, MEMORY_MODE_COLOR, MUTED, ROSE, SAGE,
+    STONE, SURFACE, SURFACE_HI,
 };
 
 #[derive(Debug, Clone)]
@@ -33,14 +34,18 @@ pub enum ApprovalKeyResult {
         id: String,
         allow: bool,
         remember: bool,
+        note: Option<String>,
     },
 }
 
-/// Self-contained pending approval queue with borderless 3-option warm-amber selector.
+/// Self-contained pending approval queue with multi-line diff/command preview
+/// and Claude Code inline rejection feedback typing on option 3.
 #[derive(Default)]
 pub struct ApprovalQueue {
     items: VecDeque<PendingApproval>,
     sel: usize,
+    typing_note: bool,
+    note_buf: String,
 }
 
 impl ApprovalQueue {
@@ -51,6 +56,16 @@ impl ApprovalQueue {
     pub fn clear(&mut self) {
         self.items.clear();
         self.sel = 0;
+        self.typing_note = false;
+        self.note_buf.clear();
+    }
+
+    pub fn desired_height(&self, width: u16) -> u16 {
+        let Some(pending) = self.items.front() else {
+            return 0;
+        };
+        let prev_n = build_approval_preview(&pending.name, &pending.args, width.saturating_sub(6) as usize).len();
+        (prev_n as u16 + 6).clamp(7, 13)
     }
 
     pub fn push_from_value(&mut self, v: &Value) -> Option<(String, String)> {
@@ -67,12 +82,16 @@ impl ApprovalQueue {
             recovered: v["recovered"] == true,
         });
         self.sel = 0;
+        self.typing_note = false;
+        self.note_buf.clear();
         Some((name, summary))
     }
 
     pub fn resolve_id(&mut self, id: &str) {
         self.items.retain(|a| a.id != id);
         self.sel = 0;
+        self.typing_note = false;
+        self.note_buf.clear();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ApprovalKeyResult {
@@ -80,6 +99,42 @@ impl ApprovalQueue {
             return ApprovalKeyResult::Ignored;
         };
         let id = pending.id.clone();
+
+        if self.typing_note {
+            match key.code {
+                KeyCode::Esc => {
+                    self.typing_note = false;
+                    self.note_buf.clear();
+                    return ApprovalKeyResult::Consumed;
+                }
+                KeyCode::Up => {
+                    self.typing_note = false;
+                    self.sel = 1;
+                    return ApprovalKeyResult::Consumed;
+                }
+                KeyCode::Backspace => {
+                    self.note_buf.pop();
+                    return ApprovalKeyResult::Consumed;
+                }
+                KeyCode::Enter => {
+                    let note = std::mem::take(&mut self.note_buf);
+                    self.typing_note = false;
+                    let trimmed = note.trim().to_owned();
+                    return ApprovalKeyResult::Resolve {
+                        id,
+                        allow: false,
+                        remember: false,
+                        note: (!trimmed.is_empty()).then_some(trimmed),
+                    };
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.note_buf.push(c);
+                    return ApprovalKeyResult::Consumed;
+                }
+                _ => return ApprovalKeyResult::Consumed,
+            }
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.sel = self.sel.saturating_sub(1);
@@ -89,11 +144,17 @@ impl ApprovalQueue {
                 self.sel = (self.sel + 1).min(2);
                 ApprovalKeyResult::Consumed
             }
+            KeyCode::Tab => {
+                self.sel = 2;
+                self.typing_note = true;
+                ApprovalKeyResult::Consumed
+            }
             KeyCode::Char('1') | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 ApprovalKeyResult::Resolve {
                     id,
                     allow: true,
                     remember: false,
+                    note: None,
                 }
             }
             KeyCode::Char('2') | KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -101,13 +162,20 @@ impl ApprovalQueue {
                     id,
                     allow: true,
                     remember: true,
+                    note: None,
                 }
             }
-            KeyCode::Char('3') | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            KeyCode::Char('3') => {
+                self.sel = 2;
+                self.typing_note = true;
+                ApprovalKeyResult::Consumed
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 ApprovalKeyResult::Resolve {
                     id,
                     allow: false,
                     remember: false,
+                    note: None,
                 }
             }
             KeyCode::Enter => {
@@ -120,7 +188,15 @@ impl ApprovalQueue {
                     id,
                     allow,
                     remember,
+                    note: None,
                 }
+            }
+            KeyCode::Char(c)
+                if self.sel == 2 && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.typing_note = true;
+                self.note_buf.push(c);
+                ApprovalKeyResult::Consumed
             }
             _ => ApprovalKeyResult::Ignored,
         }
@@ -133,38 +209,111 @@ impl ApprovalQueue {
         render_approval_panel(
             frame,
             area,
-            &pending.id,
-            &pending.name,
-            &pending.args,
-            pending.recovered,
+            pending,
             self.sel,
+            self.typing_note,
+            &self.note_buf,
         );
+    }
+}
+
+fn build_approval_preview(name: &str, args: &Value, max_w: usize) -> Vec<Line<'static>> {
+    let w = max_w.max(16);
+    match name {
+        "edit" => {
+            let path = args["path"].as_str().unwrap_or("file");
+            let old_s = args["old_string"].as_str().unwrap_or("");
+            let new_s = args["new_string"].as_str().unwrap_or("");
+            let mut raw = Vec::new();
+            for l in old_s.lines().take(3) {
+                raw.push(format!("-{l}"));
+            }
+            for l in new_s.lines().take(3) {
+                raw.push(format!("+{l}"));
+            }
+            let refs: Vec<&str> = raw.iter().map(String::as_str).collect();
+            let mut gutter = DiffGutterState::default();
+            let mut lines = vec![Line::from(vec![
+                Span::styled("  ✎ ", Style::default().fg(ACCENT)),
+                Span::styled(
+                    clip_str(path, w.saturating_sub(4)),
+                    Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
+                ),
+            ])];
+            for spans in gutter.render_block(&refs, w.saturating_sub(2)).into_iter().take(5) {
+                let mut row = vec![Span::raw("  ")];
+                row.extend(spans);
+                lines.push(Line::from(row));
+            }
+            lines
+        }
+        "write" | "apply_patch" => {
+            let path = args["path"].as_str().unwrap_or("patch");
+            let body = args["content"]
+                .as_str()
+                .or_else(|| args["patch"].as_str())
+                .unwrap_or("");
+            let mut lines = vec![Line::from(vec![
+                Span::styled("  + ", Style::default().fg(SAGE)),
+                Span::styled(
+                    clip_str(path, w.saturating_sub(4)),
+                    Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
+                ),
+            ])];
+            for raw in body.lines().take(4) {
+                let shown = clip_str(raw, w.saturating_sub(4));
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(shown, Style::default().fg(STONE).bg(SURFACE)),
+                ]));
+            }
+            lines
+        }
+        _ => {
+            let cmd = args["command"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| summarize_tool_args(name, args));
+            wrap_plain(&cmd, w.saturating_sub(4))
+                .into_iter()
+                .take(4)
+                .enumerate()
+                .map(|(i, seg)| {
+                    let prefix = if i == 0 { " $ " } else { "   " };
+                    let text = format!("{prefix}{seg}");
+                    let pad = w.saturating_sub(display_width(&text));
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(text, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
+                        Span::styled(" ".repeat(pad), Style::default().bg(SURFACE)),
+                    ])
+                })
+                .collect()
+        }
     }
 }
 
 fn render_approval_panel(
     frame: &mut Frame,
     area: Rect,
-    id: &str,
-    name: &str,
-    args: &Value,
-    recovered: bool,
+    pending: &PendingApproval,
     sel: usize,
+    typing_note: bool,
+    note_buf: &str,
 ) {
     if area.height < 5 || area.width < 14 {
         return;
     }
-    let compact = area.width < 52;
+    let compact = area.width < 56;
     let rule_len = area.width.saturating_sub(2) as usize;
     let rule = format!(" {}", "─".repeat(rule_len));
     let inner_w = area.width.saturating_sub(if compact { 2 } else { 4 }) as usize;
-    let cmd_preview = summarize_tool_args(name, args);
-    let title = if recovered {
-        format!("  ▲ Recovered ({id}) — NO replay")
+    let title = if pending.recovered {
+        format!("  ▲ Recovered ({}) — NO replay", pending.id)
     } else if compact {
-        format!(" ▲ Approve {}?", title_tool_name(name))
+        format!(" ▲ Approve {}?", title_tool_name(&pending.name))
     } else {
-        format!("  ▲ Approve {}? ({id})", title_tool_name(name))
+        format!("  ▲ Approve {}? ({})", title_tool_name(&pending.name), pending.id)
     };
 
     let opt = |idx: usize, label: &str| -> Line<'static> {
@@ -195,37 +344,44 @@ fn render_approval_panel(
         ])
     };
 
-    let preview_line = format!(" $ {}", clip_str(&cmd_preview, inner_w.saturating_sub(4)));
-    let preview_pad = inner_w.saturating_sub(display_width(&preview_line));
-    let (l0, l1, l2) = if compact {
-        ("1. Allow once (y)", "2. Always allow (a)", "3. Deny (n)")
+    let is_edit_gate = matches!(pending.name.as_str(), "edit" | "write" | "apply_patch");
+    let (l0, l1, l2_default) = if compact {
+        ("1. Allow once (y)", "2. Always allow (a)", "3. Deny / tell twig (3/n)")
     } else {
         (
             "1. Yes, allow once (y / Enter)",
-            "2. Always allow this pattern for this session (a)",
-            "3. No, deny and tell agent (n / Esc)",
+            if is_edit_gate {
+                "2. Yes, allow all edits for this session (a / Shift+Tab)"
+            } else {
+                "2. Always allow this pattern for this session (a)"
+            },
+            "3. No, and tell twig what to do differently (Tab / 3, or n to deny)",
         )
     };
+    let l2 = if typing_note || !note_buf.is_empty() {
+        format!("3. Tell twig instead: {note_buf}▎")
+    } else {
+        l2_default.to_owned()
+    };
 
+    let max_preview = (area.height as usize).saturating_sub(6).max(1);
     let mut rows = vec![
         Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
         Line::from(Span::styled(
             clip_str(&title, area.width as usize),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         )),
-        Line::from(vec![
-            Span::raw(if compact { " " } else { "  " }),
-            Span::styled(preview_line, Style::default().fg(ACCENT_PEAK).bg(SURFACE)),
-            Span::styled(" ".repeat(preview_pad), Style::default().bg(SURFACE)),
-        ]),
     ];
-    if area.height >= 8 {
-        rows.push(Line::from(""));
+    for p_line in build_approval_preview(&pending.name, &pending.args, inner_w)
+        .into_iter()
+        .take(max_preview)
+    {
+        rows.push(p_line);
     }
     rows.push(opt(0, l0));
     rows.push(opt(1, l1));
-    rows.push(opt(2, l2));
-    if area.height >= 7 {
+    rows.push(opt(2, &l2));
+    if rows.len() < area.height as usize {
         rows.push(Line::from(Span::styled(rule, Style::default().fg(AMBER))));
     }
     frame.render_widget(Paragraph::new(rows), area);
@@ -466,7 +622,11 @@ pub fn render_subagent_strip(
             Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("  ·  {}", stat_parts.join(" · ")),
+            format!(
+                "  ·  {}{}",
+                stat_parts.join(" · "),
+                if width >= 72 { "  (↓ / ^T inspect)" } else { "" }
+            ),
             Style::default().fg(MUTED),
         ),
     ])];
@@ -591,9 +751,135 @@ pub enum PickerOutcome {
     ForkSession,
     FillComposer(String),
     ToggleResumeScope,
+    CancelTask(String),
+    SaveMemory {
+        note: String,
+        global: bool,
+    },
 }
 
-/// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, `/effort`, `/rewind`, and `Ctrl+R`.
+/// Ephemeral side-question card (`/btw`) rendered above the composer without polluting chat history.
+#[derive(Debug, Clone)]
+pub struct BtwCard {
+    pub question: String,
+    pub answer: Option<String>,
+}
+
+pub fn btw_card_height(card: Option<&BtwCard>, width: usize) -> u16 {
+    let Some(c) = card else {
+        return 0;
+    };
+    let inner_w = width.saturating_sub(10).max(16);
+    let body_rows = match &c.answer {
+        None => 1,
+        Some(ans) => wrap_plain(ans.trim(), inner_w).len().clamp(1, 6),
+    };
+    (body_rows as u16) + 2
+}
+
+pub fn render_btw_card(frame: &mut Frame, area: Rect, card: &BtwCard) {
+    if area.height < 2 || area.width < 18 {
+        return;
+    }
+    let width = area.width as usize;
+    let pad_x = if width >= 120 { 4 } else if width >= 80 { 3 } else if width >= 56 { 2 } else { 1 };
+    let pad = " ".repeat(pad_x);
+    let card_w = width.saturating_sub(pad_x * 2).max(12);
+    let q_cap = card_w.saturating_sub(28).max(8);
+    let head = format!("✦ /btw · {} ", clip_str(&card.question, q_cap));
+    let tail_hint = " Esc/Space dismiss ";
+    let fill = card_w.saturating_sub(display_width(&head) + display_width(tail_hint) + 2);
+    let mut rows = vec![Line::from(vec![
+        Span::raw(pad.clone()),
+        Span::styled("╭─ ", Style::default().fg(HAIRLINE)),
+        Span::styled(head, Style::default().fg(ACCENT_PEAK).add_modifier(Modifier::BOLD)),
+        Span::styled("─".repeat(fill), Style::default().fg(HAIRLINE)),
+        Span::styled(tail_hint, Style::default().fg(MUTED)),
+    ])];
+    let max_body = (area.height as usize).saturating_sub(2).max(1);
+    let inner_w = card_w.saturating_sub(4).max(10);
+    match &card.answer {
+        None => {
+            rows.push(Line::from(vec![
+                Span::raw(pad.clone()),
+                Span::styled("│ ", Style::default().fg(HAIRLINE)),
+                Span::styled(
+                    "Thinking… (ephemeral, zero context pollution)",
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        }
+        Some(ans) => {
+            let wrapped = wrap_plain(ans.trim(), inner_w);
+            let total = wrapped.len();
+            for seg in wrapped.into_iter().take(max_body) {
+                rows.push(Line::from(vec![
+                    Span::raw(pad.clone()),
+                    Span::styled("│ ", Style::default().fg(HAIRLINE)),
+                    Span::styled(seg, Style::default().fg(IVORY)),
+                ]));
+            }
+            if total > max_body && rows.len() < area.height as usize {
+                rows.push(Line::from(vec![
+                    Span::raw(pad.clone()),
+                    Span::styled("╰─ ", Style::default().fg(HAIRLINE)),
+                    Span::styled(format!("… +{} lines", total - max_body), Style::default().fg(MUTED)),
+                ]));
+                frame.render_widget(Paragraph::new(rows), area);
+                return;
+            }
+        }
+    }
+    if rows.len() < area.height as usize {
+        rows.push(Line::from(vec![
+            Span::raw(pad),
+            Span::styled(format!("╰{}", "─".repeat(card_w.saturating_sub(1))), Style::default().fg(HAIRLINE)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+/// Queued follow-up pill strip rendered right above the composer (`↑` pops into composer to edit).
+pub fn queued_strip_height(queued: &VecDeque<String>) -> u16 {
+    queued.len().min(2) as u16
+}
+
+pub fn render_queued_strip(frame: &mut Frame, area: Rect, queued: &VecDeque<String>) {
+    if queued.is_empty() || area.height == 0 || area.width < 16 {
+        return;
+    }
+    let width = area.width as usize;
+    let pad_x = if width >= 120 { 4 } else if width >= 80 { 3 } else if width >= 56 { 2 } else { 1 };
+    let pad = " ".repeat(pad_x);
+    let max_rows = area.height as usize;
+    let total = queued.len();
+    let mut rows = Vec::with_capacity(max_rows);
+    for (idx, item) in queued.iter().take(max_rows).enumerate() {
+        let hint = if idx == 0 && width >= 64 {
+            if total > max_rows {
+                format!("  (+{} more · ↑ edit · /unqueue)", total - max_rows)
+            } else {
+                "  (↑ edit · /unqueue)".to_owned()
+            }
+        } else {
+            String::new()
+        };
+        let cap = width.saturating_sub(pad_x * 2 + 14 + display_width(&hint)).max(10);
+        let one_line = item.replace('\n', " ↵ ");
+        rows.push(Line::from(vec![
+            Span::raw(pad.clone()),
+            Span::styled("↳ Queued ", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {} ", clip_str(&one_line, cap)),
+                Style::default().fg(IVORY).bg(SURFACE),
+            ),
+            Span::styled(hint, Style::default().fg(MUTED)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+/// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, `/effort`, `/rewind`, `Ctrl+R`, `Ctrl+T`, and `#` memory.
 pub enum OverlayPicker {
     Resume {
         sessions: Vec<SessionSummary>,
@@ -617,6 +903,16 @@ pub enum OverlayPicker {
     History {
         all: Vec<String>,
         filter: String,
+        sel: usize,
+    },
+    Tasks {
+        subagents: Vec<SubagentEntry>,
+        tasks: Vec<Value>,
+        sel: usize,
+        expanded: bool,
+    },
+    MemorySave {
+        note: String,
         sel: usize,
     },
 }
@@ -664,6 +960,19 @@ impl OverlayPicker {
         }
     }
 
+    pub fn tasks(subagents: Vec<SubagentEntry>, tasks: Vec<Value>) -> Self {
+        Self::Tasks {
+            subagents,
+            tasks,
+            sel: 0,
+            expanded: false,
+        }
+    }
+
+    pub fn memory_save(note: String) -> Self {
+        Self::MemorySave { note, sel: 0 }
+    }
+
     pub fn hint(&self) -> &'static str {
         match self {
             Self::Resume { .. } => "↑/↓ select · Enter open · a toggle all repos · Esc close  ",
@@ -673,18 +982,36 @@ impl OverlayPicker {
                 "↑/↓ select · Enter chat only · r chat+code · f fork · Esc close  "
             }
             Self::History { .. } => "type to filter · ↑/↓ select · Enter fill · Esc close  ",
+            Self::Tasks { .. } => "↑/↓ select · Enter details · x kill task · Esc close  ",
+            Self::MemorySave { .. } => "↑/↓ scope · Enter save memory · Esc cancel  ",
         }
     }
 
     pub fn desired_height(&self) -> u16 {
-        let count = match self {
-            Self::Resume { sessions, .. } => sessions.len(),
-            Self::Model { all, filter, .. } => filtered_models(all, filter).len(),
-            Self::Effort { .. } => EFFORT_LEVELS.len(),
-            Self::Rewind { turns, .. } => turns.len(),
-            Self::History { all, filter, .. } => filtered_models(all, filter).len(),
-        };
-        (count.clamp(1, 8) as u16) + 3
+        match self {
+            Self::Tasks {
+                subagents,
+                tasks,
+                expanded,
+                ..
+            } => {
+                let n = subagents.len() + tasks.len();
+                let extra = if *expanded { 4 } else { 0 };
+                ((n.clamp(1, 6) + extra) as u16) + 3
+            }
+            Self::MemorySave { .. } => 6,
+            _ => {
+                let count = match self {
+                    Self::Resume { sessions, .. } => sessions.len(),
+                    Self::Model { all, filter, .. } => filtered_models(all, filter).len(),
+                    Self::Effort { .. } => EFFORT_LEVELS.len(),
+                    Self::Rewind { turns, .. } => turns.len(),
+                    Self::History { all, filter, .. } => filtered_models(all, filter).len(),
+                    _ => 1,
+                };
+                (count.clamp(1, 8) as u16) + 3
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PickerOutcome {
@@ -808,6 +1135,65 @@ impl OverlayPicker {
                     _ => PickerOutcome::None,
                 }
             }
+            Self::Tasks {
+                subagents,
+                tasks,
+                sel,
+                expanded,
+            } => {
+                let total = subagents.len() + tasks.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => PickerOutcome::Close,
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        PickerOutcome::Close
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if total > 0 => {
+                        *sel = sel.saturating_sub(1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if total > 0 => {
+                        *sel = (*sel + 1).min(total - 1);
+                        PickerOutcome::None
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') if total > 0 => {
+                        *expanded = !*expanded;
+                        PickerOutcome::None
+                    }
+                    KeyCode::Char('x' | 'X') | KeyCode::Delete if *sel >= subagents.len() => {
+                        let t_idx = *sel - subagents.len();
+                        tasks
+                            .get(t_idx)
+                            .and_then(|t| t["id"].as_str())
+                            .map(|id| PickerOutcome::CancelTask(id.to_owned()))
+                            .unwrap_or(PickerOutcome::None)
+                    }
+                    _ => PickerOutcome::None,
+                }
+            }
+            Self::MemorySave { note, sel } => match key.code {
+                KeyCode::Esc => PickerOutcome::Close,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *sel = 0;
+                    PickerOutcome::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = 1;
+                    PickerOutcome::None
+                }
+                KeyCode::Char('1') => PickerOutcome::SaveMemory {
+                    note: note.clone(),
+                    global: false,
+                },
+                KeyCode::Char('2') => PickerOutcome::SaveMemory {
+                    note: note.clone(),
+                    global: true,
+                },
+                KeyCode::Enter => PickerOutcome::SaveMemory {
+                    note: note.clone(),
+                    global: *sel == 1,
+                },
+                _ => PickerOutcome::None,
+            },
         }
     }
 
@@ -831,8 +1217,225 @@ impl OverlayPicker {
             Self::History { all, filter, sel } => {
                 render_history_picker(frame, area, all, filter, *sel);
             }
+            Self::Tasks {
+                subagents,
+                tasks,
+                sel,
+                expanded,
+            } => render_tasks_picker(frame, area, subagents, tasks, *sel, *expanded),
+            Self::MemorySave { note, sel } => render_memory_picker(frame, area, note, *sel),
         }
     }
+}
+
+fn render_tasks_picker(
+    frame: &mut Frame,
+    area: Rect,
+    subagents: &[SubagentEntry],
+    tasks: &[Value],
+    sel: usize,
+    expanded: bool,
+) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+    let total = subagents.len() + tasks.len();
+    let sel = sel.min(total.saturating_sub(1));
+
+    let mut rows = vec![
+        Line::from(Span::styled(rule.clone(), Style::default().fg(BASH_MODE_COLOR))),
+        Line::from(Span::styled(
+            format!(
+                "  Subagents ({}) & Background Tasks ({})  (↑/↓ select · Enter expand · x kill task · Esc close)",
+                subagents.len(),
+                tasks.len()
+            ),
+            Style::default().fg(BASH_MODE_COLOR).add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    if total == 0 {
+        rows.push(Line::from(Span::styled(
+            "   (no active subagents or background tasks — press Ctrl+B during a bash run to detach)",
+            Style::default().fg(MUTED),
+        )));
+    } else {
+        let reserve_detail = if expanded { 3usize } else { 0usize };
+        let max_list = (area.height.saturating_sub(3) as usize)
+            .saturating_sub(reserve_detail)
+            .max(1);
+        let start = sel.saturating_sub(max_list.saturating_sub(1));
+        let end = (start + max_list).min(total);
+        let mut selected_detail: Option<String> = None;
+
+        for idx in start..end {
+            let is_sel = idx == sel;
+            let bg = if is_sel { BASH_MODE_COLOR } else { Color::Reset };
+            let marker = if is_sel { " › " } else { "   " };
+            let (badge, badge_col, label, detail) = if idx < subagents.len() {
+                let s = &subagents[idx];
+                let dur = s
+                    .elapsed_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| s.started_at.elapsed());
+                let (st, col) = match s.status {
+                    SubagentStatus::Running => ("✦ run  ", AMBER),
+                    SubagentStatus::Completed => ("✓ done ", SAGE),
+                    SubagentStatus::Failed => ("✕ fail ", ROSE),
+                };
+                let full = match &s.error {
+                    Some(err) => format!("[{err}] {}", s.task),
+                    None => s.task.clone(),
+                };
+                (
+                    st,
+                    col,
+                    format!(
+                        "[sub:{}] {} ({})",
+                        s.role,
+                        compact_subagent_task(&s.task, 54),
+                        fmt_elapsed_compact(dur.as_secs())
+                    ),
+                    full,
+                )
+            } else {
+                let t = &tasks[idx - subagents.len()];
+                let id = t["id"].as_str().unwrap_or("bg");
+                let status = t["status"].as_str().unwrap_or("running");
+                let secs = t["elapsed_secs"].as_u64().unwrap_or(0);
+                let cmd = t["command"].as_str().unwrap_or("");
+                let (st, col) = match status {
+                    "running" => ("⚙ run  ", AMBER),
+                    "completed" => ("✓ done ", SAGE),
+                    _ => ("✕ stop ", ROSE),
+                };
+                let out_tail = t["output"].as_str().unwrap_or(cmd);
+                (
+                    st,
+                    col,
+                    format!("{id} · {cmd} ({})", fmt_elapsed_compact(secs)),
+                    format!("$ {cmd}\n{out_tail}"),
+                )
+            };
+            if is_sel {
+                selected_detail = Some(detail);
+            }
+            let used = display_width(marker) + display_width(badge);
+            let shown = clip_str(&label, row_w.saturating_sub(used + 2));
+            let pad = row_w.saturating_sub(used + display_width(&shown));
+            rows.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { BASH_MODE_COLOR })
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { badge_col })
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    shown,
+                    Style::default()
+                        .fg(if is_sel { sel_fg } else { IVORY })
+                        .bg(bg),
+                ),
+                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+            ]));
+        }
+
+        if expanded {
+            if let Some(det) = selected_detail {
+                for seg in wrap_plain(&det, row_w.saturating_sub(6)).into_iter().take(3) {
+                    rows.push(Line::from(vec![
+                        Span::styled("    ⎿  ", Style::default().fg(MUTED)),
+                        Span::styled(seg, Style::default().fg(STONE).bg(SURFACE)),
+                    ]));
+                }
+            }
+        }
+    }
+    rows.push(Line::from(Span::styled(
+        rule,
+        Style::default().fg(BASH_MODE_COLOR),
+    )));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn render_memory_picker(frame: &mut Frame, area: Rect, note: &str, sel: usize) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let rule_len = area.width.saturating_sub(2) as usize;
+    let rule = format!(" {}", "─".repeat(rule_len));
+    let row_w = area.width.saturating_sub(2) as usize;
+    let sel_fg = Color::Rgb(22, 19, 17);
+    let choices = [
+        ("1. Project memory", ".twig/preferences.md (shared with this repo)"),
+        ("2. Global memory ", "~/.config/twig/preferences.md (all repos)"),
+    ];
+    let mut rows = vec![
+        Line::from(Span::styled(
+            rule.clone(),
+            Style::default().fg(MEMORY_MODE_COLOR),
+        )),
+        Line::from(vec![
+            Span::styled(
+                "  ♯ Save memory: ",
+                Style::default()
+                    .fg(MEMORY_MODE_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                clip_str(note, row_w.saturating_sub(18)),
+                Style::default().fg(IVORY),
+            ),
+        ]),
+    ];
+    for (idx, (k, desc)) in choices.iter().enumerate() {
+        let is_sel = idx == sel;
+        let bg = if is_sel { MEMORY_MODE_COLOR } else { Color::Reset };
+        let marker = if is_sel { " › " } else { "   " };
+        let text = format!("{k}  ·  {desc}");
+        let shown = clip_str(&text, row_w.saturating_sub(display_width(marker) + 1));
+        let pad = row_w.saturating_sub(display_width(marker) + display_width(&shown));
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { MEMORY_MODE_COLOR })
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                shown,
+                Style::default()
+                    .fg(if is_sel { sel_fg } else { IVORY })
+                    .bg(bg)
+                    .add_modifier(if is_sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]));
+    }
+    rows.push(Line::from(Span::styled(
+        rule,
+        Style::default().fg(MEMORY_MODE_COLOR),
+    )));
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 fn render_effort_picker(frame: &mut Frame, area: Rect, active: Option<&str>, sel: usize) {

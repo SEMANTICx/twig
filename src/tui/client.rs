@@ -482,6 +482,35 @@ pub fn ensure_memory_file(repo: &str) -> Result<(PathBuf, bool), String> {
     Ok((path, true))
 }
 
+/// Append a quick `# <note>` memory bullet to either project `.twig/preferences.md` or global `~/.config/twig/preferences.md`.
+pub fn append_quick_memory(repo: &str, note: &str, global: bool) -> Result<String, String> {
+    let clean = note.trim().trim_start_matches('-').trim();
+    if clean.is_empty() {
+        return Err("memory note is empty".into());
+    }
+    let (target, label) = if global {
+        let dir = paths::config_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create global config dir: {e}"))?;
+        let p = dir.join("preferences.md");
+        if !p.exists() {
+            std::fs::write(&p, "# Global Preferences\n\n")
+                .map_err(|e| format!("write global preferences.md: {e}"))?;
+        }
+        let disp = shorten_home(&p.display().to_string());
+        (p, disp)
+    } else {
+        let (p, _) = ensure_memory_file(repo)?;
+        (p, ".twig/preferences.md".to_owned())
+    };
+    let mut existing = std::fs::read_to_string(&target).unwrap_or_default();
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
+    existing.push_str(&format!("- {clean}\n"));
+    std::fs::write(&target, existing).map_err(|e| format!("save memory: {e}"))?;
+    Ok(label)
+}
+
 /// Initialize `.twig/preferences.md` and `.twig/project.json` without overwriting existing files.
 pub fn init_project_files(repo: &str) -> Result<(Vec<String>, Vec<String>), String> {
     let twig_dir = Path::new(repo).join(".twig");
@@ -1243,6 +1272,7 @@ pub fn build_turn_params(
             ));
         }
     }
+    context_blocks.extend(extract_inline_file_slices(repo, &text));
     if !context_blocks.is_empty() {
         text = format!("{text}\n\n{}", context_blocks.join("\n\n"));
     }
@@ -1255,6 +1285,89 @@ pub fn build_turn_params(
         .map(|(label, url)| json!({"label": label, "url": url}))
         .collect();
     (json!({"input": text, "images": payload}), labels)
+}
+
+/// Parse `@path/to/file.rs#L10-50` or `@path/to/file.rs:10-50` inline file-slice mentions
+/// safely confined within `repo` so line-range references inject exact numbered excerpts!
+fn extract_inline_file_slices(repo: &str, text: &str) -> Vec<String> {
+    let Ok(canon_repo) = Path::new(repo).canonicalize() else {
+        return Vec::new();
+    };
+    let mut blocks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for token in text.split_whitespace() {
+        let Some(raw_ref) = token.strip_prefix('@') else {
+            continue;
+        };
+        let cleaned = raw_ref.trim_end_matches([',', '.', ';', ')', ']']);
+        if matches!(cleaned, "diff" | "staged" | "last" | "") {
+            continue;
+        }
+        let (rel_path, range_opt) = parse_path_and_line_range(cleaned);
+        // Only auto-inline explicit line slices (`#L10-30` / `:10-30`) so plain `@file` keeps lightweight path semantics unless sliced.
+        let Some((start_l, end_l)) = range_opt else {
+            continue;
+        };
+        if !seen.insert(cleaned.to_owned()) {
+            continue;
+        }
+        let pb = Path::new(rel_path);
+        if pb.is_absolute() || image_mime_for_path(pb).is_some() {
+            continue;
+        }
+        let Ok(canon_file) = canon_repo.join(pb).canonicalize() else {
+            continue;
+        };
+        if !canon_file.starts_with(&canon_repo) {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&canon_file) else {
+            continue;
+        };
+        let all_lines: Vec<&str> = body.lines().collect();
+        if all_lines.is_empty() {
+            continue;
+        }
+        let lo = start_l.max(1).min(all_lines.len());
+        let hi = end_l.max(lo).min(all_lines.len()).min(lo + 299);
+        let numbered: String = all_lines[lo - 1..hi]
+            .iter()
+            .enumerate()
+            .map(|(off, l)| format!("{:>4} | {l}", lo + off))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let clipped: String = numbered.chars().take(16_000).collect();
+        blocks.push(format!(
+            "<context source=\"@{rel_path}#L{lo}-{hi}\">\n{clipped}\n</context>"
+        ));
+    }
+    blocks
+}
+
+fn parse_path_and_line_range(spec: &str) -> (&str, Option<(usize, usize)>) {
+    let (path, tail) = if let Some((p, t)) = spec.split_once("#L") {
+        (p, t)
+    } else if let Some((p, t)) = spec.split_once("#l") {
+        (p, t)
+    } else if let Some((p, t)) = spec.rsplit_once(':') {
+        if t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            (p, t)
+        } else {
+            return (spec, None);
+        }
+    } else {
+        return (spec, None);
+    };
+    let tail = tail.trim_start_matches(['L', 'l']);
+    if let Some((a, b)) = tail.split_once('-') {
+        let b_clean = b.trim_start_matches(['L', 'l']);
+        if let (Ok(s), Ok(e)) = (a.parse::<usize>(), b_clean.parse::<usize>()) {
+            return (path, Some((s, e)));
+        }
+    } else if let Ok(single) = tail.parse::<usize>() {
+        return (path, Some((single, single)));
+    }
+    (spec, None)
 }
 
 #[derive(Debug)]
