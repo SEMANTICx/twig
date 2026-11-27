@@ -1,6 +1,6 @@
 # ✻ twig — Official Binary Distribution
 
-**A fast, single-binary coding-agent CLI, borderless TUI & web cockpit for Linux, macOS, and Windows.**
+**A fast, single-binary coding-agent harness in pure Rust — with a borderless TUI, headless CLI, and web cockpit for Linux, macOS, and Windows.**
 
 > This repository hosts **official prebuilt binaries, SHA-256 checksums, and zero-login one-line installers** for `twig`.
 
