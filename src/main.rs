@@ -574,6 +574,14 @@ fn main() {
             println!("results: {}", scratch.join("results.jsonl").display());
         }
 
+        "ladder" | "rci" => match twig::eval::rci::run_cli(cmd, &args[1..]) {
+            Ok(out) => print!("{out}"),
+            Err(e) => {
+                eprintln!("twig {cmd}: {e}");
+                std::process::exit(1);
+            }
+        },
+
         "improve" => {
             let root = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "evals".into()));
             let rounds: u32 = args.get(2).and_then(|r| r.parse().ok()).unwrap_or(2);
@@ -1065,6 +1073,8 @@ fn main() {
                  twig skill <list|enable|disable|add|doctor>  manage curated global/project skills\n  \
                  twig decisions [file.tsv]      read the decision trail\n  \
                  twig eval [dir] [reps] [only]  scoring set: fresh repo, external judge\n  \
+                 twig ladder <solo> <team>      RCI equal-budget ladder grader (Levels 0..3, pass@n_B)\n  \
+                 twig rci <status|harvest|distill|gate>  label-free role-card recursion & release gate\n  \
                  twig improve [dir] [rounds]    tune harness.json against the scoring set\n  \
                  twig automate [cfg] [--once]   unattended GitHub maintenance queue\n  \
                  twig subagent [repo] [role]    isolated role subagent\n  \

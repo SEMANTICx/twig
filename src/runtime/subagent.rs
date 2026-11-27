@@ -1055,9 +1055,15 @@ impl SubagentPool {
                 &host_runs.join("review.diff").display().to_string(),
             );
         }
-        let effective_task = format!(
+        let mut effective_task = format!(
             "[Workspace root (cwd): `.` — inspect target files directly via relative paths like `src/...`]\n{normalized_task}"
         );
+        if let Some(role_card) = crate::eval::rci::load_role_note(orig_repo, role.as_str()) {
+            effective_task = format!(
+                "[Role Protocol Card (.twig/notes/{}.md)]\n{role_card}\n\n{effective_task}",
+                role.as_str()
+            );
+        }
         request.push_str(&format!(
             "{}\n",
             json!({"id":1,"method":"turn","params":{"input":effective_task,"role":role.as_str()}})

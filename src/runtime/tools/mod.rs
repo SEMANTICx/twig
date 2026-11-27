@@ -47,6 +47,7 @@ pub struct Tools {
     agent_concurrency: usize,
     artifacts_dir: Option<PathBuf>,
     tasks: TaskManager,
+    blackboard: Vec<String>,
     undo_stack: Vec<FileSnapshot>,
     read_stamps: HashMap<PathBuf, (u128, u64)>,
     seen_subdir_docs: HashSet<PathBuf>,
@@ -81,6 +82,7 @@ impl Tools {
             agent_concurrency: cfg.subagent_concurrency,
             artifacts_dir: None,
             tasks,
+            blackboard: Vec::new(),
             undo_stack: Vec::new(),
             read_stamps: HashMap::new(),
             seen_subdir_docs: HashSet::new(),
@@ -353,8 +355,8 @@ impl Tools {
                     "required":["component","attempted","expected","actual","recovery"]}}}),
             json!({"type":"function","function":{"name":"skill","description":"List/search project & global skill metadata (optional query), load one named skill body (`name`), or read a bundled Layer-3 reference file inside that skill (`name` + `file`, e.g. `file=\"references/guide.md\"`).",
                 "parameters":{"type":"object","properties":{"name":{"type":"string"},"file":{"type":"string"},"query":{"type":"string"}}}}}),
-            json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in an isolated Git worktree; scout/advisor/reviewer are OS read-only. Set fork_context=true to clone current conversation context into the subagent without polluting the main session; pass resume_sid to continue a previous subagent; code/test return sid, diff_stat, and artifact patch. Multiple calls run in parallel.",
-                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","advisor","reviewer"]},"task":{"type":"string"},"resume_sid":{"type":"string"},"fork_context":{"type":"boolean"},"model":{"type":"string"},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
+            json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in an isolated Git worktree; scout/advisor/reviewer are OS read-only. Pass disjoint `slice` scopes across parallel subagents (RCI split-information discipline) so each agent forwards verbatim `path:line` facts via the shared Blackboard (`use_blackboard=true` by default) rather than debating shared context. Set fork_context=true to clone current conversation context; pass resume_sid to continue a previous subagent.",
+                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","advisor","reviewer"]},"task":{"type":"string"},"slice":{"type":"string"},"use_blackboard":{"type":"boolean"},"resume_sid":{"type":"string"},"fork_context":{"type":"boolean"},"model":{"type":"string"},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
             json!({"type":"function","function":{"name":"task","description":"Manage asynchronous background shell tasks (start a long-running build/test/server, send stdin input, poll status, wait for completion, cancel, or list active tasks).",
                 "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","send","status","wait","cancel","list"]},"command":{"type":"string"},"id":{"type":"string"},"input":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["action"]}}}),
         ];
@@ -406,6 +408,32 @@ impl Tools {
 
     pub fn list_tasks(&self) -> Value {
         self.tasks.list()
+    }
+
+    /// Behavioral RPC façade for the RCI Split-Fact Blackboard (`list` / `add` / `clear`)
+    /// paired with the repository's active `.twig/notes/` role-card generation status.
+    pub fn blackboard_rpc(&mut self, params: &Value) -> Value {
+        let rci_status = crate::eval::rci::status_report(&self.worktree);
+        match params["action"].as_str().unwrap_or("list") {
+            "clear" => {
+                let n = self.blackboard.len();
+                self.blackboard.clear();
+                json!({"cleared": n, "facts": [], "rci_status": rci_status})
+            }
+            "add" => {
+                if let Some(fact) = params["fact"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let entry = format!("[manual] {}", fact.chars().take(280).collect::<String>());
+                    if !self.blackboard.contains(&entry) {
+                        if self.blackboard.len() >= 32 {
+                            self.blackboard.remove(0);
+                        }
+                        self.blackboard.push(entry);
+                    }
+                }
+                json!({"facts": self.blackboard, "rci_status": rci_status})
+            }
+            _ => json!({"facts": self.blackboard, "rci_status": rci_status}),
+        }
     }
 
     pub fn cancel_task(&mut self, params: &Value) -> Result<Value, String> {
@@ -866,6 +894,8 @@ struct SubagentSpec<'a> {
     role: Role,
     role_name: &'a str,
     task: &'a str,
+    slice: Option<&'a str>,
+    use_blackboard: bool,
     resume_sid: Option<&'a str>,
     fork_context: bool,
     model: Option<&'a str>,
@@ -874,6 +904,9 @@ struct SubagentSpec<'a> {
 
 struct SubagentOutcome<'a> {
     text: String,
+    raw_reply: String,
+    slice: Option<&'a str>,
+    use_blackboard: bool,
     ok: bool,
     elapsed_secs: u64,
     role_name: &'a str,
@@ -900,6 +933,11 @@ impl Tools {
             role,
             role_name,
             task: args["task"].as_str().unwrap_or(""),
+            slice: args.get("slice").and_then(Value::as_str).filter(|s| !s.trim().is_empty()),
+            use_blackboard: args
+                .get("use_blackboard")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             resume_sid: args.get("resume_sid").and_then(Value::as_str),
             fork_context: args
                 .get("fork_context")
@@ -949,7 +987,14 @@ impl Tools {
         };
 
         let parent_artifacts = self.artifacts_dir.as_deref();
+        let board_snapshot = (!self.blackboard.is_empty()).then(|| {
+            format!(
+                "[Shared Fact Blackboard — verified facts from peer slices; cite `path:line` facts under `Facts:` at the end of your reply]\n{}",
+                self.blackboard.join("\n")
+            )
+        });
         let results: Vec<Result<SubagentOutcome<'_>, String>> = std::thread::scope(|s| {
+            let board_ref = board_snapshot.as_deref();
             let handles: Vec<_> = parsed
                 .into_iter()
                 .map(|item| {
@@ -957,9 +1002,22 @@ impl Tools {
                     s.spawn(move || {
                         let spec = item?;
                         let started = std::time::Instant::now();
+                        let mut composed_task = String::new();
+                        if let Some(sl) = spec.slice {
+                            composed_task.push_str(&format!(
+                                "[Assigned Disjoint Slice: `{sl}` — focus strictly on this scope and end with `Facts:` bullets citing `path:line`]\n"
+                            ));
+                        }
+                        if spec.use_blackboard {
+                            if let Some(board) = board_ref {
+                                composed_task.push_str(board);
+                                composed_task.push_str("\n\n");
+                            }
+                        }
+                        composed_task.push_str(spec.task);
                         let run = pool.run_resumable(
                             spec.role,
-                            spec.task,
+                            &composed_task,
                             spec.model,
                             spec.effort,
                             spec.resume_sid,
@@ -969,9 +1027,16 @@ impl Tools {
                         let elapsed_secs = started.elapsed().as_secs();
                         match run {
                             Ok(r) => {
+                                let raw_reply = r
+                                    .result
+                                    .as_ref()
+                                    .and_then(|v| v["text"].as_str())
+                                    .unwrap_or(&r.output)
+                                    .to_owned();
                                 let summary = json!({
                                     "sid": r.sid,
                                     "role": r.role,
+                                    "slice": spec.slice,
                                     "worktree": r.worktree,
                                     "exit_code": r.exit_code,
                                     "timed_out": r.timed_out,
@@ -985,6 +1050,9 @@ impl Tools {
                                 });
                                 Ok(SubagentOutcome {
                                     text: serde_json::to_string_pretty(&summary).unwrap_or_default(),
+                                    raw_reply,
+                                    slice: spec.slice,
+                                    use_blackboard: spec.use_blackboard,
                                     ok: true,
                                     elapsed_secs,
                                     role_name: spec.role_name,
@@ -992,6 +1060,9 @@ impl Tools {
                             }
                             Err(e) => Ok(SubagentOutcome {
                                 text: format!("subagent error: {e}"),
+                                raw_reply: String::new(),
+                                slice: spec.slice,
+                                use_blackboard: false,
                                 ok: false,
                                 elapsed_secs,
                                 role_name: spec.role_name,
@@ -1013,6 +1084,20 @@ impl Tools {
         for res in results {
             match res {
                 Ok(done) => {
+                    if done.ok && done.use_blackboard {
+                        for fact in crate::eval::rci::extract_decisive_facts(
+                            done.role_name,
+                            done.slice,
+                            &done.raw_reply,
+                        ) {
+                            if !self.blackboard.contains(&fact) {
+                                if self.blackboard.len() >= 32 {
+                                    self.blackboard.remove(0);
+                                }
+                                self.blackboard.push(fact);
+                            }
+                        }
+                    }
                     let err_note = (!done.ok).then(|| {
                         done.text
                             .strip_prefix("subagent error:")

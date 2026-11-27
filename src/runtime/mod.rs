@@ -431,25 +431,11 @@ impl<'a> Daemon<'a> {
             }
 
             "model.set" => {
-                let requested = params
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .unwrap_or("");
-                if requested.is_empty() || requested == "reset" || requested == "default" {
-                    self.model_override = None;
-                } else {
-                    self.model_override = Some(requested.to_owned());
-                }
-                let _ = crate::llm::Provider::configure(
-                    &json!({"action": "save_model", "model": self.model_override}),
-                );
-                let active = self
-                    .model_override
-                    .clone()
-                    .unwrap_or_else(|| self.llm.roles().get("code").to_string());
-                let env_override = std::env::var_os("TWIG_MODEL").is_some()
-                    || std::env::var_os("TWIG_ROLES").is_some();
+                let requested = params.get("model").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                self.model_override = (!requested.is_empty() && requested != "reset" && requested != "default").then(|| requested.to_owned());
+                let _ = crate::llm::Provider::configure(&json!({"action": "save_model", "model": self.model_override}));
+                let active = self.model_override.clone().unwrap_or_else(|| self.llm.roles().get("code").to_string());
+                let env_override = std::env::var_os("TWIG_MODEL").is_some() || std::env::var_os("TWIG_ROLES").is_some();
                 self.frozen_system = None;
                 Ok(json!({"model": active, "env_override": env_override}))
             }
@@ -677,6 +663,7 @@ impl<'a> Daemon<'a> {
             }
             "tasks.list" => Ok(self.tools.list_tasks()),
             "tasks.cancel" => self.tools.cancel_task(params),
+            "blackboard" => Ok(self.tools.blackboard_rpc(params)),
             "skill.manage" => {
                 let store = SkillStore::default_for(Some(&self.worktree));
                 let action = params["action"].as_str().unwrap_or("list");
@@ -921,7 +908,7 @@ impl<'a> Daemon<'a> {
                 reminders.extend(self.tools.dynamic_turn_reminders(input));
                 if self.operator_mode {
                     reminders.push(
-                        "Operator mode is active (Agent as Memory): handle small (<50-line) or UI-coupled edits directly; delegate self-contained modules with fixed interfaces and explicit acceptance criteria to isolated subagents (`code`, `test`, `scout`, `advisor`, `reviewer`) or `twig session`; inspect returned diffs and run verification before finishing.".into(),
+                        "Operator mode is active (RCI Split-Fact Collective Discipline): handle small (<50-line) edits directly; never run shared-information debate across identical subagents (stays <= equal-budget majority vote). Partition disjoint `slice`s across parallel subagents (`scout`/`code`/`test`), forward verbatim `path:line` facts via the session Blackboard, and synthesize/gate with `advisor` or `reviewer`.".into(),
                     );
                 }
                 if self.study_mode {

@@ -26,7 +26,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/plan", "toggle read-only planning mode (Shift+Tab)"),
     ("/study", "toggle REA epistemic clean-room study mode (/study [on|off|<target>])"),
     ("/go", "exit /plan & /study, switch to `code` role, and execute agreed spec/plan"),
-    ("/operator", "toggle Agent-as-Memory multi-session operator mode"),
+    ("/operator", "toggle RCI split-fact collective orchestration mode"),
+    ("/blackboard", "view/add/clear RCI split-fact blackboard (/blackboard [clear|add <fact>])"),
+    ("/rci", "RCI equal-budget role-card status, harvest & distillation (/rci [status|harvest|distill])"),
     ("/roles", "view or set per-role models (/roles <role> <model> [effort])"),
     ("/dual-plan ", "independent blind dual-model plan + synthesis"),
     ("/btw ", "ask an ephemeral side question without polluting context"),
@@ -127,6 +129,11 @@ pub enum SlashCommand {
         action: String,
         server: Option<String>,
     },
+    Blackboard {
+        action: String,
+        fact: Option<String>,
+    },
+    RunRci(String),
     EvolveSession,
     ManageSkills {
         action: String,
@@ -207,6 +214,17 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
             action: "init_rea".into(),
             server: None,
         }),
+        "/blackboard" | "/bb" => Some(SlashCommand::Blackboard {
+            action: "list".into(),
+            fact: None,
+        }),
+        "/blackboard clear" | "/bb clear" => Some(SlashCommand::Blackboard {
+            action: "clear".into(),
+            fact: None,
+        }),
+        "/rci" | "/rci status" => Some(SlashCommand::RunRci("status".into())),
+        "/rci harvest" => Some(SlashCommand::RunRci("harvest".into())),
+        "/rci distill" | "/evolve --rci" => Some(SlashCommand::RunRci("distill".into())),
         "/evolve" => Some(SlashCommand::EvolveSession),
         "/skills" | "/playbooks" => Some(SlashCommand::ManageSkills {
             action: "list".into(),
@@ -247,6 +265,32 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
                 enabled: Some(true),
                 target: Some(a.to_owned()),
             });
+        }
+    }
+    if let Some(arg) = trimmed
+        .strip_prefix("/blackboard ")
+        .or_else(|| trimmed.strip_prefix("/bb "))
+    {
+        let a = arg.trim();
+        if let Some(rest) = a.strip_prefix("add ") {
+            let f = rest.trim();
+            if !f.is_empty() {
+                return Some(SlashCommand::Blackboard {
+                    action: "add".into(),
+                    fact: Some(f.to_owned()),
+                });
+            }
+        } else if !a.is_empty() {
+            return Some(SlashCommand::Blackboard {
+                action: "add".into(),
+                fact: Some(a.to_owned()),
+            });
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/rci ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::RunRci(a.to_owned()));
         }
     }
     if let Some(arg) = trimmed.strip_prefix("/mcp ") {

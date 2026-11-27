@@ -134,6 +134,7 @@ struct App {
     rewind_req: Option<u64>,
     rewind_prefill: Option<String>,
     mcp_req: Option<u64>,
+    blackboard_req: Option<u64>,
     tasks_req: Option<u64>,
     skills_req: Option<u64>,
     roles_req: Option<u64>,
@@ -217,6 +218,7 @@ impl App {
             rewind_req: None,
             rewind_prefill: None,
             mcp_req: None,
+            blackboard_req: None,
             tasks_req: None,
             skills_req: None,
             roles_req: None,
@@ -276,6 +278,7 @@ impl App {
         self.rewind_req = None;
         self.rewind_prefill = None;
         self.mcp_req = None;
+        self.blackboard_req = None;
         self.tasks_req = None;
         self.skills_req = None;
         self.roles_req = None;

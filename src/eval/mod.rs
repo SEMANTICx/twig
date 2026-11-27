@@ -5,6 +5,7 @@ pub mod classify;
 pub mod dataset;
 pub mod improve;
 pub mod lessons;
+pub mod rci;
 pub mod runner;
 pub mod trajectory;
 

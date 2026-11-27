@@ -1,251 +1,311 @@
-# twig
+# ✻ twig
 
-**A thin, high-discipline coding-agent harness in Rust — cross-platform (Linux, macOS, Windows) with a responsive borderless TUI from phone screens to ultrawide monitors.**
+**A high-discipline, gateway-neutral coding-agent harness in pure Rust — combining a Claude Code-caliber borderless TUI, tamper-evident BLAKE3 session ledgers, clean-room differential verification, and Recursive Collective Intelligence (RCI).**
 
-> Any OpenAI-compatible gateway (default: `magpie`) provides the models; **twig** provides the execution loop, structured tools, tiered safety policy, isolated subagents, curated skills, verifier, borderless TUI, and tamper-evident session record.
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-D77757)](#platform-support)
+[![Rust](https://img.shields.io/badge/rust-static%20single%20binary-DEA584)](#architecture)
+[![License: MIT](https://img.shields.io/badge/license-MIT-80C08A)](LICENSE)
 
----
-
-## Why twig?
-
-Most coding agents accumulate hidden latency and prompt bloat: per-call LLM classifiers, repetitive permission popups for harmless reads, full-tree scans on boot, and megabytes of unchecked skill text.
-
-`twig` takes the opposite approach:
-
-- **One round-trip per model turn** — multiple tool calls execute within a single turn, with mid-turn steering (`Enter` while running) and automatic retry on transient upstream errors.
-- **Responsive borderless warm-terracotta TUI** — zero 4-sided box borders, adapts cleanly across **phone / Termux / Blink SSH (`36×16`)**, **tmux split panes (`60×20`)**, **laptops (`100×28`)**, and **ultrawide monitors (`180×45`)**.
-- **Cross-platform by design** — native execution, clipboard text/image, file locking, XDG/AppData config paths, and isolated Git-worktree subagents on **Linux, macOS, and Windows**.
-- **Three-tier shell policy (no LLM classifier)** — `Auto` (shape-cached read-only commands), `Audit` (default, runs immediately and logs out of band), and `Deny` (token-aware destructive guard that pauses for human approval).
-- **3-tier hybrid skill system** — project (`.twig/skills`) > global (`~/.config/twig/skills`) + cold vault (`~/.local/share/twig-skills-vault`), with zero-RTT `$skill-name` invocation and automatic Top-5 local pre-ranking when `> 15` skills are enabled.
-- **Evidence over claims** — external acceptance checks, differential replay verification, BLAKE3 hash-chained JSONL session records, and ablation-controlled `harness.json` tuning (`twig improve`).
+> **Bring any model, keep ironclad engineering discipline.** Point `twig` at any OpenAI-compatible gateway (default: `magpie`), route heterogeneous models per role (`code`, `plan`, `advisor`, `reviewer`, `scout`), or bridge local `cli:claude` / `cli:codex` / `cli:gemini` subscriptions directly inside isolated Git worktrees.
 
 ---
 
-## Platform Support
+## Contents
 
-| Platform | TUI & Core Loop | Structured Tools & Shell | Clipboard (Text / Image) | Subagents & Isolation |
-|---|---|---|---|---|
-| **Linux** (`x86_64` musl, `aarch64`) | Full | Full (`sh -c`, `waitid` pgid cleanup) | OSC 52 + `wl-copy` / `wl-paste` | Isolated Git worktree + optional `bwrap` OS sandbox |
-| **macOS** (`arm64`, `x86_64`) | Full | Full (`sh -c`, pgid cleanup) | OSC 52 + `pbcopy` / `pngpaste` | Isolated Git worktree (`mode.set` RO for scout/reviewer) |
-| **Windows** (`x86_64-msvc`) | Full (Windows Terminal) | Full (`cmd /C`, `taskkill /T` tree cleanup) | OSC 52 + `clip` / PowerShell clipboard | Isolated Git worktree (`mode.set` RO for scout/reviewer) |
-| **Mobile SSH / Termux** | Responsive compact layout (`>= 32 cols`) | Remote host or Termux shell | OSC 52 | Runs on connected host |
+1. [Why `twig`?](#why-twig)
+2. [How `twig` Compares (`twig` vs `Claude Code` vs `Codex CLI`)](#how-twig-compares)
+3. [Installation](#installation)
+4. [Quick Start](#quick-start)
+5. [Interactive TUI (`twig chat`)](#interactive-tui-twig-chat)
+6. [Recursive Collective Intelligence (RCI) & Multi-Agent Orchestration](#recursive-collective-intelligence-rci--multi-agent-orchestration)
+7. [Verification, Lossless Compaction & Self-Improvement](#verification-lossless-compaction--self-improvement)
+8. [3-Tier Skill System & MCP Integration](#3-tier-skill-system--mcp-integration)
+9. [Architecture](#architecture)
+10. [CLI Reference & Environment Variables](#cli-reference--environment-variables)
+
+---
+
+## Why `twig`?
+
+Most coding agents suffer from three structural failure modes: **vendor lock-in**, **unverified model claims** ("tests pass!" when nothing ran), and **shared-context multi-agent token waste**. `twig` solves all three in a single zero-dependency static binary (`<15ms` cold start, `~10 MB` RSS):
+
+- **Claude Code-Caliber Terminal UX + Scientific Rendering** — Distinct full-width request cards, `◆` assistant replies, `Ctrl+O` result-focused tool folding, unfolded `● Update(file) +N -M` cards with **intra-line word-level diffs**, rich approval diff previews with inline rejection feedback (`Tab`), `Alt+Enter` queued follow-up pills (`↑` pops back to edit), `Ctrl+B` live backgrounding, `Ctrl+T`/`↓` interactive subagent/task drawer, `/btw` floating side-cards, **plus native terminal GFM box tables, Unicode LaTeX math (`$...$` / `$$...$$`), and Mermaid/SVG diagrams**.
+- **Gateway-Neutral + Native CLI Bridges** — Mix and match OpenAI-compatible endpoints (`magpie`, vLLM, OpenRouter, LiteLLM) with local CLI engines (`cli:claude`, `cli:codex`, `cli:gemini`) per role (`code`, `plan`, `advisor`, `reviewer`, `scout`).
+- **Two-Stage Lossless Context Compaction** — Stage 1 deterministically offloads large older tool outputs to `artifact:tool-<id>.txt` with zero LLM calls; Stage 2 folds rolling history into a bounded summary while archiving full verbatim JSON (`context-<blake3>.json`) so the agent can paginate any historical line via `read(path="artifact:...", start_line=...)` even after 200+ tool calls.
+- **Evidence Over Claims (`twig verify` & `Record`)** — Every session is written to a **BLAKE3 hash-chained JSONL ledger** (`twig record`), gated by project `post_edit_check` / `check_on_change` hooks, Stop Hooks (`exit 2` blocks completion and feeds diagnostics back), and clean-room black-box differential oracle replay (`twig verify`).
+- **Recursive Collective Intelligence (RCI)** — Implements Stanford/Berkeley/NVIDIA RCI principles (`arXiv:2611.32606`): disjoint `slice` assignment + **Split-Fact Blackboard** across parallel Git-worktree subagents, `.twig/notes/<role>.md` protocol cards, **Equal-Budget Ladder** grading (`twig ladder` across `Level 0..=3`, $V(n_B)$, $\text{pass@}n_B$), and **label-free gated recursion** (`twig rci`).
+
+---
+
+## How `twig` Compares
+
+| Capability | `twig` | `Claude Code CLI` | `Codex CLI` |
+|---|---|---|---|
+| **Runtime Footprint** | **Single static Rust binary** (`musl`, `<15ms` boot, `~10 MB` RAM) | Node.js + Ink React TUI (~100+ MB RAM) | Rust TUI (Apache-2.0) |
+| **Model & Vendor Freedom** | **Any OpenAI gateway + per-role routing + `cli:claude`/`cli:codex`/`cli:gemini` bridges** | Coupled to Anthropic Messages protocol | Coupled to OpenAI Responses API |
+| **Terminal Rich Rendering** | **Word-level diffs + CJK-aligned GFM tables + LaTeX math + Mermaid/SVG box diagrams** + built-in `twig web` cockpit | Word-level diffs & polished TUI; raw LaTeX / Mermaid source | Clean minimal patch TUI; raw LaTeX / Mermaid source |
+| **Context Compaction** | **2-stage lossless** (`artifact:tool-*.txt` addressable line-by-line + folded summary) | LLM `/compact` summary + prompt cache | Responses API state chaining + truncation |
+| **Multi-Agent Discipline** | **Isolated Git worktrees + Split-Fact Blackboard + RCI Equal-Budget Ladder (`pass@n_B`)** | Subagents + background tasks | Cloud tasks / local sub-runs |
+| **Audit & Verification** | **BLAKE3 tamper-evident chain + black-box `twig verify` + ablation-gated `twig improve`** | Permissions + Hooks | Kernel Landlock / Seatbelt sandbox |
 
 ---
 
 ## Installation
 
-### 1. One-Line Prebuilt Installer (Recommended)
+### 1. One-Line Prebuilt Installer (No Login Required)
 
 **Linux & macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.sh | sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/SEMANTICx/twig/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.ps1 | iex
 ```
 
-*(Both scripts verify SHA-256 checksums against GitHub Releases and install into `~/.local/bin` or `%LOCALAPPDATA%\twig\bin`. Pin a version with `TWIG_VERSION=v0.2.0`.)*
+> Verifies SHA-256 checksums against `SHA256SUMS.txt` on [`SEMANTICx/twig-dist`](https://github.com/SEMANTICx/twig-dist) and installs to `~/.local/bin/twig` (or `%LOCALAPPDATA%\twig\bin`). Pin a release via `TWIG_VERSION=v0.2.0`.
 
-### 2. Cargo / `cargo-binstall`
-
-```bash
-# Instant prebuilt download via cargo-binstall (no local compilation)
-cargo binstall --git https://github.com/SEMANTICx/twig.git twig
-
-# Or build from source
-cargo install --git https://github.com/SEMANTICx/twig.git --locked
-```
-
-### 3. Manual Build from Source
+### 2. Build from Source (Private / Dev Checkout)
 
 ```bash
 git clone https://github.com/SEMANTICx/twig.git
 cd twig
 cargo build --release --locked
+install -Dm755 target/release/twig ~/.local/bin/twig
 ```
+
+### Platform Support
+
+| Platform | TUI & Core Loop | Shell & Process Cleanup | Clipboard (Text / Image) | Worktree & OS Sandbox |
+|---|---|---|---|---|
+| **Linux** (`x86_64` static `musl`, `aarch64`) | Full | `sh -c`, `waitid` pgid tree reaper | OSC 52 + `wl-copy` / `wl-paste` | Git worktree + `bwrap` namespace isolation |
+| **macOS** (`arm64`, `x86_64`) | Full | `sh -c`, process-group cleanup | OSC 52 + `pbcopy` / `pngpaste` | Git worktree + read-only tool guard |
+| **Windows** (`x86_64-msvc`) | Full (Windows Terminal) | `cmd /C`, `taskkill /T /F` | OSC 52 + `clip` / PowerShell | Git worktree + read-only tool guard |
+| **Mobile SSH / Termux** | Responsive down to `32 cols` + `twig web` | Host shell | OSC 52 | Host isolation |
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Verify environment, config, git/bwrap, model gateway, and skills
+# 1. Check gateway connectivity, sandbox, active role routing, and skill health
 twig doctor
 
-# 2. Run offline harness self-check (no model/network required)
+# 2. Run deterministic offline harness self-checks (zero network/LLM calls)
 twig selfcheck
 
-# 3. Launch the interactive TUI in any repository
+# 3. Start the interactive TUI inside any project
 cd /path/to/your/repo
 twig chat
 
-# 4. Run a headless single-shot task or manage first-class sessions from CLI/scripts
-twig exec --role plan "Inspect architecture and list bottlenecks"
-twig exec --check "cargo test" --json "Fix off-by-one in parser"
-twig exec --events "Trace and fix failing test"
-twig session list
-twig session search "parser"
+# 4. Launch the mobile/desktop browser cockpit (live SSE + inline SVG/math + Bearer auth)
+twig web --port 3426
+
+# 5. Run headless in CI or scripts with an external acceptance gate
+twig exec --check "cargo test --quiet" --json "Fix off-by-one bounds bug in parser"
 ```
 
 ---
 
-## Responsive Borderless TUI (`twig chat`)
-
-`twig` adapts layout, margins, gutters, shortcut overlays, approval panels, and footer telemetry to any viewport width and height:
-
-| Breakpoint | Typical Device | Layout Adaptation |
-|---|---|---|
-| **Compact (`< 58 cols`)** | Phone SSH / Termux portrait (`36×16`) | Stacked welcome header with tail-elided path & wrapped env pulse, tight 1-col margins, hidden diff line-number gutter, compact placeholder `Ask twig… (/ @ $ !)`, single-column `?` shortcut guide, concise footer (`✻ repo · model · badges`), compact approval options |
-| **Split (`58–87 cols`)** | Tmux / IDE split pane (`60×20`) | Inline welcome header, full diff gutters, shortened right footer hint (`? help · ^R hist`), 1-column `?` overlay below 76 cols |
-| **Desktop / Ultrawide (`>= 88 cols`)** | Laptop & desktop (`100×28` – `180×45`) | Full welcome pulse, full live telemetry (`repo (branch) +N -M · model effort · ctx% · tokens · cache%`), 2-column `?` shortcut reference |
+## Interactive TUI (`twig chat`)
 
 ```text
-  ✻ twig 0.2.0  ~/Dev/my-project
-    skills 10 (+13 vault)  ·  docs AGENTS.md  ·  mcp 0  ·  sandbox off
+  ✻ twig 0.2.0  ~/Dev/twig
+    skills 10 (+13 vault)  ·  docs AGENTS.md  ·  mcp 0  ·  sandbox bwrap
 
- ───────────────────────────────────────────────────────────────────────────
-  ❯ Ask twig anything… (/ command · @ file · $ skill · ! shell)
- ───────────────────────────────────────────────────────────────────────────
-  ✻ my-project (main) +12 -3 · claude-sonnet-4 high     ? shortcuts · Shift+Tab plan · ^R history
+    ▎
+    ▎  ❯ Audit context compaction and fix budget overflow on 200-tool runs
+    ▎
+
+    ▸ 14 tools (9 read · 3 search · 2 bash)  3s · ^O expand
+
+    ● Update(src/runtime/context.rs)  +42 -11  0s
+      ⎿  @@ -291,6 +291,8 @@
+          294   let t = s.trim_start();
+          295 - t.starts_with("<system-reminder>")
+          295 + t.starts_with("<system-reminder>") || t.starts_with("Compacted history")
+
+    ◆ Folded prior summaries into a single rolling summary and capped artifact refs.
+
+    ↳ Queued  Run full test suite next   (↑ edit · /unqueue)
+    ✻ Synthesizing  (12s · queued:1 · esc interrupt · ^B bg · enter steer · alt+enter queue)
+    ─────────────────────────────────────────────────────────────────────────────────────────
+    ❯ Type steering guidance and press Enter (or Esc to interrupt)…
+    ─────────────────────────────────────────────────────────────────────────────────────────
+    ◈ Subagents  ·  2 running · 1 done  (↓ / ^T inspect)
+      ✦  reviewer*   src/runtime/turn.rs — verify budget synthesis turn  8s
+      ✦  scout*      src/tui/overlays.rs — check drawer keybindings      5s
+    ✻ twig (main) +42 -11 · gpt-5.4 high · ctx 38% · 48.2k tok · cache 81%   ^O tools · Shift+Tab · ^T · ?
 ```
 
-### Input Prefixes
+### Composer Modes & Inline Prefixes
 
-| Prefix | Purpose |
+| Prefix | Visual Mode & Behavior |
 |---|---|
-| `/` | Fuzzy slash-command palette |
-| `@` | Repository file, inline image (`@shot.png`), or live context (`@diff`, `@staged`, `@last`) |
-| `$` | Direct skill autocomplete & zero-RTT invocation (supports active + `[vault]` skills) |
-| `!` | Run a local shell command immediately in the repo without spending tokens |
+| *(plain text)* | **Chat / Steer Mode (`❯`)** — Sends a new turn when idle, or injects live mid-turn **steering guidance** (`Enter`) while running |
+| `/` | **Slash Palette** — Fuzzy-filtered command menu (`Enter` executes zero-arg commands immediately; `Tab` autocompletes) |
+| `@` | **Context & Line-Slice Mention** — `@src/lib.rs`, **exact line slices `@src/lib.rs#L10-50` (`:10-50`)**, inline images `@shot.png`, or live git/shell state (`@diff`, `@staged`, `@last`) |
+| `$` | **Zero-RTT Skill Invocation** — Autocompletes active & cold-vault skills (`$karpathy-guidelines`), injecting the skill body on send |
+| `!` | **Cyan Local Bash Mode (`$`)** — Morphs composer to cyan `! bash mode`; executes locally in `0` tokens and exposes output to `@last` |
+| `#` | **Lavender Memory Mode (`♯`)** — Morphs composer to `# memory mode`; `Enter` opens a 1-key picker to append the rule to `.twig/preferences.md` (repo) or `~/.config/twig/preferences.md` (global) |
 
-### Key Slash Commands & Shortcuts
+### Keyboard Workflow & Slash Commands
 
-| Command / Key | Action |
+| Shortcut / Command | Action |
 |---|---|
-| `Shift+Tab` / `/plan` | Toggle read-only planning mode (automatically routes to `plan` role model) |
-| `/study [on\|off\|<target>]` | Toggle opt-in REA clean-room study mode (`[Observed]`/`[Derived]`/`[Inferred]`/`[Unknown]` provenance; 0 tokens when off) |
-| `/go [instructions]` | Exit `/plan` & `/study`, switch back to `code` role model, and execute the agreed plan/spec + tests |
-| `/roles [<role> <model> [effort]]` | Configure heterogeneous models or external CLI workers (`cli:codex`, `cli:claude`, `cli:gemini`) per role in `roles.json` |
-| `/operator` | Toggle Agent-as-Memory multi-session orchestration mode (zero token overhead when off) |
-| `/dual-plan <goal>` | Run blind independent tool-driven plans (`outline`/`read`/`grep`/`glob`) on `plan` × `advisor` models, then synthesize a brief |
-| `/btw <question>` | Ask an ephemeral side question reusing KV cache without polluting session history |
-| `/walkthrough` / `/commit [hint]` | Generate a logical walkthrough of `git diff` / stage & commit with a repo-style-matched message |
-| `/apply <sid>` / `/gc` | Apply a subagent session patch cleanly into the worktree (reversible via `/undo`) / clean up 0-byte & stale subagent remnants |
-| `Esc×2` / `/rewind [N] [--code]` | Rewind conversation turns (`Enter` chat-only, `r` / `--code` also restores Git worktree snapshot) |
-| `/undo` | Revert the last `edit`, `write`, or `apply_patch` file change |
-| `/model` / `/effort` | Switch active fallback model via gateway / set reasoning effort (`off`..`xhigh`) |
-| `/skills [list\|enable\|disable\|doctor]` | Inspect, hot-toggle, and lint 3-tier skills without restarting |
-| `/diff` / `/review` | Inspect git diff / run two-tier (`blockers` vs `suggestions`) independent review with auto `xhigh` escalation on sensitive paths |
-| `/tasks` / `/mcp [enable\|disable\|init-rea]` | Inspect background tasks / list or hot-toggle MCP servers (including opt-in `rea-agents` scaffold) |
-| `/evolve` | Guard-first ratchet proposal (executable tests/`post_edit_check` first, bounded `<= 2.4K` `.twig/preferences.md` consolidation) |
-| `/memory` / `/init` | Edit `.twig/preferences.md` in `$EDITOR` (`/memory show` displays budget) / scaffold `.twig/` |
-| `/fork` / `/resume` / `/archive` / `/export` | Branch, repo-scoped resume (`a` toggles all repos), archive, or export sessions to Markdown |
-| `/compact` / `/verify` / `/status` / `/doctor` | Two-stage context compaction / verify BLAKE3 hash chain / inspect telemetry & environment |
-| `Ctrl+R` / `Ctrl+F` / `Ctrl+G` / `Ctrl+O` | Persistent prompt history / search transcript / compose in `$EDITOR` / expand tool outputs |
-| `Alt+V` / `Alt+Y` / `Alt+M` / `?` | Paste clipboard image / copy code block (`+Shift` full reply) / toggle mouse select / shortcut overlay |
+| `Shift+Tab` | **3-Mode Permission Cycle**: `Auto-Accept Edits` (default) ⇄ `◈ Plan Mode` (read-only) ⇄ `🔒 Review Edits` (diff approval before every edit) |
+| `Ctrl+O` / `/expand` | Toggle **Result-Focused Folding** (collapses finished exploration bursts & intermediate thoughts; keeps Requests, `Update` diffs & Replies) |
+| `Alt+Enter` / `↑` | **Queue Follow-Up Prompt** while busy (`↳ Queued` pill above composer); press **`↑` in an empty composer** to pop it back for editing |
+| `Ctrl+B` | **Detach to Background**: detaches a slow foreground `bash` command into an async session background process without killing it |
+| `Ctrl+T` / `↓` | **Subagents & Background Tasks Drawer**: inspect live subagent tasks/errors or background shell tails (`Enter`), or press **`x`** to kill a task |
+| `Tab` / `3` *(in Approval)* | **Inline Rejection Feedback**: type instructions directly on Option 3 (`Tell twig instead: ...`) so the model pivots immediately |
+| `/btw <question>` | **Floating Ephemeral Side-Card**: answers above the composer reusing KV cache with zero history/transcript pollution (`Esc`/`Space` dismisses) |
+| `Esc×2` / `/rewind` | Interactive turn rewind (`Enter` rewinds chat only; `r` / `--code` restores exact Git worktree tree snapshot; `f` forks session) |
+| `/plan` → `/go [note]` | Explore & design read-only on the `plan` model, then `/go` to restore write access and execute on the `code` model |
+| `/dual-plan <goal>` | Blind parallel tool-verified planning across `plan` × `advisor` models followed by a synthesized consensus brief |
+| `/diff` / `/review` / `/walkthrough` | Line-numbered diff / fresh read-only `blockers` vs `suggestions` review (`xhigh` on sensitive paths) / logical architecture walkthrough |
+| `/commit [hint]` / `/pr` / `/worktree` | Repo-style smart commit (zero AI trailers) / push & open PR / live mid-session handoff to an isolated Git worktree |
+| `Ctrl+F` / `Ctrl+R` / `Ctrl+G` | Case-folding CJK-safe transcript search / fuzzy prompt history picker / compose draft in `$EDITOR` |
+| `Alt+Y` / `Alt+Shift+Y` / `Alt+V` / `Alt+M` | Cycle-copy code blocks / copy full reply / attach clipboard screenshot / toggle mouse capture for native text selection |
 
 ---
 
-## Agent Tools & Runtime Architecture
+## Recursive Collective Intelligence (RCI) & Multi-Agent Orchestration
 
-### Built-in Tools
+Inspired by **Recursive Collective Intelligence** (*He et al., Stanford / UC Berkeley / NVIDIA, arXiv:2611.32606*), `twig` treats multi-agent collaboration as a rigorous budget-accounted engineering discipline rather than unstructured roleplay:
 
-| Tool | Behavior |
-|---|---|
-| `outline`, `read`, `edit`, `write`, `apply_patch`, `grep`, `glob` | Worktree-confined structured tools: zero-dependency symbol `outline`, line-numbered `read` (`artifact:<file>`, `session:<sid>`, lazy subdirectory `AGENTS.md`/`CLAUDE.md`), Read-Before-Edit `mtime` lock (persisted across `/resume`), 4-level progressive indentation `edit`, multi-file `apply_patch`, and `.twig/project.json` `post_edit_check` / `check_on_change` hooks |
-| `bash` | Bounded 1 MiB shell runner (`sh -c` on Unix, `cmd /C` on Windows) with automatic process-group/FD reclamation, parallel `Auto` read batching, optional Linux `bwrap` isolation, and tiered policy |
-| `task` | Session-scoped async background shell tasks (`start`, `send` stdin, `status`, `wait`, `cancel`, `list`) with cancellation support |
-| `subagent` | Parallel & resumable (`resume_sid`) isolated Git worktrees (`code`, `test`, `scout`, `advisor`, `reviewer`); returns `sid`, `diff_stat`, and `artifact:subagent-<sid>.patch` |
-| `skill` | Progressive-disclosure skill catalog (`query`) and on-demand body loader (`name`), including cold-vault fallback |
-| `mcp` | Lazy stdio JSON-RPC 2.0 MCP client (`.twig/mcp.json` & config `mcp.json`) supporting tools (`Audit` tier, blocked in read-only mode), prompts, and resources |
-| `todo` / `papercut` | Live progress checklist / structured harness defect reporting |
+### 1. Why Shared-Context Debate Wastes Tokens — and How `twig` Fixes It
+When 4 agents read the same context and debate conclusions, accuracy stays at or below equal-budget majority vote ($V(n_B)$) while burning $3\text{–}6\times$ the tokens. Genuine **Level 3 Collective Emergence** ($P_{\text{team}} > \text{pass@}n_B$) happens when agents inspect **disjoint slices** and forward **verbatim `path:line` facts** onto a shared blackboard:
 
-### 3-Tier Skill Management (`twig skill`)
+- **Disjoint `slice` + `Blackboard` (`subagent` tool & `/operator`)**:
+  Parallel `subagent` calls take an explicit `slice` (e.g. `"src/runtime/*"` vs `"src/tui/*"`) in isolated Git worktrees (`--ro-bind` in `bwrap` for `scout`/`advisor`/`reviewer`). Decisive `path:line` & `[Observed]` facts are automatically harvested onto the session's **RCI Split-Fact Blackboard** (`/blackboard`) and forwarded to downstream waves.
+- **Role Protocol Cards (`.twig/notes/<role>.md`)**:
+  Compact (`<= 1,200` chars) per-role protocol cards (`scout`, `code`, `test`, `advisor`, `reviewer`) are injected automatically into subagents — zero prompt cost when absent, cutting coordination overhead by >40% when active.
+
+### 2. Equal-Budget Ladder (`twig ladder`) & Label-Free Gated Recursion (`twig rci`)
 
 ```bash
-twig skill list                         # Inspect project, global, and vault skills
-twig skill enable <name> [--project]    # Enable globally (symlink on Unix, copy on Windows) or in .twig/skills/
-twig skill disable <name> [--project]   # Disable without deleting from vault
-twig skill add <path> [--name N] [--enable]
-twig skill doctor                       # Audit frontmatter, 500-line budget, shadowing & hygiene
+# 1. Run solo baseline (4 reps) and collective team on the same eval suite
+twig eval evals 4 > solo_log.txt
+twig ladder solo_results.jsonl team_results.jsonl
 ```
 
-- **Tier 1 (Project)**: `<repo>/.twig/skills/<name>/SKILL.md` (highest precedence, confined to repo)
-- **Tier 2 (Global Active)**: `~/.config/twig/skills` (Windows: `%APPDATA%\twig\skills`, recommended `<= 10–15` evergreen skills)
-- **Tier 3 (Cold Vault)**: `~/.local/share/twig-skills-vault` (Windows: `%LOCALAPPDATA%\twig-skills-vault`; zero Layer-1 token cost; invoke on-demand via `$name` or `skill(name="...")`)
+`twig ladder` grades collective runs against solo runs at matched completion-token budget $n_B = B_{\text{team}} / B_{\text{solo}}$:
+- **Level 0**: $P_{\text{team}} \le P_1$ *(net coordination tax)*
+- **Level 1**: $P_1 < P_{\text{team}} \le V(n_B)$ *(beats 1 agent, within majority vote)*
+- **Level 2**: $V(n_B) < P_{\text{team}} \le \text{pass@}n_B$ *(beats vote, within independent oracle selection)*
+- **Level 3**: $P_{\text{team}} > \text{pass@}n_B$ *(genuine collective emergence + equivalent solo budget savings $n_{\text{eq}}$ & exact sign-test $p$-value)*
 
-### Instruction Discovery
-
-On every turn, `twig` automatically loads repository instructions in precedence order (bounded to 32 KB):
-1. `AGENTS.md`
-2. `CLAUDE.md`
-3. `.twig/preferences.md`
-
-### Safety, Guard & Compaction
-
-- **Three-Tier Shell Policy**:
-  - `Auto`: read-only commands (`ls`, `cat`, `rg`, `git status/diff/log`, …) with shape caching.
-  - `Audit`: default for ordinary work; runs immediately and logs to the session record.
-  - `Deny`: token-aware destructive guard (`rm -rf /`, `rm -fr ~`, `git push -f/--force`, `git reset --hard`, `git clean -fdx`, `dd of=/dev/...`, `mkfs*`, etc.) held for explicit human approval (`1. Allow once` / `2. Always allow shape` / `3. Deny`).
-- **Progress Guard & Loop Breaker**: detects stalled turns (warns → narrows to read-only → aborts safely) and nudges the agent when identical failing tool calls repeat.
-- **Lossless Compaction**: archives full history to JSON, preserves verbatim user constraints, valid tool-call pairs, and all `artifact:tool-*.txt` side-channel references across compaction and resume.
-
----
-
-## Releasing & Distribution
-
-Every `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to lint and build 5 prebuilt archives + `SHA256SUMS.txt`:
-
-- `twig-<tag>-x86_64-unknown-linux-musl.tar.gz` (static portable Linux x64)
-- `twig-<tag>-aarch64-unknown-linux-gnu.tar.gz` (Linux ARM64)
-- `twig-<tag>-aarch64-apple-darwin.tar.gz` (macOS Apple Silicon)
-- `twig-<tag>-x86_64-apple-darwin.tar.gz` (macOS Intel)
-- `twig-<tag>-x86_64-pc-windows-msvc.zip` (Windows x64)
-
-Cut a release with:
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
+# 2. Harvest ONLY BLAKE3-valid, auto-verified collective sessions (zero human labels)
+twig rci harvest
 
-Once public, the recommended multi-channel distribution stack is:
-1. **GitHub Releases + `install.sh` / `install.ps1`** (already wired in this repo)
-2. **`cargo-binstall`** (`[package.metadata.binstall]` already configured in `Cargo.toml`)
-3. **Homebrew Tap (`brew install SEMANTICx/tap/twig`)** for macOS/Linux + **Scoop bucket (`scoop install twig`)** for Windows + **AUR (`twig-bin`)** for Arch Linux — all pointing directly at the GitHub Release archives and `SHA256SUMS.txt`.
+# 3. Distill anti-overfit-checked role cards into .twig/notes/{scout,code,test,advisor,reviewer}.md
+twig rci distill --online
+
+# 4. Gate generation promotion (requires 0 regressions on solved tasks + accuracy or >=15% budget win)
+twig rci gate solo_results.jsonl gen0_team.jsonl gen1_team.jsonl
+```
 
 ---
 
-## Configuration & Environment Variables
+## Verification, Lossless Compaction & Self-Improvement
 
-| Variable | Default | Description |
+- **Clean-Room Differential Replay (`twig verify`)**:
+  Record I/O behavior from a reference binary or legacy script (`twig verify record journal.jsonl ./legacy_bin --raw`), then wire `--journal journal.jsonl` into `twig` so the agent cannot finish until the candidate binary matches every recorded case.
+- **Protected `HarnessConfig` Optimizer (`twig improve`)**:
+  Splits tasks into `train` and unreachable `heldout`, diagnoses failure modes via contrastive variance, runs **deletion ablations** so dead prompt prose is never added, blocks task-token leakage (`lint`), and promotes changes only when heldout gates pass without regressions.
+- **Three-Tier Shell Policy (`src/runtime/policy.rs`)**:
+  Zero-latency AST/token classifier: `Auto` (shape-cached read-only commands fan out in parallel), `Audit` (ordinary build/test commands run immediately and log to ledger), and `Deny` (destructive shapes like `rm -rf /`, `git push --force`, `git reset --hard`, or `.env`/`.twig` control-plane writes pause for explicit human approval).
+
+---
+
+## 3-Tier Skill System & MCP Integration
+
+```bash
+twig skill list                         # Show Project (.twig/skills), Global Active, and Cold Vault skills
+twig skill enable sharp-edges           # Activate a vault skill globally
+twig skill enable my-skill --project    # Scope a skill to the current repository
+twig skill add ./path/to/skill --enable # Import a SKILL.md bundle into the vault
+twig skill doctor                       # Enforce frontmatter, <=500-line cap, and shadow checks
+```
+
+- **Cold Vault = Zero Token Tax**: Keep 50+ specialized skills in `~/.local/share/twig-skills-vault` at `0` system-prompt tokens; invoke any vault skill on the fly with `$skill-name` in `twig chat` or `skill(name="...")`.
+- **Lazy Stdio MCP (`mcp` tool & `/mcp`)**: Configure servers in `.twig/mcp.json` or `~/.config/twig/mcp.json`; toggle live with `/mcp enable <name>` / `/mcp disable <name>`.
+
+---
+
+## Architecture
+
+`twig` enforces a strict **acyclic 7-layer DAG** verified on every build by `deslop-please` (zero circular dependencies, `<2,000` lines per file, narrow module interfaces, zero external bloat crates):
+
+```text
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Interfaces : tui (Ratatui chat) · web (HTTP+SSE cockpit) · automate │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Evaluation : eval (runner, improve, ablation, trajectory, rci)      │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Runtime    : daemon · turn · tools · subagent · context · policy    │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Verify     : differential oracle replay & branch-coverage gates     │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Model      : llm (OpenAI SSE, role router, cli:claude/codex/gemini) │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Execution  : exec (process-group reaper, PTY/pipes, Linux bwrap)    │
+  ├─────────────────────────────────────────────────────────────────────┤
+  │ Foundation : config · record (BLAKE3 hash chain + flock) · control  │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## CLI Reference & Environment Variables
+
+### Commands
+
+```text
+twig chat [repo] [sid] [--plain]                 Interactive borderless TUI
+twig web [--port 3426] [--bind 127.0.0.1]        Browser & mobile cockpit
+twig exec [flags] "<prompt>"                     Headless single-shot execution (--role/--model/--check/--json/--events)
+twig session <list|search|show|spawn|send|diff|apply|archive|gc>
+twig verify [record] <journal.jsonl> <program>   Black-box differential oracle recording & gating
+twig eval [dir] [reps] [only]                    Isolated worktree benchmark runner
+twig ladder <solo.jsonl> <team.jsonl> [--json]   RCI Equal-Budget Ladder grader (Levels 0..3)
+twig rci <status|harvest|distill|gate>           Label-free role-card recursion & release gating
+twig improve [dir] [rounds]                      Ablation-controlled harness.json optimizer
+twig skill <list|enable|disable|add|doctor>      3-tier skill manager
+twig review [repo] <diff_file>                   Independent two-tier read-only diff reviewer
+twig subagent [repo] [role] "<task>"             Run an isolated role subagent
+twig automate [automation.json] [--once]         Unattended GitHub issue/PR maintenance loop
+twig record <session.jsonl>                      Verify BLAKE3 session hash-chain integrity
+twig doctor / twig selfcheck / twig config [init]
+```
+
+### Environment Variables
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `TWIG_BASE_URL` | `http://127.0.0.1:3425/v1` | OpenAI-compatible gateway URL |
-| `TWIG_API_KEY` | `magpie` | Bearer token for gateway |
-| `TWIG_MODEL` | *(saved `/model`)* | Override default model (takes precedence over saved `model.txt`) |
-| `TWIG_ROLES` | — | JSON role map, e.g. `'{"code":"...","plan":"...","filter":"...","judge":"..."}'` (`scout→filter`, `reviewer→judge`) |
-| `TWIG_EFFORT` | *(saved `/effort`)* | Reasoning effort: `off`, `low`, `medium`, `high`, `xhigh` |
-| `TWIG_CONFIG` | `~/.config/twig/harness.json` | Path to `HarnessConfig` JSON |
-| `TWIG_SKILLS_DIR` | `~/.config/twig/skills` | Active global skills directory |
-| `TWIG_SKILLS_VAULT` | `~/.local/share/twig-skills-vault` | Inactive cold skill vault directory |
-| `TWIG_WORKERS` | `4` | Parallel worker count for `twig eval` |
-| `TWIG_WALL_SECS` | `300` | Per-task wall-clock limit for `twig eval` |
+| `TWIG_BASE_URL` | `http://127.0.0.1:3425/v1` | OpenAI-compatible gateway endpoint |
+| `TWIG_API_KEY` | `magpie` | Gateway Bearer API key |
+| `TWIG_MODEL` | *(saved `/model`)* | Override active model (`cli:claude`, `cli:codex`, `cli:gemini`, or gateway model ID) |
+| `TWIG_ROLES` | *(saved `/roles`)* | JSON per-role map (`code`, `plan`, `advisor`, `reviewer`, `scout`) |
+| `TWIG_EFFORT` | *(saved `/effort`)* | Reasoning effort (`off`, `low`, `medium`, `high`, `xhigh`) |
+| `TWIG_CONFIG` | `~/.config/twig/harness.json` | Custom `HarnessConfig` JSON path |
+| `TWIG_SKILLS_DIR` / `TWIG_SKILLS_VAULT` | XDG / AppData defaults | Active global skills dir / zero-cost cold vault dir |
+| `TWIG_WORKERS` / `TWIG_WALL_SECS` | `4` / `300` | Parallelism & wall-clock timeout for `twig eval` |
+| `TWIG_REDUCED_MOTION` | `0` | Set `1` to disable smooth scroll & breathing animations |
 
 ---
 
-## Development & Quality Gates
+## Quality Gates
 
 ```bash
-deslop-please                                # Architecture & hygiene lint (0 errors)
-cargo clippy --all-targets -- -D warnings    # Zero warnings
-cargo run --quiet -- selfcheck               # Offline self-check
-cargo test --no-fail-fast                    # Full unit + integration suite
+deslop-please                                # Enforce strict DAG, module depth & zero field leaks
+cargo clippy --all-targets -- -D warnings    # Zero compiler or clippy warnings
+cargo run --quiet -- selfcheck               # Deterministic offline invariant checks
+cargo test --no-fail-fast                    # Full unit + integration test suite
 ```
-
-See [AGENTS.md](AGENTS.md) for codebase architecture and contributor guidelines.
-
----
 
 ## License
 

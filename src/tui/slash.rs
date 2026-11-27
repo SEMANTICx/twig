@@ -142,6 +142,33 @@ impl App {
                         self.transcript.push_assistant(report);
                     }
                 }
+                if self.blackboard_req == Some(id) {
+                    self.blackboard_req = None;
+                    if let Some(cleared) = result.get("cleared").and_then(Value::as_u64) {
+                        let msg = format!("Cleared {cleared} fact(s) from RCI blackboard");
+                        self.flash(&msg);
+                        self.transcript.push_notice(NoticeKind::Info, msg);
+                    } else {
+                        let facts = result["facts"].as_array().cloned().unwrap_or_default();
+                        if facts.is_empty() {
+                            self.transcript.push_notice(
+                                NoticeKind::Info,
+                                "RCI split-fact blackboard is empty (parallel subagents populate `path:line` facts automatically)",
+                            );
+                        } else {
+                            let body: Vec<String> = facts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(|f| format!("- {f}"))
+                                .collect();
+                            self.transcript.push_notice(
+                                NoticeKind::Playbook,
+                                format!("RCI split-fact blackboard ({} facts)", body.len()),
+                            );
+                            self.transcript.push_assistant(body.join("\n"));
+                        }
+                    }
+                }
                 if self.tasks_req == Some(id) {
                     self.tasks_req = None;
                     if let Some(r) = result.get("running").and_then(Value::as_u64) {
@@ -1045,6 +1072,63 @@ impl App {
                     json!({"action": action, "server": server}),
                     &flash_msg,
                 );
+            }
+            SlashCommand::Blackboard { action, fact } => {
+                self.blackboard_req = self.send_rpc(
+                    client,
+                    "blackboard",
+                    json!({"action": action, "fact": fact}),
+                    "",
+                );
+            }
+            SlashCommand::RunRci(sub) => {
+                let repo_path = std::path::Path::new(&self.repo_raw);
+                let sessions_dir = crate::config::paths::state_dir().join("sessions");
+                match sub.as_str() {
+                    "harvest" => match crate::eval::rci::harvest_sessions(&sessions_dir) {
+                        Ok(rep) => {
+                            self.transcript.push_notice(
+                                NoticeKind::Playbook,
+                                format!(
+                                    "RCI label-free harvest: {} verified collective session(s) out of {} valid ledgers",
+                                    rep.verified_collective_sessions, rep.chain_valid_files
+                                ),
+                            );
+                            if let Ok(pretty) = serde_json::to_string_pretty(&rep.role_credits) {
+                                self.transcript
+                                    .push_assistant(format!("```json\n{pretty}\n```"));
+                            }
+                        }
+                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                    },
+                    "distill" | "distill --online" => {
+                        let online = sub.contains("--online");
+                        match crate::eval::rci::distill_role_notes(repo_path, &sessions_dir, online)
+                        {
+                            Ok((rep, files)) => {
+                                let msg = format!(
+                                    "RCI distilled {} role protocol cards ({} verified sessions harvested)",
+                                    files.len(),
+                                    rep.verified_collective_sessions
+                                );
+                                self.flash(&msg);
+                                self.transcript.push_notice(NoticeKind::Success, msg);
+                                self.transcript.push_assistant(
+                                    files
+                                        .into_iter()
+                                        .map(|f| format!("- `{f}`"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                );
+                            }
+                            Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+                        }
+                    }
+                    _ => {
+                        let msg = crate::eval::rci::status_report(repo_path);
+                        self.transcript.push_notice(NoticeKind::Info, msg);
+                    }
+                }
             }
             SlashCommand::CompactNow => {
                 self.send_rpc(client, "session.compact", json!({}), "Compacting context…");
