@@ -73,6 +73,9 @@ case "$ARCH" in
       TARGET="x86_64-unknown-linux-musl"
       BUILD_ARGS=(--target "$TARGET")
       BIN_PATH="$ROOT/target/$TARGET/release/twig"
+      if ! command -v musl-gcc >/dev/null 2>&1 && ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1; then
+        export CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-gcc}"
+      fi
     elif [ "${TWIG_ALLOW_GNU_FALLBACK:-0}" = "1" ]; then
       TARGET="x86_64-unknown-linux-gnu"
       BUILD_ARGS=()
@@ -99,6 +102,13 @@ CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
 RUSTFLAGS="--remap-path-prefix=${ROOT}=twig --remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${RUSTUP_HOME_DIR}=/rustup" \
   cargo build --manifest-path "$ROOT/Cargo.toml" --release --locked "${BUILD_ARGS[@]}"
+
+if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && command -v ldd >/dev/null 2>&1; then
+  if ldd "$BIN_PATH" 2>&1 | grep -Eq 'libc\.so|ld-linux'; then
+    echo "error: $BIN_PATH dynamically links glibc despite musl target!" >&2
+    exit 1
+  fi
+fi
 
 PKG="twig-${TAG}-${TARGET}"
 OUT_DIR="$STAGE_DIR/out"
