@@ -1971,15 +1971,15 @@ mod tests {
         assert!(text.contains('┌') && text.contains("11-27"), "gfm box table: {text}");
         assert!(text.contains("E = mc²"), "display math rendered: {text}");
 
-        let rich = "## 标题 [规范](https://ui-sdk.dev/docs/agents)\n> 引用 [源码](/home/amedus/Dev/personal/twig/src/tui/markdown.rs:814)\n\n**重点核对 `H-01` 的 [市场判断](https://x.com/thankUcrypto/status/2126226625524343032)**\n\n- 一级要点\n  - 二级要点 [web.rs](file:///home/u/src/web.rs#L10-L20)\n    - 三级要点";
+        let rich = "## 标题 [规范](https://ui-sdk.dev/docs/agents)\n> 引用 [源码](/workspace/twig/src/tui/markdown.rs:814)\n\n**重点核对 `H-01` 的 [市场判断](https://example.com/post/12345)**\n\n- 一级要点\n  - 二级要点 [web.rs](file:///home/u/src/web.rs#L10-L20)\n    - 三级要点";
         let rich_out: String = render_markdown(rich, 80)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rich_out.contains("标题 规范 [1]") && rich_out.contains("  [1] https://ui-sdk.dev/docs/agents"));
-        assert!(rich_out.contains("▎ 引用 源码 [2]") && rich_out.contains("  [2] /home/amedus/Dev/personal/twig/src/tui/markdown.rs:814"));
-        assert!(rich_out.contains("市场判断 [3]") && rich_out.contains("  [3] https://x.com/thankUcrypto/status/2126226625524343032"));
+        assert!(rich_out.contains("▎ 引用 源码 [2]") && rich_out.contains("  [2] /workspace/twig/src/tui/markdown.rs:814"));
+        assert!(rich_out.contains("市场判断 [3]") && rich_out.contains("  [3] https://example.com/post/12345"));
         assert!(rich_out.contains(" H-01 ") && rich_out.contains("web.rs (#L10-L20)"));
         assert!(rich_out.contains("• 一级要点") && rich_out.contains("  ◦ 二级要点") && rich_out.contains("    ▪ 三级要点"));
     }

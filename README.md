@@ -68,7 +68,7 @@ irm https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.ps1 | iex
 
 > Verifies SHA-256 checksums (`sha256sum`, `shasum`, or `openssl`) against release digests on [`SEMANTICx/twig-dist`](https://github.com/SEMANTICx/twig-dist) and installs to `~/.local/bin/twig` (or `%LOCALAPPDATA%\twig\bin`). Pin a release via `TWIG_VERSION=v0.2.0`.
 
-### 2. Build from Source (Private / Dev Checkout)
+### 2. Build from Source
 
 ```bash
 git clone https://github.com/SEMANTICx/twig.git
