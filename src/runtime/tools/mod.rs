@@ -372,7 +372,7 @@ impl Tools {
             json!({"type":"function","function":{"name":"skill","description":"List/search project & global skill metadata (optional query), load one named skill body (`name`), or read a bundled Layer-3 reference file inside that skill (`name` + `file`, e.g. `file=\"references/guide.md\"`).",
                 "parameters":{"type":"object","properties":{"name":{"type":"string"},"file":{"type":"string"},"query":{"type":"string"}}}}}),
             json!({"type":"function","function":{"name":"subagent","description":"Delegate a bounded task in an isolated Git worktree; scout/advisor/reviewer are OS read-only. Pass disjoint `slice` scopes across parallel subagents (RCI split-information discipline) so each agent forwards verbatim `path:line` facts via the shared Blackboard (`use_blackboard=true` by default) rather than debating shared context. Set fork_context=true to clone current conversation context; pass resume_sid to continue a previous subagent.",
-                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","advisor","reviewer"]},"task":{"type":"string"},"slice":{"type":"string"},"use_blackboard":{"type":"boolean"},"resume_sid":{"type":"string"},"fork_context":{"type":"boolean"},"model":{"type":"string"},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
+                "parameters":{"type":"object","properties":{"role":{"type":"string","enum":["code","test","scout","advisor","reviewer"]},"task":{"type":"string"},"slice":{"type":"string"},"use_blackboard":{"type":"boolean"},"resume_sid":{"type":"string"},"fork_context":{"type":"boolean"},"model":{"type":"string","description":"Optional model ID or local CLI bridge (`cli:codex`, `cli:agy`, `cli:claude`, `cli:gemini`, or `cli:<runner>:<submodel>`)."},"effort":{"type":"string","enum":["off","low","medium","high","xhigh"]}},"required":["role","task"]}}}),
             json!({"type":"function","function":{"name":"task","description":"Manage asynchronous background shell tasks (start a long-running build/test/server, send stdin input, poll status, wait for completion, cancel, or list active tasks).",
                 "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["start","send","status","wait","cancel","list"]},"command":{"type":"string"},"id":{"type":"string"},"input":{"type":"string"},"timeout_secs":{"type":"integer"}},"required":["action"]}}}),
         ];
@@ -1794,10 +1794,45 @@ mod tests {
             "{har_info}"
         );
 
-        // 4. Broad directory `grep` skips `.env` secrets while still matching `.env.example`.
+        // 4. Broad directory `grep` skips `.env` secrets while still matching `.env.example`,
+        //    and direct `grep(path=".env")` is explicitly refused.
         let grep_res = t.run(&call("grep", json!({"pattern": "API_TOKEN"})));
         assert!(grep_res.contains(".env.example:1:"), "{grep_res}");
         assert!(!grep_res.contains("super-secret-prod"), "{grep_res}");
+        let direct_secret_grep = t.run(&call(
+            "grep",
+            json!({"pattern": "API_TOKEN", "path": ".env"}),
+        ));
+        assert!(
+            direct_secret_grep.starts_with("refused:")
+                && !direct_secret_grep.contains("super-secret-prod"),
+            "{direct_secret_grep}"
+        );
+
+        // 4b. Session stamp recovery rejects files modified even 10ms after the recorded stamp.
+        let stamp_before = t.stamped_meta("src/engine.rs");
+        assert!(stamp_before.is_none());
+        let _ = t.run(&call("read", json!({"path": "src/engine.rs"})));
+        let (orig_ns, orig_len) = t.stamped_meta("src/engine.rs").unwrap();
+        std::fs::write(d.join("src/engine.rs"), "// externally modified\n").unwrap();
+        let mut t_resumed = Tools::new(&d);
+        t_resumed.restore_read_stamps(&[json!({
+            "kind": "tool.result",
+            "tool": "read",
+            "args": {"path": "src/engine.rs"},
+            "exit_code": 0,
+            "stamp": [orig_ns.to_string(), orig_len],
+            "ts": (orig_ns / 1_000_000)
+        })]);
+        assert!(
+            t_resumed.stamped_meta("src/engine.rs").is_none(),
+            "externally modified file must not be marked already-read after recovery"
+        );
+        std::fs::write(
+            d.join("src/engine.rs"),
+            "pub fn compute_score(x: i32) -> i32 { x * 2 }\n",
+        )
+        .unwrap();
 
         // 5. `bash` modifying a previously `read` file appends immediate staleness guidance.
         let _ = t.run(&call("read", json!({"path": "src/engine.rs"})));

@@ -417,6 +417,7 @@ pub fn fetch_magpie_models() -> Result<Vec<String>, String> {
     for (bin, id) in [
         ("codex", "cli:codex"),
         ("claude", "cli:claude"),
+        ("agy", "cli:agy"),
         ("gemini", "cli:gemini"),
     ] {
         let found = Command::new(bin)

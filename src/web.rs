@@ -431,7 +431,7 @@ main{flex:1;display:flex;flex-direction:column;min-width:0}
 .msg.assistant .math-blk{padding:6px 12px;margin:6px 0;border-left:2px solid var(--amber);color:var(--amber);font-family:ui-serif,Georgia,serif;font-size:15px}
 .msg.assistant .math-in{color:var(--amber);font-family:ui-serif,Georgia,serif}
 .msg.assistant .svg-card{background:#120f0d;border:1px solid #332c27;border-radius:6px;padding:10px;margin:6px 0;overflow-x:auto}
-.msg.assistant .svg-card svg{max-width:100%;height:auto;display:block}
+.msg.assistant .svg-card img{max-width:100%;height:auto;display:block}
 .msg.assistant .code-hdr{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted);margin-bottom:4px}
 .msg.user{border-left:3px solid var(--acc);background:var(--hi)}
 .msg.tool{font:12px/1.45 ui-monospace,monospace;color:var(--muted);padding:6px 12px}
@@ -470,7 +470,8 @@ if(tok)localStorage.setItem('twig_tok',tok);
 let curSid='',curWt='',tab='chat',detail=null,lastHtml='',forceTail=true;
 const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+tok}:{'Content-Type':'application/json'};
 async function api(p,o={}){const r=await fetch(p,{...o,headers:hdrs()});return r.json();}
-function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function svgDataUri(raw){try{const b=new TextEncoder().encode(raw);let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return 'data:image/svg+xml;base64,'+btoa(s);}catch(_){return '';}}
 const SYM={'\\alpha':'α','\\beta':'β','\\gamma':'γ','\\delta':'δ','\\theta':'θ','\\lambda':'λ','\\mu':'μ','\\pi':'π','\\sigma':'σ','\\omega':'ω','\\Delta':'Δ','\\Sigma':'∑','\\sum':'∑','\\prod':'∏','\\int':'∫','\\infty':'∞','\\pm':'±','\\times':'×','\\cdot':'·','\\leq':'≤','\\le':'≤','\\geq':'≥','\\ge':'≥','\\neq':'≠','\\ne':'≠','\\approx':'≈','\\to':'→','\\rightarrow':'→','\\Rightarrow':'⇒','\\in':'∈','\\forall':'∀','\\exists':'∃','\\partial':'∂','\\nabla':'∇'};
 function fmtTex(s){
   let o=esc(s).replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g,'($1)/($2)').replace(/\\sqrt\{([^{}]+)\}/g,'√($1)').replace(/\\text\{([^{}]+)\}/g,'$1');
@@ -484,7 +485,7 @@ function fmtIn(s){
     .replace(/\\\((.+?)\\\)/g,(_,m)=>`<span class="math-in">${fmtTex(m)}</span>`)
     .replace(/(^|[^\\$])\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$/g,(all,p,m)=>/^[0-9.,]+$/.test(m)?all:`${p}<span class="math-in">${fmtTex(m)}</span>`)
     .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener" style="color:var(--acc)">$1</a>');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,(_,l,u)=>`<a href="${u}" target="_blank" rel="noopener noreferrer" style="color:var(--acc)">${l}</a>`);
   return o.replace(/\x00C(\d+)\x00/g,(_,i)=>codes[+i]);
 }
 function fmtMd(src){
@@ -498,8 +499,8 @@ function fmtMd(src){
       i++;
       if(lang==='math'||lang==='latex'||lang==='tex')out+=`<div class="math-blk">${fmtTex(buf.join('\n'))}</div>`;
       else if(lang==='svg'||(buf.join('').trim().startsWith('<svg'))){
-        const safe=buf.join('\n').replace(/<script[\s\S]*?<\/script>/gi,'').replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,'').replace(/javascript:/gi,'');
-        out+=`<div class="svg-card">${safe}</div>`;
+        const uri=svgDataUri(buf.join('\n'));
+        out+=uri?`<div class="svg-card"><img src="${uri}" alt="diagram"></div>`:`<pre><code>${esc(buf.join('\n'))}</code></pre>`;
       }
       else out+=`<pre><div class="code-hdr"><span>${esc(lang||'code')}</span><button class="btn" style="padding:1px 7px;font-size:11px" onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)">Copy</button></div><code>${esc(buf.join('\n'))}</code></pre>`;
       continue;
@@ -537,8 +538,8 @@ async function loadList(){
   el.innerHTML=d.sessions.map(s=>{
     const cls='b-'+(s.status||'settled');
     const tag=s.status==='approval'?'wait':s.status==='running'?'run':s.status==='dirty'?'diff':'ok';
-    return `<div class="sitem ${s.sid===curSid?'active':''}" onclick="openSid('${s.sid}')">
-      <div><span class="badge ${cls}">${tag}</span><strong>${esc(s.label)}</strong></div>
+    return `<div class="sitem ${s.sid===curSid?'active':''}" data-sid="${esc(s.sid)}" onclick="openSid(this.dataset.sid)">
+      <div><span class="badge ${esc(cls)}">${tag}</span><strong>${esc(s.label)}</strong></div>
       <div style="font-size:11px;color:var(--muted);margin-top:3px">${esc(s.branch||'main')} · t${s.turns} · ${esc(s.age)}</div>
     </div>`;
   }).join('');
@@ -562,11 +563,12 @@ function render(){
     if(next!==lastHtml){const prevTop=p.scrollTop;p.innerHTML=next;lastHtml=next;p.scrollTop=prevTop;}
     return;
   }
-  let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div style="font-size:12px;color:var(--muted)">${esc(JSON.stringify(a.args))}</div></div><div><button class="btn primary" onclick="approve('${a.id}',true)">Allow</button> <button class="btn" onclick="approve('${a.id}',false)">Deny</button></div></div>`).join('');
+  let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div style="font-size:12px;color:var(--muted)">${esc(JSON.stringify(a.args))}</div></div><div><button class="btn primary" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true)">Allow</button> <button class="btn" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false)">Deny</button></div></div>`).join('');
   html+=(detail.messages||[]).filter(m=>m.role!=='system').map(m=>{
     const txt=typeof m.content==='string'?m.content:JSON.stringify(m.content);
+    const rCls=m.role==='assistant'?'assistant':m.role==='user'?'user':'tool';
     if(m.role==='tool')return `<div class="msg tool">↳ ${esc(txt.slice(0,400))}</div>`;
-    return `<div class="msg ${m.role}">${m.role==='assistant'?fmtMd(txt):esc(txt)}</div>`;
+    return `<div class="msg ${rCls}">${m.role==='assistant'?fmtMd(txt):esc(txt)}</div>`;
   }).join('');
   const finalHtml=html||'<div style="color:var(--muted)">Send a prompt below to begin.</div>';
   if(finalHtml!==lastHtml){
@@ -622,6 +624,9 @@ mod tests {
         let mut r1 = String::new();
         c1.read_to_string(&mut r1).unwrap();
         assert!(r1.contains("200 OK") && r1.contains("twig cockpit"));
+        assert!(!COCKPIT_HTML.contains("approve('${a.id}'"));
+        assert!(!COCKPIT_HTML.contains("openSid('${s.sid}'"));
+        assert!(COCKPIT_HTML.contains("data:image/svg+xml;base64,"));
 
         // 2. GET /api/sessions without token is rejected with 401
         let mut c2 = TcpStream::connect(addr).unwrap();

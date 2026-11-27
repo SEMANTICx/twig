@@ -158,22 +158,47 @@ pub fn record_oracle(path: &Path, oracle: &Candidate, inputs: &[Value]) -> io::R
     Ok(cases.len())
 }
 
-/// Structural equality. Floats compare within `tol`; NaN equals NaN; a type
-/// difference is a failure even when the values look similar.
+/// Structural equality. Exact integers compare without 53-bit `f64` mantissa loss;
+/// floats compare within `tol`; NaN equals NaN; type differences fail.
 pub fn eq_json(a: &Value, b: &Value, tol: f64) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(x), Some(y)) => {
-                if x.is_nan() && y.is_nan() {
-                    true
-                } else if x.is_nan() || y.is_nan() {
-                    false
+        (Value::Number(x), Value::Number(y)) => {
+            let x_int = x
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| x.as_u64().map(i128::from));
+            let y_int = y
+                .as_i64()
+                .map(i128::from)
+                .or_else(|| y.as_u64().map(i128::from));
+            if let (Some(xi), Some(yi)) = (x_int, y_int) {
+                return if tol >= 1.0 {
+                    xi.abs_diff(yi) <= (tol as u128)
                 } else {
-                    (x - y).abs() <= tol
-                }
+                    xi == yi
+                };
             }
-            _ => x == y,
-        },
+            match (x.as_f64(), y.as_f64()) {
+                (Some(xf), Some(yf)) => {
+                    if xf.is_nan() && yf.is_nan() {
+                        true
+                    } else if xf.is_nan() || yf.is_nan() {
+                        false
+                    } else {
+                        if let Some(int_v) = x_int.or(y_int) {
+                            let flt_v = if x_int.is_some() { yf } else { xf };
+                            if int_v.unsigned_abs() > (1u128 << 53) {
+                                return flt_v.is_finite()
+                                    && flt_v.fract() == 0.0
+                                    && (flt_v as i128) == int_v;
+                            }
+                        }
+                        (xf - yf).abs() <= tol
+                    }
+                }
+                _ => x == y,
+            }
+        }
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eq_json(p, q, tol))
         }
@@ -319,13 +344,16 @@ pub fn verify(path: &Path, candidate: &Candidate, min_cases: usize) -> Verdict {
             }
         }
     }
-    let ok = fails.is_empty() && covered >= min_cases;
+    let required = min_cases.max(1);
+    let ok = !cases.is_empty() && fails.is_empty() && covered >= required;
     let why = if ok {
         None
+    } else if cases.is_empty() {
+        Some("journal is empty (0 cases)".into())
     } else if !fails.is_empty() {
         Some(format!("{} mismatching case(s)", fails.len()))
     } else {
-        Some(format!("covered {covered} < {min_cases} required"))
+        Some(format!("covered {covered} < {required} required"))
     };
     Verdict {
         ok,
@@ -571,5 +599,22 @@ mod tests {
         let masked = identity().with_ignore_fields(vec!["timestamp".into()]);
         assert!(verify(&noisy_path, &masked, 1).ok);
         let _ = std::fs::remove_file(&noisy_path);
+
+        // Large 64-bit integers (> 2^53) must never collide via f64 rounding, and empty journals fail even if min_cases=0.
+        assert!(!eq_json(
+            &json!(9_007_199_254_740_992_i64),
+            &json!(9_007_199_254_740_993_i64),
+            1e-9
+        ));
+        assert!(eq_json(
+            &json!(9_007_199_254_740_993_i64),
+            &json!(9_007_199_254_740_993_i64),
+            1e-9
+        ));
+        let empty_j = std::env::temp_dir().join(format!("twig-empty-j-{}.jsonl", std::process::id()));
+        std::fs::write(&empty_j, "").unwrap();
+        let empty_verdict = verify(&empty_j, &identity(), 0);
+        assert!(!empty_verdict.ok);
+        let _ = std::fs::remove_file(&empty_j);
     }
 }

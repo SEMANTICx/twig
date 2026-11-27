@@ -54,8 +54,17 @@ impl Tools {
         }
     }
 
-    /// Re-hydrate `read_stamps` from recovered session `tool.result` rows when the file on disk
-    /// has not been modified since the recorded tool execution (`mtime_ms <= row_ts + 1500`).
+    pub(crate) fn stamped_meta(&self, rel: &str) -> Option<(u128, u64)> {
+        if rel.starts_with("artifact:") || rel.starts_with("session:") {
+            return None;
+        }
+        let (_, target) = self.resolve_existing_in_worktree(rel).ok()?;
+        self.read_stamps.get(&target).copied()
+    }
+
+    /// Re-hydrate `read_stamps` from recovered session `tool.result` rows only when the file
+    /// on disk matches the exact recorded `(mtime_ns, len)` stamp (or `mtime_ms <= row_ts_ms`
+    /// with zero future grace window for legacy transcripts).
     pub(crate) fn restore_read_stamps(&mut self, rows: &[Value]) {
         for row in rows {
             if row["kind"] != "tool.result" || row["exit_code"] != 0 {
@@ -73,15 +82,27 @@ impl Tools {
             if rel.starts_with("artifact:") || rel.starts_with("session:") {
                 continue;
             }
-            let row_ts_ms = row["ts"].as_u64().unwrap_or(0) as u128;
             let Ok((_, target)) = self.resolve_existing_in_worktree(rel) else {
                 continue;
             };
-            if let Some((mtime_ns, len)) = file_stamp(&target) {
-                let mtime_ms = mtime_ns / 1_000_000;
-                if row_ts_ms > 0 && mtime_ms <= row_ts_ms.saturating_add(1_500) {
+            let Some((mtime_ns, len)) = file_stamp(&target) else {
+                continue;
+            };
+            if let Some(arr) = row.get("stamp").and_then(Value::as_array) {
+                let rec_ns = arr
+                    .first()
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<u128>().ok());
+                let rec_len = arr.get(1).and_then(Value::as_u64);
+                if rec_ns == Some(mtime_ns) && rec_len == Some(len) {
                     self.read_stamps.insert(target, (mtime_ns, len));
                 }
+                continue;
+            }
+            let row_ts_ms = row["ts"].as_u64().unwrap_or(0) as u128;
+            let mtime_ms = mtime_ns / 1_000_000;
+            if row_ts_ms > 0 && mtime_ms <= row_ts_ms {
+                self.read_stamps.insert(target, (mtime_ns, len));
             }
         }
     }
@@ -1180,8 +1201,20 @@ pub(super) fn grep_stateless(
     let mut matches = Vec::new();
     let mut truncated = false;
     let is_dir_walk = base.is_dir();
+    if !is_dir_walk && super::super::policy::is_sensitive_secret_path(subpath.unwrap_or("")) {
+        return (
+            "refused: grep on sensitive secret file is blocked; use read(path=...) which requires human approval".into(),
+            Some(1),
+        );
+    }
     for (rel, abs) in files {
-        if is_dir_walk && super::super::policy::is_sensitive_secret_path(&rel) {
+        if super::super::policy::is_sensitive_secret_path(&rel) {
+            if !is_dir_walk {
+                return (
+                    "refused: grep on sensitive secret file is blocked; use read(path=...) which requires human approval".into(),
+                    Some(1),
+                );
+            }
             continue;
         }
         if let Some(g) = file_glob {
@@ -1538,10 +1571,9 @@ fn trace_symbol_xrefs(root: &Path, base: &Path, sym: &str) -> (String, Option<i3
 
     let mut defs = Vec::new();
     let mut refs = Vec::new();
-    let is_dir_walk = base.is_dir();
 
     for (rel, abs) in files {
-        if is_dir_walk && super::super::policy::is_sensitive_secret_path(&rel) {
+        if super::super::policy::is_sensitive_secret_path(&rel) {
             continue;
         }
         let Ok(meta) = std::fs::metadata(&abs) else {

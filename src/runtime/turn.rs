@@ -51,18 +51,28 @@ fn record_tool_outcome(
     audit_sink: &mut dyn FnMut(&ToolCall, &str),
     emit: &mut dyn FnMut(Value),
 ) -> Result<String, String> {
+    let stamp = if exit_code == Some(0) && matches!(call.name.as_str(), "read" | "edit" | "write") {
+        call.args
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|p| env.tools.stamped_meta(p))
+            .map(|(ns, len)| json!([ns.to_string(), len]))
+    } else {
+        None
+    };
+    let mut rec_row = json!({
+        "id": call.id,
+        "tool": call.name,
+        "args": call.args,
+        "tier": tier.as_str(),
+        "output": output,
+        "exit_code": exit_code
+    });
+    if let (Some(s), Some(obj)) = (stamp, rec_row.as_object_mut()) {
+        obj.insert("stamp".into(), s);
+    }
     env.record
-        .append(
-            "tool.result",
-            json!({
-                "id": call.id,
-                "tool": call.name,
-                "args": call.args,
-                "tier": tier.as_str(),
-                "output": output,
-                "exit_code": exit_code
-            }),
-        )
+        .append("tool.result", rec_row)
         .map_err(|e| e.to_string())?;
     if call.name == "papercut" && output == "papercut recorded" {
         env.record
@@ -342,12 +352,14 @@ pub fn run_turn_live(
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             )
-        } else if (matches!(call.name.as_str(), "read" | "edit" | "write")
-            && call
-                .args
-                .get("path")
-                .and_then(Value::as_str)
-                .is_some_and(is_sensitive_secret_path))
+        } else if (matches!(
+            call.name.as_str(),
+            "read" | "edit" | "write" | "grep" | "outline"
+        ) && call
+            .args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(is_sensitive_secret_path))
             || (matches!(call.name.as_str(), "edit" | "write")
                 && call
                     .args

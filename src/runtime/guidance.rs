@@ -1108,15 +1108,52 @@ impl SkillStore {
         if !valid_skill_name(target_name) {
             return Err(format!("invalid skill name {target_name:?}"));
         }
+        std::fs::create_dir_all(&self.vault_dir)
+            .map_err(|e| format!("create vault {}: {e}", self.vault_dir.display()))?;
         let dst = self.vault_dir.join(target_name);
-        if dst.exists() {
-            std::fs::remove_dir_all(&dst).map_err(|e| format!("replace {}: {e}", dst.display()))?;
-        }
-        if src.is_dir() {
-            copy_dir_recursive(src, &dst).map_err(|e| format!("import dir: {e}"))?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let stage = self
+            .vault_dir
+            .join(format!(".staging-{target_name}-{}-{nonce:x}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&stage);
+        let stage_res = if src.is_dir() {
+            copy_dir_recursive(src, &stage).map_err(|e| format!("import dir: {e}"))
         } else {
-            std::fs::create_dir_all(&dst).map_err(|e| format!("create dir: {e}"))?;
-            std::fs::copy(src, dst.join("SKILL.md")).map_err(|e| format!("import file: {e}"))?;
+            std::fs::create_dir_all(&stage)
+                .map_err(|e| format!("create dir: {e}"))
+                .and_then(|()| {
+                    std::fs::copy(src, stage.join("SKILL.md"))
+                        .map(|_| ())
+                        .map_err(|e| format!("import file: {e}"))
+                })
+        };
+        if let Err(e) = stage_res {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(e);
+        }
+        let backup = self
+            .vault_dir
+            .join(format!(".backup-{target_name}-{}-{nonce:x}", std::process::id()));
+        let had_existing = dst.exists();
+        if had_existing {
+            std::fs::rename(&dst, &backup)
+                .map_err(|e| {
+                    let _ = std::fs::remove_dir_all(&stage);
+                    format!("backup {}: {e}", dst.display())
+                })?;
+        }
+        if let Err(e) = std::fs::rename(&stage, &dst) {
+            let _ = std::fs::remove_dir_all(&stage);
+            if had_existing {
+                let _ = std::fs::rename(&backup, &dst);
+            }
+            return Err(format!("activate {}: {e}", dst.display()));
+        }
+        if had_existing {
+            let _ = std::fs::remove_dir_all(&backup);
         }
         let mut msg = format!("imported {target_name} into vault ({})", dst.display());
         if enable_global && !self.global_dir.join(target_name).exists() {

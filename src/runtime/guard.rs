@@ -119,13 +119,24 @@ impl Guard {
             .any(|ig| real == *ig || real.starts_with(ig))
     }
 
-    /// Stat-only walk: no file contents are read, so this stays O(files).
+    /// Stat-only walk: no file contents are read, and symlinks are never followed
+    /// so directory loops or outside-worktree targets cannot stall or leak into `digest`.
     pub fn digest(&self) -> String {
         let mut rows: Vec<(String, u64, u128)> = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let root_canon = self
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| self.worktree.clone());
         let mut stack = vec![self.worktree.clone()];
         while let Some(dir) = stack.pop() {
             if self.ignored(&dir) {
                 continue;
+            }
+            if let Ok(canon) = dir.canonicalize() {
+                if !canon.starts_with(&root_canon) || !visited.insert(canon) {
+                    continue;
+                }
             }
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
@@ -134,10 +145,13 @@ impl Guard {
             for entry in entries.flatten() {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
-                let meta = match entry.metadata() {
+                let meta = match std::fs::symlink_metadata(&path) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
                 if meta.is_dir() {
                     if IGNORED_DIRS.contains(&name.as_str()) || self.ignored(&path) {
                         continue;
@@ -286,5 +300,25 @@ mod tests {
             .is_some());
         assert!(g.observe_tool_call("bash", &args, "found it", Some(0)).is_none());
         assert!(g.observe_tool_call("bash", &args, "", Some(0)).is_none());
+    }
+
+    #[test]
+    fn directory_symlinks_and_self_loops_do_not_escape_or_hang_digest() {
+        let dir = tmpdir();
+        let outside = std::env::temp_dir().join(format!("twig-guard-ext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dir, dir.join("self_loop")).unwrap();
+            std::os::unix::fs::symlink(&outside, dir.join("escape_link")).unwrap();
+        }
+        let g = Guard::new(&dir, 20, 6, 1);
+        let d1 = g.digest();
+        std::fs::write(outside.join("secret.txt"), b"outside-mutated-longer").unwrap();
+        let d2 = g.digest();
+        assert_eq!(d1, d2, "outside symlink target must not affect worktree digest");
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

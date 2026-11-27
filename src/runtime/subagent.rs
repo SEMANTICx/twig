@@ -567,9 +567,23 @@ fn build_external_cli_command(
             cmd.current_dir(worktree);
             Ok(cmd)
         }
+        "agy" | "antigravity" => {
+            let mut cmd = Command::new("agy");
+            cmd.args(["-p", task, "--disable-slash-commands"]);
+            if role.read_only() {
+                cmd.args(["--mode", "plan"]);
+            } else {
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            if let Some(m) = submodel {
+                cmd.args(["--model", m]);
+            }
+            cmd.current_dir(worktree);
+            Ok(cmd)
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unsupported external CLI runner {other:?}; expected cli:codex, cli:claude, or cli:gemini"),
+            format!("unsupported external CLI runner {other:?}; expected cli:codex, cli:claude, cli:agy, or cli:gemini"),
         )),
     }
 }
@@ -1009,6 +1023,14 @@ impl SubagentPool {
             );
             let mut ext_cmd =
                 build_external_cli_command(&resolved_model, role, &effective_task, &host_worktree)?;
+            if (resolved_model.starts_with("cli:agy")
+                || resolved_model.starts_with("cli:antigravity"))
+                && effort_override
+                    .map(str::trim)
+                    .is_some_and(|e| matches!(e, "low" | "medium" | "high" | "xhigh"))
+            {
+                ext_cmd.args(["--effort", effort_override.unwrap().trim()]);
+            }
             let capture = run_process_streaming(
                 &mut ext_cmd,
                 &[],

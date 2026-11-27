@@ -284,7 +284,8 @@ fn matches_meta_escape(cmd: &str) -> bool {
                 *t,
                 "--dangerously-skip-permissions" | "--dangerously-bypass-approvals-and-sandbox"
             )
-        }) || (matches!(prog, "claude" | "codex" | "gemini") && rest.contains(&"--yolo"))
+        }) || (matches!(prog, "claude" | "codex" | "gemini" | "agy" | "antigravity")
+            && rest.contains(&"--yolo"))
         {
             return true;
         }
@@ -383,9 +384,93 @@ enum Token {
     Unsafe,
 }
 
+/// Find the byte index of the matching `)` for `$(` starting at `open_paren_idx`
+/// (`cmd.as_bytes()[open_paren_idx] == b'('`), respecting nested parens and quotes.
+fn find_matching_paren(cmd: &str, open_paren_idx: usize) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = open_paren_idx + 1;
+    let mut depth = 1usize;
+    let mut in_s = false;
+    let mut in_d = false;
+    while i < bytes.len() {
+        let ch = cmd[i..].chars().next()?;
+        let len = ch.len_utf8();
+        if in_s {
+            if ch == '\'' {
+                in_s = false;
+            }
+            i += len;
+            continue;
+        }
+        if in_d {
+            if ch == '\\' && i + 1 < bytes.len() {
+                let next = cmd[i + 1..].chars().next()?;
+                i += 1 + next.len_utf8();
+                continue;
+            }
+            if ch == '"' {
+                in_d = false;
+            } else if ch == '$' && bytes.get(i + 1) == Some(&b'(') {
+                let close = find_matching_paren(cmd, i + 1)?;
+                i = close + 1;
+                continue;
+            }
+            i += len;
+            continue;
+        }
+        match ch {
+            '\\' if i + 1 < bytes.len() => {
+                let next = cmd[i + 1..].chars().next()?;
+                i += 1 + next.len_utf8();
+                continue;
+            }
+            '\'' => in_s = true,
+            '"' => in_d = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    None
+}
+
+/// Find the byte index of the closing unescaped `` ` `` starting after `open_tick_idx`.
+fn find_closing_backtick(cmd: &str, open_tick_idx: usize) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = open_tick_idx + 1;
+    while i < bytes.len() {
+        let ch = cmd[i..].chars().next()?;
+        if ch == '\\' && i + 1 < bytes.len() {
+            let next = cmd[i + 1..].chars().next()?;
+            i += 1 + next.len_utf8();
+            continue;
+        }
+        if ch == '`' {
+            return Some(i);
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
 /// Quote-aware shell lexer that separates unquoted metacharacters even without
-/// surrounding spaces, and flags command/process substitutions as `Unsafe`.
+/// surrounding spaces, flags command/process substitutions with `Token::Unsafe`
+/// (so `shape()` never marks them `Auto`), and recursively unpacks nested `$(...)`
+/// and `` `...` `` bodies as separate segments so `Deny` and secret checks inspect them.
 fn lex_shell(cmd: &str) -> Option<Vec<Token>> {
+    lex_shell_depth(cmd, 0)
+}
+
+fn lex_shell_depth(cmd: &str, depth: usize) -> Option<Vec<Token>> {
+    if depth > 8 {
+        return None;
+    }
     let bytes = cmd.as_bytes();
     let mut i = 0;
     let mut out = Vec::new();
@@ -393,6 +478,8 @@ fn lex_shell(cmd: &str) -> Option<Vec<Token>> {
     let mut in_single = false;
     let mut in_double = false;
     let mut has_token = false;
+    let mut paren_depth = 0usize;
+    let mut sub_tokens: Vec<Token> = Vec::new();
 
     let flush = |cur: &mut String, has_token: &mut bool, out: &mut Vec<Token>| {
         if *has_token {
@@ -426,8 +513,24 @@ fn lex_shell(cmd: &str) -> Option<Vec<Token>> {
                     cur.push(next);
                     i += 1 + next.len_utf8();
                 }
-                '`' => return Some(vec![Token::Unsafe]),
-                '$' if bytes.get(i + 1) == Some(&b'(') => return Some(vec![Token::Unsafe]),
+                '`' => {
+                    let close = find_closing_backtick(cmd, i)?;
+                    let inner = &cmd[i + 1..close];
+                    sub_tokens.push(Token::Unsafe);
+                    sub_tokens.push(Token::Op(";"));
+                    sub_tokens.extend(lex_shell_depth(inner, depth + 1)?);
+                    sub_tokens.push(Token::Op(";"));
+                    i = close + 1;
+                }
+                '$' if bytes.get(i + 1) == Some(&b'(') => {
+                    let close = find_matching_paren(cmd, i + 1)?;
+                    let inner = &cmd[i + 2..close];
+                    sub_tokens.push(Token::Unsafe);
+                    sub_tokens.push(Token::Op(";"));
+                    sub_tokens.extend(lex_shell_depth(inner, depth + 1)?);
+                    sub_tokens.push(Token::Op(";"));
+                    i = close + 1;
+                }
                 _ => {
                     cur.push(ch);
                     i += len;
@@ -460,11 +563,43 @@ fn lex_shell(cmd: &str) -> Option<Vec<Token>> {
                 }
                 i += len;
             }
-            '`' => return Some(vec![Token::Unsafe]),
-            '$' if bytes.get(i + 1) == Some(&b'(') => return Some(vec![Token::Unsafe]),
-            '(' | ')' => return Some(vec![Token::Unsafe]),
-            '<' if bytes.get(i + 1) == Some(&b'(') => return Some(vec![Token::Unsafe]),
-            '>' if bytes.get(i + 1) == Some(&b'(') => return Some(vec![Token::Unsafe]),
+            '`' => {
+                flush(&mut cur, &mut has_token, &mut out);
+                let close = find_closing_backtick(cmd, i)?;
+                let inner = &cmd[i + 1..close];
+                out.push(Token::Unsafe);
+                out.push(Token::Op(";"));
+                out.extend(lex_shell_depth(inner, depth + 1)?);
+                out.push(Token::Op(";"));
+                i = close + 1;
+            }
+            '$' | '<' | '>' if bytes.get(i + 1) == Some(&b'(') => {
+                flush(&mut cur, &mut has_token, &mut out);
+                let close = find_matching_paren(cmd, i + 1)?;
+                let inner = &cmd[i + 2..close];
+                out.push(Token::Unsafe);
+                out.push(Token::Op(";"));
+                out.extend(lex_shell_depth(inner, depth + 1)?);
+                out.push(Token::Op(";"));
+                i = close + 1;
+            }
+            '(' => {
+                flush(&mut cur, &mut has_token, &mut out);
+                paren_depth += 1;
+                out.push(Token::Unsafe);
+                out.push(Token::Op(";"));
+                i += 1;
+            }
+            ')' => {
+                if paren_depth == 0 {
+                    return None;
+                }
+                flush(&mut cur, &mut has_token, &mut out);
+                paren_depth -= 1;
+                out.push(Token::Unsafe);
+                out.push(Token::Op(";"));
+                i += 1;
+            }
             '#' if !has_token => break, // unquoted comment at word boundary
             '&' => {
                 flush(&mut cur, &mut has_token, &mut out);
@@ -530,10 +665,14 @@ fn lex_shell(cmd: &str) -> Option<Vec<Token>> {
         }
     }
 
-    if in_single || in_double {
-        return None; // unbalanced quotes: fail closed
+    if in_single || in_double || paren_depth != 0 {
+        return None; // unbalanced quotes or parens: fail closed
     }
     flush(&mut cur, &mut has_token, &mut out);
+    if !sub_tokens.is_empty() {
+        out.push(Token::Op(";"));
+        out.extend(sub_tokens);
+    }
     Some(out)
 }
 
@@ -773,6 +912,14 @@ impl Policy {
 
     /// Deny rules read the real command; allow rules read the folded shape.
     pub fn classify(&self, cmd: &str) -> Tier {
+        if !cmd.trim().is_empty() && lex_shell(cmd).is_none() {
+            let allows = self.session_allows.lock().expect("policy session allows");
+            return if allows.contains(cmd.trim()) {
+                Tier::Audit
+            } else {
+                Tier::Deny
+            };
+        }
         let sh = shape(cmd);
         let exact_gate = touches_sensitive_secret(cmd) || matches_meta_escape(cmd);
         if HARD_DENY.iter().any(|d| cmd.contains(d))
@@ -1036,5 +1183,25 @@ mod tests {
         assert_eq!(p.classify("cp hook.sh .git/hooks/pre-commit"), Tier::Deny);
         assert_eq!(p.classify("cp hook.sh .husky/pre-commit"), Tier::Deny);
         assert_eq!(p.classify("tmux list-sessions"), Tier::Audit);
+    }
+
+    #[test]
+    fn command_substitutions_and_subshells_cannot_bypass_deny_or_secret_gates() {
+        let p = Policy::new();
+        assert_eq!(p.classify("echo $(rm -r -f /)"), Tier::Deny);
+        assert_eq!(p.classify("echo $(/bin/rm -fr /)"), Tier::Deny);
+        assert_eq!(p.classify("echo \"$(/bin/rm -fr ~)\""), Tier::Deny);
+        assert_eq!(p.classify("echo `rm -r -f /`"), Tier::Deny);
+        assert_eq!(p.classify("(rm -r -f /)"), Tier::Deny);
+        assert_eq!(p.classify("echo $(cat \"$HOME/.ssh/id_rsa\")"), Tier::Deny);
+        assert_eq!(p.classify("echo \"$(cat \"$HOME/.ssh/id_rsa\")\""), Tier::Deny);
+        assert_eq!(p.classify("echo `cat .env`"), Tier::Deny);
+        assert_eq!(p.classify("cat <(cat .env.production)"), Tier::Deny);
+        assert_eq!(p.classify("echo $(cp evil.json .twig/project.json)"), Tier::Deny);
+        // Unbalanced quotes or substitutions fail closed to Deny.
+        assert_eq!(p.classify("echo $(rm -rf /"), Tier::Deny);
+        assert_eq!(p.classify("echo 'unterminated"), Tier::Deny);
+        // Benign subshells remain Audit (not falsely blocked, not Auto).
+        assert_eq!(p.classify("(cd src && cargo test)"), Tier::Audit);
     }
 }

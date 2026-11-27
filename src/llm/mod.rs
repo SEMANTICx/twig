@@ -737,9 +737,22 @@ fn complete_via_cli(
             }
             c
         }
+        "agy" | "antigravity" => {
+            let mut c = Command::new("agy");
+            c.args(["-p", &prompt, "--disable-slash-commands"]);
+            if read_only {
+                c.args(["--mode", "plan"]);
+            } else {
+                c.arg("--dangerously-skip-permissions");
+            }
+            if let Some(m) = submodel {
+                c.args(["--model", m]);
+            }
+            c
+        }
         other => {
             return Err(format!(
-                "unsupported CLI model {other:?}; expected cli:codex, cli:claude, or cli:gemini"
+                "unsupported CLI model {other:?}; expected cli:codex, cli:claude, cli:agy, or cli:gemini"
             ));
         }
     };

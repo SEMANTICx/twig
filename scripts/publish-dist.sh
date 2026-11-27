@@ -65,21 +65,34 @@ case "$TAG" in
   *) echo "error: release tag must start with 'v' (e.g. v0.2.0)" >&2; exit 1 ;;
 esac
 
-# 3. Build stripped, path-remapped Linux binary (prefers static musl when installed, falls back to host).
+# 3. Build stripped, path-remapped Linux binary (requires static musl on x86_64 unless explicitly overridden).
 ARCH="$(uname -m)"
-if [ "$ARCH" = "x86_64" ] && rustup target list --installed 2>/dev/null | grep -qx "x86_64-unknown-linux-musl" && command -v musl-gcc >/dev/null 2>&1; then
-  TARGET="x86_64-unknown-linux-musl"
-  BUILD_ARGS=(--target "$TARGET")
-  BIN_PATH="$ROOT/target/$TARGET/release/twig"
-else
-  case "$ARCH" in
-    x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
-    aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
-    *) echo "error: unsupported arch $ARCH" >&2; exit 1 ;;
-  esac
-  BUILD_ARGS=()
-  BIN_PATH="$ROOT/target/release/twig"
-fi
+case "$ARCH" in
+  x86_64|amd64)
+    if rustup target list --installed 2>/dev/null | grep -qx "x86_64-unknown-linux-musl" && command -v musl-gcc >/dev/null 2>&1; then
+      TARGET="x86_64-unknown-linux-musl"
+      BUILD_ARGS=(--target "$TARGET")
+      BIN_PATH="$ROOT/target/$TARGET/release/twig"
+    elif [ "${TWIG_ALLOW_GNU_FALLBACK:-0}" = "1" ]; then
+      TARGET="x86_64-unknown-linux-gnu"
+      BUILD_ARGS=()
+      BIN_PATH="$ROOT/target/release/twig"
+    else
+      echo "error: x86_64 release requires static musl toolchain (never mislabel glibc as musl)." >&2
+      echo "       Install via: rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools" >&2
+      exit 1
+    fi
+    ;;
+  aarch64|arm64)
+    TARGET="aarch64-unknown-linux-gnu"
+    BUILD_ARGS=()
+    BIN_PATH="$ROOT/target/release/twig"
+    ;;
+  *)
+    echo "error: unsupported arch $ARCH" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> Building stripped, path-remapped release binary (${TARGET})..."
 CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"

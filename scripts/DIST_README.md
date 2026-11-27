@@ -1,6 +1,6 @@
 # ✻ twig — Official Binary Distribution
 
-**A fast, single-binary coding-agent harness in pure Rust — with a borderless TUI, headless CLI, and web cockpit for Linux, macOS, and Windows.**
+**A fast, single-binary coding-agent harness in pure Rust — with a borderless TUI, persistent subagent session thread trees, headless CLI, and web cockpit for Linux, macOS, and Windows.**
 
 > This repository hosts **official prebuilt binaries, SHA-256 checksums, and zero-login one-line installers** for `twig`.
 
@@ -36,15 +36,15 @@ irm https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.ps1 | iex
 | **macOS** (Intel) | `x86_64` | `twig-v*-x86_64-apple-darwin.tar.gz` |
 | **Windows** | `x86_64` | `twig-v*-x86_64-pc-windows-msvc.zip` |
 
-Every release includes per-archive `.sha256` digests and `SHA256SUMS.txt` verified automatically during installation.
+Every release includes per-archive `.sha256` digests and `SHA256SUMS.txt` verified automatically during installation (`sha256sum`, `shasum`, or `openssl`).
 
 ---
 
 ## Highlights
 
 - **Single Static Binary (`<15ms` startup, `~10 MB` RAM)** — Zero Node.js or Python runtime dependencies.
-- **Gateway-Neutral + Multi-CLI Routing** — Connect any OpenAI-compatible gateway (`TWIG_BASE_URL` / `TWIG_API_KEY`), route models per role (`code`, `plan`, `advisor`, `reviewer`, `scout`), or bridge local `cli:claude`, `cli:codex`, and `cli:gemini` runners.
-- **Borderless TUI (`twig chat`) & Web Cockpit (`twig web`)** — Result-focused tool folding (`Ctrl+O`), unfolded `Update(file) +N -M` cards with **intra-line word diffs**, diff approval previews with inline rejection feedback (`Tab`), `Alt+Enter` queued follow-ups (`↑` to edit), `Ctrl+B` background detach, `Ctrl+T`/`↓` Subagent & Task drawer, `/btw` floating side-cards, **plus terminal GFM box tables, LaTeX math, and Mermaid/SVG diagrams**.
+- **Gateway-Neutral + Multi-CLI Routing** — Connect any OpenAI-compatible gateway (`TWIG_BASE_URL` / `TWIG_API_KEY`), route models per role (`code`, `plan`, `advisor`, `reviewer`, `scout`), or bridge local `cli:codex`, `cli:agy` (Antigravity CLI), `cli:claude`, and `cli:gemini` runners inside isolated Git worktrees.
+- **Borderless TUI (`twig chat`) & Web Cockpit (`twig web`)** — Native mouse drag-to-copy, Codex-style live subagent thread switcher (`/agent`, `v`, `Tab`, direct child chat), result-focused tool folding (`Ctrl+O`), unfolded `Update(file) +N -M` cards with **intra-line word diffs**, diff approval previews with inline rejection feedback (`Tab`), `Alt+Enter` queued follow-ups (`↑` to edit), `Ctrl+B` background detach, `/btw` floating side-cards, **plus multi-line GFM box tables, `[n]` link footnotes, LaTeX math, and Mermaid/SVG diagrams**.
 - **Two-Stage Lossless Compaction & BLAKE3 Ledger** — Offloads large tool outputs to addressable `artifact:tool-*.txt` files and records tamper-evident hash-chained sessions (`twig record`).
 - **Recursive Collective Intelligence (RCI) & Verification** — Isolated Git-worktree subagents with a **Split-Fact Blackboard** (`/blackboard`), `.twig/notes/<role>.md` protocol cards, **Equal-Budget Ladder** grading (`twig ladder`), label-free gated recursion (`twig rci`), and clean-room differential verification (`twig verify`).
 
@@ -59,7 +59,7 @@ twig doctor
 # 2. Launch interactive TUI inside any Git repository
 twig chat
 
-# 3. Launch browser / mobile cockpit
+# 3. Launch browser / mobile HTTP cockpit
 twig web --port 3426
 
 # 4. Run non-interactive single-shot execution with an acceptance check
@@ -71,6 +71,8 @@ twig exec --check "cargo test" "Fix failing edge case and verify"
 | Key / Prefix | Action |
 |---|---|
 | `/` · `@file#L10-50` · `$skill` · `!cmd` · `#note` | Slash commands · file/line-slice context · skill invoke · local Bash mode · quick memory save |
+| **Mouse Left-Drag** | Highlight & auto-copy text directly (CJK wide-char safe; `Alt+M` toggles mouse capture) |
+| `/agent` (`v` in `^T`/`↓`, `Tab`, `Esc`) | Switch into live/completed subagent thread, `Tab` cycle, `Enter` chat directly, `Esc` return to main |
 | `Shift+Tab` | Cycle `Auto-Accept Edits` ⇄ `◈ Plan (read-only)` ⇄ `🔒 Review Edits (diff approval)` |
 | `Ctrl+O` | Expand / fold intermediate tool outputs |
 | `Ctrl+B` / `Ctrl+T` (`↓`) | Detach running Bash command to background / open Subagents & Tasks drawer |
@@ -84,5 +86,6 @@ Set environment variables or use `/model` and `/roles` inside `twig chat`:
 ```bash
 export TWIG_BASE_URL="http://127.0.0.1:3425/v1"   # Any OpenAI-compatible /v1 endpoint
 export TWIG_API_KEY="your-api-key"
-export TWIG_MODEL="gpt-5.4"                       # Or cli:claude / cli:codex / cli:gemini
+export TWIG_MODEL="gpt-5.4"                       # Or cli:codex / cli:agy / cli:claude / cli:gemini
+export TWIG_ROLES='{"reviewer":"cli:codex","scout":"cli:agy","advisor":"cli:claude"}'
 ```

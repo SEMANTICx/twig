@@ -982,10 +982,14 @@ fn main() {
                 match args[i].as_str() {
                     "--min-cases" => {
                         i += 1;
-                        min_cases = args
-                            .get(i)
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(1);
+                        let parsed = args.get(i).and_then(|s| s.parse::<usize>().ok());
+                        match parsed {
+                            Some(n) if n >= 1 => min_cases = n,
+                            _ => {
+                                eprintln!("twig verify: --min-cases must be an integer >= 1");
+                                std::process::exit(2);
+                            }
+                        }
                     }
                     "--min-branch" => {
                         i += 1;

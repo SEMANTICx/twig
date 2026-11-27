@@ -49,10 +49,22 @@ echo "Downloading ${PKG}.tar.gz..."
 curl -fsSL "${BASE_URL}/${PKG}.tar.gz" -o "${TMP_DIR}/${PKG}.tar.gz"
 curl -fsSL "${BASE_URL}/${PKG}.tar.gz.sha256" -o "${TMP_DIR}/${PKG}.tar.gz.sha256"
 
-if command -v sha256sum >/dev/null 2>&1; then
+if [ "${TWIG_SKIP_CHECKSUM:-0}" = "1" ]; then
+  echo "Warning: skipping SHA-256 verification (TWIG_SKIP_CHECKSUM=1)" >&2
+elif command -v sha256sum >/dev/null 2>&1; then
   (cd "$TMP_DIR" && sha256sum -c "${PKG}.tar.gz.sha256")
 elif command -v shasum >/dev/null 2>&1; then
   (cd "$TMP_DIR" && shasum -a 256 -c "${PKG}.tar.gz.sha256")
+elif command -v openssl >/dev/null 2>&1; then
+  EXPECTED="$(awk '{print $1}' "${TMP_DIR}/${PKG}.tar.gz.sha256" | tr 'A-F' 'a-f')"
+  ACTUAL="$(openssl dgst -sha256 "${TMP_DIR}/${PKG}.tar.gz" | awk '{print $NF}' | tr 'A-F' 'a-f')"
+  if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+    echo "twig install: SHA-256 checksum mismatch (expected $EXPECTED, got $ACTUAL)" >&2
+    exit 1
+  fi
+else
+  echo "twig install: no SHA-256 verification tool found (install sha256sum, shasum, or openssl, or set TWIG_SKIP_CHECKSUM=1)" >&2
+  exit 1
 fi
 
 mkdir -p "$INSTALL_DIR"

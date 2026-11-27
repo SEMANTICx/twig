@@ -431,6 +431,13 @@ pub(super) fn restore_worktree_snapshot(worktree: &Path, tree_oid: &str) -> Resu
         .env("GIT_INDEX_FILE", &tmp_idx)
         .output()
         .map_err(|e| format!("git ls-files: {e}"))?;
+    if !snap_files_out.status.success() {
+        cleanup(&tmp_idx);
+        return Err(format!(
+            "git ls-files snapshot failed: {}",
+            String::from_utf8_lossy(&snap_files_out.stderr).trim()
+        ));
+    }
     let snap_set: HashSet<String> = String::from_utf8_lossy(&snap_files_out.stdout)
         .split('\0')
         .filter(|s| !s.is_empty())
@@ -443,6 +450,13 @@ pub(super) fn restore_worktree_snapshot(worktree: &Path, tree_oid: &str) -> Resu
         .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
         .output()
         .map_err(|e| format!("git ls-files current: {e}"))?;
+    if !cur_files_out.status.success() {
+        cleanup(&tmp_idx);
+        return Err(format!(
+            "git ls-files current failed: {}",
+            String::from_utf8_lossy(&cur_files_out.stderr).trim()
+        ));
+    }
     let mut removed = 0usize;
     for rel in String::from_utf8_lossy(&cur_files_out.stdout)
         .split('\0')
