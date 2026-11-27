@@ -879,6 +879,124 @@ fn locate_session_jsonl(sid: &str) -> Option<PathBuf> {
     None
 }
 
+/// Load persisted child subagent threads belonging to `parent_sid` so `/resume` and
+/// `session.history` automatically remount the full session thread tree.
+pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>) -> Vec<Value> {
+    let want = parent_sid.trim();
+    if want.is_empty() {
+        return Vec::new();
+    }
+    let mut roots = vec![paths::state_dir().join("subagents")];
+    if let Some(extra) = extra_subagents_root {
+        if !roots.iter().any(|r| r == extra) {
+            roots.push(extra.to_path_buf());
+        }
+    }
+    let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for root in roots {
+        let Ok(dirs) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for dir_entry in dirs.flatten() {
+            let dir_path = dir_entry.path();
+            if !dir_path.is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&dir_path) else {
+                continue;
+            };
+            for file_entry in files.flatten() {
+                let p = file_entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    if let Ok(m) = file_entry.metadata() {
+                        if m.len() > 0 {
+                            candidates.push((m.modified().unwrap_or(SystemTime::UNIX_EPOCH), p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|a| a.0);
+
+    let mut matched = Vec::new();
+    for (_, path) in candidates {
+        let Some(sid) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut rows = Vec::new();
+        let mut is_child = false;
+        let mut checked_meta = false;
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(row) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if row["kind"] == "session.meta" {
+                checked_meta = true;
+                if row["parent_sid"].as_str() == Some(want) {
+                    is_child = true;
+                } else if !is_child {
+                    break;
+                }
+            } else if !checked_meta && rows.len() >= 4 {
+                break;
+            }
+            rows.push(row);
+        }
+        if !is_child {
+            continue;
+        }
+        let mut role = "scout".to_owned();
+        let mut model: Option<String> = None;
+        let mut tool_count = 0u32;
+        for row in &rows {
+            match row["kind"].as_str() {
+                Some("session.meta") => {
+                    if let Some(r) = row["role"].as_str().filter(|s| !s.is_empty()) {
+                        role = r.to_owned();
+                    }
+                    if let Some(m) = row["model"].as_str().filter(|s| !s.is_empty()) {
+                        model = Some(m.to_owned());
+                    }
+                }
+                Some("tool.started") => tool_count = tool_count.saturating_add(1),
+                _ => {}
+            }
+        }
+        let recovered = recover_session(&rows, None);
+        let task = recovered
+            .messages
+            .iter()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let turns = recovered
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .count() as u32;
+        matched.push(json!({
+            "id": sid,
+            "sid": sid,
+            "role": role,
+            "model": model,
+            "task": task,
+            "turns": turns,
+            "tool_count": tool_count,
+            "messages": recovered.messages,
+        }));
+    }
+    if matched.len() > 16 {
+        matched.drain(..matched.len() - 16);
+    }
+    matched
+}
+
 fn read_session_worktree(sid: &str) -> Option<String> {
     let path = locate_session_jsonl(sid)?;
     let file = std::fs::File::open(path).ok()?;
@@ -1417,6 +1535,54 @@ mod tests {
             assert!(!sys.contains("SECRET_HOST_KEY"));
         }
         assert!(run_session_cli(&["archive".into(), "../escape".into()]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_child_threads_recovers_only_matching_parent_subagents() {
+        let base = std::env::temp_dir().join(format!("twig-child-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let child_dir = base.join("scout-1-runs");
+        let other_dir = base.join("scout-2-runs");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+
+        let mut rec1 =
+            crate::record::Record::open(child_dir.join("scout-1.jsonl"), "scout-1").unwrap();
+        rec1.append(
+            "session.meta",
+            json!({"worktree": "/tmp", "parent_sid": "parent-abc", "role": "scout", "model": "gpt-5"}),
+        )
+        .unwrap();
+        rec1.append(
+            "message",
+            json!({"message": {"role": "user", "content": "Audit src/web.rs"}}),
+        )
+        .unwrap();
+        rec1.append("tool.started", json!({"id": "t1", "tool": "read"})).unwrap();
+        rec1.append("tool.started", json!({"id": "t2", "tool": "grep"})).unwrap();
+        rec1.append(
+            "message",
+            json!({"message": {"role": "assistant", "content": "Found 2 endpoints."}}),
+        )
+        .unwrap();
+
+        let mut rec2 =
+            crate::record::Record::open(other_dir.join("scout-2.jsonl"), "scout-2").unwrap();
+        rec2.append(
+            "session.meta",
+            json!({"worktree": "/tmp", "parent_sid": "different-parent", "role": "scout"}),
+        )
+        .unwrap();
+
+        let threads = load_child_threads("parent-abc", Some(&base));
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["sid"], "scout-1");
+        assert_eq!(threads[0]["role"], "scout");
+        assert_eq!(threads[0]["tool_count"], 2);
+        assert_eq!(threads[0]["turns"], 1);
+        assert_eq!(threads[0]["task"], "Audit src/web.rs");
+        assert_eq!(threads[0]["messages"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -79,6 +79,7 @@ pub struct SubagentResult {
 #[derive(Clone)]
 pub struct SubagentPool {
     config: Arc<SubagentConfig>,
+    parent_sid: Option<String>,
     slots: Arc<(Mutex<usize>, Condvar)>,
     seq: Arc<AtomicU64>,
 }
@@ -575,6 +576,13 @@ fn build_external_cli_command(
 
 impl SubagentPool {
     pub fn new(config: SubagentConfig) -> io::Result<Self> {
+        Self::new_for_parent(config, None)
+    }
+
+    pub fn new_for_parent(
+        config: SubagentConfig,
+        parent_sid: Option<String>,
+    ) -> io::Result<Self> {
         if config.concurrency == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -598,6 +606,7 @@ impl SubagentPool {
         Ok(Self {
             slots: Arc::new((Mutex::new(config.concurrency), Condvar::new())),
             config: Arc::new(config),
+            parent_sid: parent_sid.filter(|s| !s.trim().is_empty()),
             seq: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -809,6 +818,16 @@ impl SubagentPool {
             }
         };
 
+        if let Some(cb) = on_event {
+            cb(json!({
+                "ev": "subagent.progress",
+                "sid": sid,
+                "activity": "starting…",
+                "turns": 0,
+                "tool_count": 0,
+            }));
+        }
+
         let worktree = if has_git {
             root.join(format!("{sid}-wt"))
         } else {
@@ -827,6 +846,7 @@ impl SubagentPool {
                     "session.meta",
                     json!({
                         "worktree": worktree.display().to_string(),
+                        "parent_sid": self.parent_sid,
                         "role": role.as_str(),
                         "forked_context": true,
                     }),
@@ -1067,10 +1087,15 @@ impl SubagentPool {
             });
         }
 
-        for key in ["TWIG_BASE_URL", "TWIG_API_KEY", "TWIG_PARENT_SID"] {
+        for key in ["TWIG_BASE_URL", "TWIG_API_KEY"] {
             if let Ok(value) = std::env::var(key) {
                 command.env(key, value);
             }
+        }
+        if let Some(ref p) = self.parent_sid {
+            command.env("TWIG_PARENT_SID", p);
+        } else if let Ok(value) = std::env::var("TWIG_PARENT_SID") {
+            command.env("TWIG_PARENT_SID", value);
         }
         command.env("TWIG_MODEL", &resolved_model);
 

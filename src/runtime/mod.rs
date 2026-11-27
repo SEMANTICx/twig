@@ -24,8 +24,9 @@ use self::guard::Guard;
 use self::guidance::{inject_playbook, route, Playbook, SkillStore};
 use self::policy::{Policy, Tier};
 use self::session::{
-    append_repo_instructions, capture_worktree_snapshot, detect_model_family, load_session_patch,
-    notify_herdr, recover_session, restore_worktree_snapshot, RESOLVED_UNKNOWN_MSG,
+    append_repo_instructions, capture_worktree_snapshot, detect_model_family, load_child_threads,
+    load_session_patch, notify_herdr, recover_session, restore_worktree_snapshot,
+    RESOLVED_UNKNOWN_MSG,
 };
 use self::tools::Tools;
 use self::turn::{execute_recorded_call, run_turn_live, ExecEnv, TurnCtx};
@@ -133,7 +134,7 @@ impl<'a> Daemon<'a> {
             _ => None,
         };
         let (record, rows) =
-            Record::open_with_rows(runs_dir.join(format!("{sid}.jsonl")), sid)
+            Record::open_with_rows(runs_dir.join(format!("{sid}.jsonl")), sid.clone())
                 .map_err(|e| e.to_string())?;
         let title = rows
             .iter()
@@ -169,7 +170,7 @@ impl<'a> Daemon<'a> {
             }
         }
         let mut tools =
-            Tools::with_config(&worktree, cfg).with_artifacts_dir(runs_dir.join("artifacts"));
+            Tools::with_config(&worktree, cfg).with_session_context(runs_dir.join("artifacts"), &sid);
         tools.restore_read_stamps(&rows);
         tools.apply_plan_mode(plan_mode);
         let initial_effort = std::env::var("TWIG_EFFORT")
@@ -377,6 +378,7 @@ impl<'a> Daemon<'a> {
                     "turns": turns,
                     "messages": self.messages,
                     "todos": self.todos,
+                    "child_threads": load_child_threads(&self.sid(), Some(&self.runs_dir.join("subagents"))),
                     "pending": self.pending,
                     "context_bytes": self.context.used_bytes(&self.messages),
                     "context_max": self.context.max_bytes(),
@@ -735,7 +737,7 @@ impl<'a> Daemon<'a> {
                         let next_wt = PathBuf::from(wt_str);
                         let (cfg, _) = HarnessConfig::resolve().unwrap_or_default();
                         let mut next_tools = Tools::with_config(&next_wt, &cfg)
-                            .with_artifacts_dir(self.runs_dir.join("artifacts"));
+                            .with_session_context(self.runs_dir.join("artifacts"), self.sid());
                         let _ = next_tools.apply_plan_mode(self.plan_mode);
                         self.worktree = next_wt;
                         self.tools = next_tools;

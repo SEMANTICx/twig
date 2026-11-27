@@ -17,9 +17,8 @@ use super::client::{
 };
 use super::composer::{parse_slash, SlashCommand};
 use super::markdown::{format_status_notice, FooterMode};
-use super::overlays::{
-    parse_todos, summarize_tool_args, title_tool_name, BtwCard, OverlayPicker,
-};
+use super::overlays::{summarize_tool_args, title_tool_name, OverlayPicker};
+use super::strips::{parse_todos, BtwCard, SubagentEntry, SubagentStatus, TodoEntry};
 use super::transcript::NoticeKind;
 use crate::llm::Llm;
 use super::{Action, App};
@@ -61,6 +60,9 @@ impl App {
                 }
                 if let Some(items) = result.get("todos").and_then(Value::as_array) {
                     self.todos = parse_todos(items);
+                    self.todos_done_at = (!self.todos.is_empty()
+                        && self.todos.iter().all(TodoEntry::is_completed))
+                    .then(Instant::now);
                 }
                 if let Some(rt) = result.get("running_tasks").and_then(Value::as_u64) {
                     self.running_tasks = rt as usize;
@@ -81,6 +83,44 @@ impl App {
                     self.history_req = None;
                     if let Some(messages) = result.get("messages").and_then(Value::as_array) {
                         self.transcript.replay_history(messages);
+                    }
+                    if let Some(children) = result.get("child_threads").and_then(Value::as_array) {
+                        self.subagents.clear();
+                        self.subagent_transcripts.clear();
+                        for child in children {
+                            let Some(csid) = child["sid"].as_str().filter(|s| !s.is_empty()) else {
+                                continue;
+                            };
+                            let role = child["role"].as_str().unwrap_or("scout").to_owned();
+                            let model = child["model"].as_str().map(str::to_owned);
+                            let task = child["task"].as_str().unwrap_or("").to_owned();
+                            let turns = child["turns"].as_u64().unwrap_or(0) as u32;
+                            let tool_count = child["tool_count"].as_u64().unwrap_or(0) as u32;
+                            let mut tr = super::transcript::Transcript::new();
+                            if let Some(msgs) = child.get("messages").and_then(Value::as_array) {
+                                tr.replay_history(msgs);
+                            } else if !task.is_empty() {
+                                tr.push_user(task.clone());
+                            }
+                            self.subagent_transcripts.insert(csid.to_owned(), tr);
+                            self.subagents.push(SubagentEntry {
+                                id: csid.to_owned(),
+                                child_sid: Some(csid.to_owned()),
+                                role,
+                                model,
+                                task,
+                                parallel: false,
+                                active_turn: false,
+                                started_at: Instant::now(),
+                                elapsed_secs: Some(0),
+                                status: SubagentStatus::Completed,
+                                error: None,
+                                activity: None,
+                                turns,
+                                tool_count,
+                                trace: Vec::new(),
+                            });
+                        }
                     }
                 }
                 if self.verify_req == Some(id) {
@@ -333,6 +373,10 @@ impl App {
                             format!("{} · turn {reason}", self.repo_label),
                         ));
                         if reason == "final" && self.approvals.is_empty() {
+                            if !self.todos_updated_in_turn && !self.todos.is_empty() {
+                                self.todos.clear();
+                                self.todos_done_at = None;
+                            }
                             if let Some(next_q) = self.queued_turns.pop_front() {
                                 self.auto_send_next = Some(next_q);
                             }
@@ -444,6 +488,7 @@ impl App {
                 format!("active model: {} (could not fetch magpie models: {e}; use `/model <name>`)", self.model),
             ),
             LocalMsg::GitStat(stat) => self.git_stat = stat,
+            LocalMsg::SubagentEvent(ev) => self.apply_event(&ev),
         }
     }
 
@@ -595,6 +640,10 @@ impl App {
             Some("todo.updated") => {
                 if let Some(items) = ev["items"].as_array() {
                     self.todos = parse_todos(items);
+                    self.todos_updated_in_turn = true;
+                    self.todos_done_at = (!self.todos.is_empty()
+                        && self.todos.iter().all(TodoEntry::is_completed))
+                    .then(Instant::now);
                 }
             }
             Some("policy.allowed") => {
@@ -608,6 +657,11 @@ impl App {
             Some("subagent.started") => {
                 let raw_id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent").to_owned();
+                let model = ev["model"].as_str().map(str::to_owned);
+                let child_sid = ev["sid"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
                 let id = if raw_id.is_empty() {
                     format!("{role}-{}", self.subagents.len() + 1)
                 } else {
@@ -621,14 +675,17 @@ impl App {
                     child_tr.push_user(task.clone());
                 }
                 self.subagent_transcripts.insert(id.clone(), child_tr);
-                self.subagents.push(super::overlays::SubagentEntry {
+                self.subagents.push(SubagentEntry {
                     id,
+                    child_sid,
                     role,
+                    model,
                     task,
                     parallel,
+                    active_turn: true,
                     started_at: Instant::now(),
                     elapsed_secs: None,
-                    status: super::overlays::SubagentStatus::Running,
+                    status: SubagentStatus::Running,
                     error: None,
                     activity: None,
                     turns: 0,
@@ -643,32 +700,34 @@ impl App {
                         }
                     }
                 }
-                if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
-                    &mut self.overlay_picker
-                {
+                if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
                     *subagents = self.subagents.clone();
                 }
             }
             Some("subagent.progress") => {
                 let id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent");
+                let child_sid = ev["sid"].as_str().filter(|s| !s.is_empty());
                 let activity = ev["activity"].as_str().unwrap_or("").trim();
                 let turns = ev["turns"].as_u64().unwrap_or(0) as u32;
                 let tool_count = ev["tool_count"].as_u64().unwrap_or(0) as u32;
                 let match_idx = (!id.is_empty())
                     .then(|| {
-                        self.subagents.iter().position(|s| {
-                            s.status == super::overlays::SubagentStatus::Running && s.id == id
-                        })
+                        self.subagents
+                            .iter()
+                            .position(|s| s.status == SubagentStatus::Running && s.id == id)
                     })
                     .flatten()
                     .or_else(|| {
-                        self.subagents.iter().position(|s| {
-                            s.status == super::overlays::SubagentStatus::Running && s.role == role
-                        })
+                        self.subagents
+                            .iter()
+                            .position(|s| s.status == SubagentStatus::Running && s.role == role)
                     });
                 if let Some(idx) = match_idx {
                     let entry = &mut self.subagents[idx];
+                    if let Some(csid) = child_sid {
+                        entry.child_sid = Some(csid.to_owned());
+                    }
                     if turns > entry.turns {
                         entry.turns = turns;
                     }
@@ -678,6 +737,7 @@ impl App {
                     if !activity.is_empty() {
                         entry.activity = Some(activity.to_owned());
                         if !activity.starts_with("thinking")
+                            && !activity.starts_with("starting")
                             && entry.trace.last().map(String::as_str) != Some(activity)
                         {
                             entry.trace.push(activity.to_owned());
@@ -686,9 +746,7 @@ impl App {
                             }
                         }
                     }
-                    if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
-                        &mut self.overlay_picker
-                    {
+                    if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
                         *subagents = self.subagents.clone();
                     }
                 }
@@ -702,9 +760,7 @@ impl App {
                     self.subagents
                         .iter()
                         .rev()
-                        .find(|s| {
-                            s.status == super::overlays::SubagentStatus::Running && s.role == role
-                        })
+                        .find(|s| s.status == SubagentStatus::Running && s.role == role)
                         .map(|s| s.id.clone())
                 };
                 if let Some(k) = key {
@@ -717,6 +773,9 @@ impl App {
             Some("subagent.completed") => {
                 let id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent");
+                let child_sid = ev["sid"].as_str().filter(|s| !s.is_empty());
+                let model = ev["model"].as_str().map(str::to_owned);
+                let has_patch = ev["patch_artifact"].as_str().is_some();
                 let ok = ev["ok"] == true;
                 let secs = ev["elapsed_secs"].as_u64().unwrap_or(0);
                 let err_note = ev["error"]
@@ -724,44 +783,57 @@ impl App {
                     .filter(|s| !s.is_empty())
                     .map(str::to_owned);
                 let next_status = if ok {
-                    super::overlays::SubagentStatus::Completed
+                    SubagentStatus::Completed
                 } else {
-                    super::overlays::SubagentStatus::Failed
+                    SubagentStatus::Failed
                 };
                 let match_idx = (!id.is_empty())
                     .then(|| {
-                        self.subagents.iter().position(|s| {
-                            s.status == super::overlays::SubagentStatus::Running && s.id == id
-                        })
+                        self.subagents
+                            .iter()
+                            .position(|s| s.status == SubagentStatus::Running && s.id == id)
                     })
                     .flatten()
                     .or_else(|| {
-                        self.subagents.iter().position(|s| {
-                            s.status == super::overlays::SubagentStatus::Running && s.role == role
-                        })
+                        self.subagents
+                            .iter()
+                            .position(|s| s.status == SubagentStatus::Running && s.role == role)
                     })
                     .or_else(|| {
                         self.subagents
                             .iter()
-                            .position(|s| s.status == super::overlays::SubagentStatus::Running)
+                            .position(|s| s.status == SubagentStatus::Running)
                     });
-                let done_id = if let Some(idx) = match_idx {
+                let (done_id, resolved_sid) = if let Some(idx) = match_idx {
+                    if let Some(csid) = child_sid {
+                        self.subagents[idx].child_sid = Some(csid.to_owned());
+                    }
+                    if self.subagents[idx].model.is_none() {
+                        self.subagents[idx].model = model;
+                    }
                     self.subagents[idx].status = next_status;
                     self.subagents[idx].elapsed_secs = Some(secs);
                     self.subagents[idx].error = err_note.clone();
                     self.subagents[idx].activity = None;
-                    self.subagents[idx].id.clone()
+                    (
+                        self.subagents[idx].id.clone(),
+                        self.subagents[idx].child_sid.clone(),
+                    )
                 } else {
                     let fallback_id = if id.is_empty() {
                         format!("{role}-{}", self.subagents.len() + 1)
                     } else {
                         id.to_owned()
                     };
-                    self.subagents.push(super::overlays::SubagentEntry {
+                    let csid = child_sid.map(str::to_owned);
+                    self.subagents.push(SubagentEntry {
                         id: fallback_id.clone(),
+                        child_sid: csid.clone(),
                         role: role.to_owned(),
+                        model,
                         task: String::new(),
                         parallel: false,
+                        active_turn: true,
                         started_at: Instant::now(),
                         elapsed_secs: Some(secs),
                         status: next_status,
@@ -771,13 +843,22 @@ impl App {
                         tool_count: 0,
                         trace: Vec::new(),
                     });
-                    fallback_id
+                    (fallback_id, csid)
                 };
+                if has_patch {
+                    self.git_stat_dirty = true;
+                }
                 if let Some(tr) = self.subagent_transcripts.get_mut(&done_id) {
                     if ok {
+                        let apply_hint = match (has_patch, resolved_sid.as_deref()) {
+                            (true, Some(csid)) => format!(" · patch ready: `/apply {csid}`"),
+                            _ => String::new(),
+                        };
                         tr.push_notice(
                             NoticeKind::Success,
-                            format!("subagent [{role}] completed in {secs}s (Esc ← main)"),
+                            format!(
+                                "subagent [{role}] completed in {secs}s{apply_hint} (Enter reply · Esc ← main)"
+                            ),
                         );
                     } else {
                         tr.push_notice(
@@ -789,9 +870,7 @@ impl App {
                         );
                     }
                 }
-                if let Some(super::overlays::OverlayPicker::Tasks { subagents, .. }) =
-                    &mut self.overlay_picker
-                {
+                if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
                     *subagents = self.subagents.clone();
                 }
             }
@@ -1052,7 +1131,7 @@ impl App {
                     self.transcript.search_open_with(&q);
                     Action::None
                 }
-                SlashCommand::CopyCode => match self.transcript.copy_latest_code_block() {
+                SlashCommand::CopyCode => match self.active_transcript_mut().copy_latest_code_block() {
                     Ok((text, msg)) => {
                         self.flash(msg);
                         Action::CopyCode(text)
@@ -1063,7 +1142,7 @@ impl App {
                     }
                 },
                 SlashCommand::ClearTranscript => {
-                    self.transcript.clear();
+                    self.active_transcript_mut().clear();
                     Action::None
                 }
                 SlashCommand::ShowHelp => {
@@ -1072,6 +1151,42 @@ impl App {
                 }
                 other => Action::Slash(other),
             };
+        }
+
+        if let Some(sub_id) = self.viewing_subagent.clone() {
+            if let Some(idx) = self.subagents.iter().position(|s| s.id == sub_id) {
+                if self.subagents[idx].status == SubagentStatus::Running {
+                    self.composer.set(trimmed);
+                    self.flash("Subagent is still running — wait for it to finish or Esc ← main");
+                    return Action::None;
+                }
+                let child_sid = self.subagents[idx]
+                    .child_sid
+                    .clone()
+                    .unwrap_or_else(|| self.subagents[idx].id.clone());
+                let role = self.subagents[idx].role.clone();
+                let model = self.subagents[idx].model.clone();
+                self.subagents[idx].status = SubagentStatus::Running;
+                self.subagents[idx].active_turn = true;
+                self.subagents[idx].started_at = Instant::now();
+                self.subagents[idx].elapsed_secs = None;
+                self.subagents[idx].error = None;
+                self.subagents[idx].activity = Some("starting…".into());
+                let text = trimmed.to_owned();
+                if let Some(tr) = self.subagent_transcripts.get_mut(&sub_id) {
+                    tr.push_user(text.clone());
+                    tr.follow_tail();
+                }
+                self.flash(format!("Sent message to subagent [{role}]"));
+                return Action::SendSubagentTurn {
+                    id: sub_id,
+                    child_sid,
+                    role,
+                    model,
+                    input: text,
+                };
+            }
+            self.viewing_subagent = None;
         }
 
         if self.running {
@@ -1164,7 +1279,11 @@ impl App {
                             .subagents
                             .iter()
                             .rev()
-                            .find(|s| s.id == q || s.role.eq_ignore_ascii_case(q))
+                            .find(|s| {
+                                s.id == q
+                                    || s.child_sid.as_deref() == Some(q)
+                                    || s.role.eq_ignore_ascii_case(q)
+                            })
                             .map(|s| s.id.clone());
                         if let Some(id) = found {
                             self.viewing_subagent = Some(id);
@@ -1690,5 +1809,162 @@ fn apply_child_stream_event(tr: &mut super::transcript::Transcript, ev: &Value) 
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::markdown::MotionMode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::backend::TestBackend;
+
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn subagent_thread_tree_interactive_chat_mouse_copy_and_todo_lifecycle_work() {
+        let mut app = App::new(".");
+        app.motion = MotionMode::Reduced;
+
+        // 1. Live subagent stream + 0-token parent isolation + interactive follow-up turn
+        let cells_before = app.transcript.len();
+        app.apply_event(&json!({
+            "ev": "subagent.started", "id": "sub-1", "role": "scout", "task": "Map tui modules", "parallel": true
+        }));
+        app.apply_event(&json!({
+            "ev": "subagent.started", "id": "sub-2", "role": "code", "task": "Fix web timeout", "parallel": true
+        }));
+        app.apply_event(&json!({
+            "ev": "subagent.progress", "id": "sub-1", "sid": "scout-sid-1", "role": "scout",
+            "activity": "Read(src/tui/mod.rs)", "turns": 2, "tool_count": 5
+        }));
+        app.apply_event(&json!({
+            "ev": "subagent.stream", "id": "sub-1", "role": "scout",
+            "child": {"ev": "model.delta", "text": "Subagent-1 live finding: TUI uses Ratatui."}
+        }));
+        assert_eq!(app.transcript.len(), cells_before);
+        assert!(render_text(&mut app, 128, 28).contains("Read(src/tui/mod.rs) · 5 tools · t2"));
+
+        app.apply_event(&json!({
+            "ev": "subagent.completed", "id": "sub-1", "sid": "scout-sid-1", "role": "scout", "ok": true, "elapsed_secs": 3
+        }));
+        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_key(press(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-1"));
+
+        // Direct interactive follow-up inside viewed subagent thread!
+        for ch in "Check line 120 too".chars() {
+            app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::SendSubagentTurn {
+                id: "sub-1".into(),
+                child_sid: "scout-sid-1".into(),
+                role: "scout".into(),
+                model: None,
+                input: "Check line 120 too".into(),
+            }
+        );
+        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-2"));
+        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.viewing_subagent.is_none());
+
+        // 2. Persistent child_threads remount via `session.history`
+        app.history_req = Some(42);
+        app.apply_server_msg(ServerMsg::Reply {
+            id: 42,
+            result: json!({
+                "sid": "main-99",
+                "messages": [{"role": "user", "content": "audit"}],
+                "child_threads": [{
+                    "sid": "scout-restored",
+                    "role": "scout",
+                    "task": "Audit MCP",
+                    "turns": 1,
+                    "tool_count": 3,
+                    "messages": [
+                        {"role": "user", "content": "Audit MCP"},
+                        {"role": "assistant", "content": "MCP findings ready."}
+                    ]
+                }]
+            }),
+        });
+        assert_eq!(app.subagents.len(), 1);
+        app.viewing_subagent = Some("scout-restored".into());
+        assert!(render_text(&mut app, 110, 24).contains("MCP findings ready."));
+        app.viewing_subagent = None;
+
+        // 3. Plan progress (`todo`) idle state + `+1 more` + follow-up cleanup
+        app.running = true;
+        app.apply_event(&json!({
+            "ev": "todo.updated",
+            "items": [
+                {"content": "Step A", "status": "completed"},
+                {"content": "Step B", "status": "in_progress"},
+                {"content": "Step C", "status": "pending"},
+                {"content": "Step D", "status": "pending"},
+                {"content": "Step E", "status": "pending"}
+            ]
+        }));
+        app.running = false;
+        let idle_todo = render_text(&mut app, 110, 26);
+        assert!(idle_todo.contains("Plan progress  1/5  · idle  · +1 more") && idle_todo.contains("◐ Step B"));
+        // Follow-up turn finishing without updating todo clears stale checklist
+        app.todos_updated_in_turn = false;
+        app.active_turn_req = Some(77);
+        app.apply_server_msg(ServerMsg::Reply {
+            id: 77,
+            result: json!({"done": true, "reason": "final", "text": "All done"}),
+        });
+        assert!(app.todos.is_empty());
+
+        // 4. Native mouse drag-selection auto-copy + scroll retention
+        app.transcript.clear();
+        for i in 0..30 {
+            app.transcript.push_user(format!("Prompt line {i}"));
+            app.transcript.push_assistant(format!("Answer line {i}"));
+        }
+        let _ = render_text(&mut app, 100, 24);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 18,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 18,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Action::CopyCode(_)
+        ));
+        app.handle_key(press(KeyCode::Home, KeyModifiers::NONE));
+        let _ = render_text(&mut app, 100, 24);
+        app.apply_event(&json!({"ev": "model.delta", "text": "Tail update"}));
+        assert!(render_text(&mut app, 100, 24).contains("Prompt line 0"));
     }
 }

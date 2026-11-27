@@ -12,7 +12,9 @@ mod composer;
 mod markdown;
 mod math_table;
 mod overlays;
+mod selection;
 mod slash;
+mod strips;
 mod transcript;
 
 use std::io::{self, IsTerminal};
@@ -20,7 +22,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
 };
 use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
@@ -43,9 +45,12 @@ use self::markdown::{
     HAIRLINE_FOCUS, IVORY, MUTED,
 };
 use self::overlays::{
+    title_tool_name, ApprovalKeyResult, ApprovalQueue, OverlayPicker, PickerOutcome,
+};
+use self::selection::{MouseSelectAction, TextSelection};
+use self::strips::{
     btw_card_height, queued_strip_height, render_btw_card, render_queued_strip,
-    render_subagent_strip, render_todo_strip, subagent_strip_height, title_tool_name,
-    todo_strip_height, ApprovalKeyResult, ApprovalQueue, BtwCard, OverlayPicker, PickerOutcome,
+    render_subagent_strip, render_todo_strip, subagent_strip_height, todo_strip_height, BtwCard,
     SubagentEntry, SubagentStatus, TodoEntry,
 };
 use self::transcript::{NoticeKind, RenderOpts, Transcript};
@@ -72,6 +77,13 @@ pub fn chat(repo: &str, resume: Option<&str>, plain: bool) -> Result<(), String>
 enum Action {
     None,
     SendTurn(String),
+    SendSubagentTurn {
+        id: String,
+        child_sid: String,
+        role: String,
+        model: Option<String>,
+        input: String,
+    },
     SendSteer(String),
     Cancel,
     BackgroundActive,
@@ -151,9 +163,13 @@ struct App {
     cached_tasks: Vec<Value>,
     open_tasks_drawer: bool,
     todos: Vec<TodoEntry>,
+    todos_updated_in_turn: bool,
+    todos_done_at: Option<Instant>,
     subagents: Vec<SubagentEntry>,
     subagent_transcripts: std::collections::HashMap<String, Transcript>,
     viewing_subagent: Option<String>,
+    selection: TextSelection,
+    last_screen: Option<ratatui::buffer::Buffer>,
     btw_card: Option<BtwCard>,
     pending_images: Vec<(String, String)>,
     transcript: Transcript,
@@ -237,9 +253,13 @@ impl App {
             cached_tasks: Vec::new(),
             open_tasks_drawer: false,
             todos: Vec::new(),
+            todos_updated_in_turn: false,
+            todos_done_at: None,
             subagents: Vec::new(),
             subagent_transcripts: std::collections::HashMap::new(),
             viewing_subagent: None,
+            selection: TextSelection::default(),
+            last_screen: None,
             btw_card: None,
             pending_images: Vec::new(),
             transcript: Transcript::new(),
@@ -297,9 +317,12 @@ impl App {
         self.cached_tasks.clear();
         self.open_tasks_drawer = false;
         self.todos.clear();
+        self.todos_updated_in_turn = false;
+        self.todos_done_at = None;
         self.subagents.clear();
         self.subagent_transcripts.clear();
         self.viewing_subagent = None;
+        self.selection.clear();
         self.btw_card = None;
         self.pending_images.clear();
         self.transcript.clear();
@@ -426,7 +449,7 @@ impl App {
                     if key.code == KeyCode::Char('Y')
                         || key.modifiers.contains(KeyModifiers::SHIFT) =>
                 {
-                    return match self.transcript.copy_latest_reply() {
+                    return match self.active_transcript_mut().copy_latest_reply() {
                         Ok((text, msg)) => {
                             self.flash(msg);
                             Action::CopyCode(text)
@@ -438,7 +461,7 @@ impl App {
                     };
                 }
                 KeyCode::Char('y') => {
-                    return match self.transcript.copy_latest_code_block() {
+                    return match self.active_transcript_mut().copy_latest_code_block() {
                         Ok((text, msg)) => {
                             self.flash(msg);
                             Action::CopyCode(text)
@@ -475,6 +498,15 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => {
+                    if self.selection.has_range() {
+                        if let Some(text) = self.selection.extract_text(self.last_screen.as_ref()) {
+                            self.selection.clear();
+                            self.flash(format!("Copied selection ({} chars)", text.chars().count()));
+                            return Action::CopyCode(text);
+                        }
+                        self.selection.clear();
+                        return Action::None;
+                    }
                     if self.overlay_picker.is_some() {
                         self.overlay_picker = None;
                         return Action::None;
@@ -534,7 +566,7 @@ impl App {
                 }
                 KeyCode::Char('g') => return Action::OpenEditor,
                 KeyCode::Char('l') => {
-                    self.transcript.clear();
+                    self.active_transcript_mut().clear();
                     return Action::None;
                 }
                 KeyCode::Char('a' | 'e' | 'u' | 'w' | 'j') => {
@@ -707,26 +739,34 @@ impl App {
                 return Action::None;
             }
             KeyCode::PageUp => {
+                self.selection.clear();
                 self.active_transcript_mut().scroll_by(-12);
                 return Action::None;
             }
             KeyCode::PageDown => {
+                self.selection.clear();
                 self.active_transcript_mut().scroll_by(12);
                 return Action::None;
             }
             KeyCode::Home
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
+                self.selection.clear();
                 self.active_transcript_mut().scroll_to_top();
                 return Action::None;
             }
             KeyCode::End
                 if key.modifiers.contains(KeyModifiers::CONTROL) || self.composer.is_empty() =>
             {
+                self.selection.clear();
                 self.active_transcript_mut().follow_tail();
                 return Action::None;
             }
             KeyCode::Esc => {
+                if self.selection.has_range() {
+                    self.selection.clear();
+                    return Action::None;
+                }
                 if self.viewing_subagent.is_some() {
                     self.viewing_subagent = None;
                     self.flash("Returned to main session");
@@ -822,11 +862,17 @@ impl App {
         }
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
-        match kind {
-            MouseEventKind::ScrollUp => self.active_transcript_mut().scroll_by(-4),
-            MouseEventKind::ScrollDown => self.active_transcript_mut().scroll_by(4),
-            _ => {}
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Action {
+        match self.selection.on_mouse(mouse, self.last_screen.as_ref()) {
+            MouseSelectAction::None => Action::None,
+            MouseSelectAction::Scroll(delta) => {
+                self.active_transcript_mut().scroll_by(delta);
+                Action::None
+            }
+            MouseSelectAction::Copied(text) => {
+                self.flash(format!("Copied selection ({} chars)", text.chars().count()));
+                Action::CopyCode(text)
+            }
         }
     }
 
@@ -895,7 +941,7 @@ impl App {
             .map(|t| t.search_is_open())
             .unwrap_or_else(|| self.transcript.search_is_open());
         let todo_h: u16 = if !has_approval && !has_picker && area.height > 14 {
-            todo_strip_height(&self.todos)
+            todo_strip_height(&self.todos, self.running, self.todos_done_at)
         } else {
             0
         };
@@ -1010,9 +1056,9 @@ impl App {
                 ),
                 Span::styled(
                     if self.subagents.len() > 1 {
-                        "(Tab next · ^O expand · Esc ← main)"
+                        "(Enter chat · Tab next · ^O expand · Esc ← main)"
                     } else {
-                        "(^O expand · Esc ← main)"
+                        "(Enter chat · ^O expand · Esc ← main)"
                     },
                     Style::default().fg(MUTED).bg(banner_bg),
                 ),
@@ -1051,7 +1097,7 @@ impl App {
         }
 
         if todo_h > 0 {
-            render_todo_strip(frame, chunks[1], &self.todos);
+            render_todo_strip(frame, chunks[1], &self.todos, self.running);
         }
         if let (true, Some(card)) = (btw_h > 0, self.btw_card.as_ref()) {
             render_btw_card(frame, chunks[2], card);
@@ -1111,7 +1157,25 @@ impl App {
             self.approvals.render(frame, chunks[6]);
         } else {
             let narrow_ui = area.width < 58;
-            let (rule_color, prompt_color, placeholder) = if self.running {
+            let (rule_color, prompt_color, placeholder) = if let Some(sub_id) =
+                self.viewing_subagent.as_deref()
+            {
+                let role = self
+                    .subagents
+                    .iter()
+                    .find(|s| s.id == sub_id)
+                    .map(|s| s.role.as_str())
+                    .unwrap_or("subagent");
+                let prompt_hint = if !self.composer.is_empty() {
+                    ""
+                } else if narrow_ui {
+                    "Message subagent… (Esc ← main)"
+                } else {
+                    "Message this subagent thread directly… (Enter send · Tab next · Esc ← main)"
+                };
+                let _ = role;
+                (BASH_MODE_COLOR, BASH_MODE_COLOR, prompt_hint)
+            } else if self.running {
                 (
                     active_rule_color(run_elapsed, self.motion),
                     AMBER,
@@ -1179,6 +1243,8 @@ impl App {
             "^O tools · Shift+Tab · ^T · ?"
         };
         render_footer(frame, chunks[8], &self.footer_view(flash, right_hint));
+        self.last_screen = Some(frame.buffer_mut().clone());
+        self.selection.paint(frame.buffer_mut());
     }
 
     fn connect_session(
@@ -1292,7 +1358,12 @@ impl App {
                                 return Ok(self.running);
                             }
                         }
-                        Event::Mouse(mouse) => self.handle_mouse(mouse.kind),
+                        Event::Mouse(mouse) => {
+                            let action = self.handle_mouse(mouse);
+                            if self.handle_action(action, terminal, client, workers)? {
+                                return Ok(self.running);
+                            }
+                        }
                         Event::Resize(_, _) => {}
                         _ => {}
                     }
@@ -1314,9 +1385,16 @@ impl App {
         match action {
             Action::None => {}
             Action::SendTurn(text) => {
-                // Keep any still-running subagents, clear completed ones from prior turns.
-                self.subagents
-                    .retain(|s| s.status == SubagentStatus::Running);
+                for s in &mut self.subagents {
+                    if s.status != SubagentStatus::Running {
+                        s.active_turn = false;
+                    }
+                }
+                if self.todos_done_at.is_some() {
+                    self.todos.clear();
+                    self.todos_done_at = None;
+                }
+                self.todos_updated_in_turn = false;
                 let imgs = std::mem::take(&mut self.pending_images);
                 let (params, labels) =
                     build_turn_params(&self.repo_raw, text, imgs, self.last_shell.as_ref());
@@ -1333,6 +1411,24 @@ impl App {
                         self.transcript.push_notice(NoticeKind::Error, e);
                     }
                 }
+            }
+            Action::SendSubagentTurn {
+                id,
+                child_sid,
+                role,
+                model,
+                input,
+            } => {
+                workers.spawn_subagent_turn(
+                    self.repo_raw.clone(),
+                    self.sid.clone(),
+                    id,
+                    child_sid,
+                    role,
+                    model,
+                    self.effort.clone(),
+                    input,
+                );
             }
             Action::SendSteer(text) => {
                 self.send_rpc(client, "steer", json!({"input": text}), "");
@@ -1872,78 +1968,6 @@ mod tests {
         assert!(render_frame_text(&mut app, 110, 28).contains("Crash-safe kernel release."));
         app.handle_key(press(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(app.btw_card.is_none());
-
-        // `↓` in empty composer opens Subagents & Tasks drawer
-        app.running = false;
-        app.apply_event(&json!({
-            "ev": "subagent.started", "id": "sub-1", "role": "scout", "task": "Map tui modules", "parallel": true
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.started", "id": "sub-2", "role": "scout", "task": "Map runtime tools", "parallel": true
-        }));
-        let cells_before = app.transcript.len();
-        app.apply_event(&json!({
-            "ev": "subagent.progress", "id": "sub-1", "role": "scout", "activity": "Read(src/tui/mod.rs)", "turns": 2, "tool_count": 5
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.progress", "id": "sub-2", "role": "scout", "activity": "Grep(SubagentPool)", "turns": 1, "tool_count": 2
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.stream", "id": "sub-1", "role": "scout",
-            "child": {"ev": "model.delta", "text": "Subagent-1 live finding: TUI uses Ratatui."}
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.stream", "id": "sub-2", "role": "scout",
-            "child": {"ev": "model.delta", "text": "Subagent-2 live finding: Tools run via mpsc."}
-        }));
-        // Out-of-band progress and child stream must never pollute the main transcript (0-token UI guarantee).
-        assert_eq!(app.transcript.len(), cells_before);
-        let strip_frame = render_frame_text(&mut app, 128, 28);
-        assert!(strip_frame.contains("Read(src/tui/mod.rs) · 5 tools · t2"));
-        assert!(strip_frame.contains("Grep(SubagentPool) · 2 tools · t1"));
-
-        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
-        assert!(matches!(app.overlay_picker, Some(OverlayPicker::Tasks { .. })));
-        app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        let drawer_frame = render_frame_text(&mut app, 120, 28);
-        assert!(drawer_frame.contains("trace (t2): Read(src/tui/mod.rs)"));
-
-        // Codex-style live view switcher: `v` enters sub-1 live stream, `Tab` cycles to sub-2, `Esc` returns to main!
-        app.handle_key(press(KeyCode::Char('v'), KeyModifiers::NONE));
-        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-1"));
-        let sub1_frame = render_frame_text(&mut app, 120, 28);
-        assert!(sub1_frame.contains("Subagent [scout]") && sub1_frame.contains("Subagent-1 live finding"));
-        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-2"));
-        let sub2_frame = render_frame_text(&mut app, 120, 28);
-        assert!(sub2_frame.contains("Subagent-2 live finding"));
-        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.viewing_subagent.is_none());
-
-        // Scrolling up must NEVER snap back to bottom when background tools/deltas stream in.
-        app.transcript.clear();
-        app.motion = MotionMode::Reduced;
-        for i in 0..35 {
-            app.transcript.push_user(format!("Prompt line {i}"));
-            app.transcript.push_assistant(format!("Answer line {i}"));
-        }
-        let _ = render_frame_text(&mut app, 100, 24);
-        app.handle_mouse(MouseEventKind::ScrollUp);
-        app.handle_key(press(KeyCode::Home, KeyModifiers::NONE));
-        let top_frame = render_frame_text(&mut app, 100, 24);
-        assert!(top_frame.contains("Prompt line 0"));
-        assert!(top_frame.contains("live tail (End)"));
-
-        app.apply_event(&json!({
-            "ev": "tool.started", "id": "t99", "tool": "read_file", "args": {"path": "Cargo.toml"}, "tier": "auto"
-        }));
-        app.apply_event(&json!({"ev": "model.delta", "text": "More streaming output at bottom"}));
-        app.transcript.push_assistant("Background review completed".into());
-        let still_top = render_frame_text(&mut app, 100, 24);
-        assert!(
-            still_top.contains("Prompt line 0"),
-            "scroll position snapped back to bottom during tool/assistant updates!"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

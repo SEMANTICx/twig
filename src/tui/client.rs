@@ -1157,6 +1157,7 @@ pub enum LocalMsg {
     Doctor(Result<(String, bool), String>),
     Models(Result<Vec<String>, String>),
     GitStat(Option<(usize, usize)>),
+    SubagentEvent(Value),
 }
 
 /// Non-blocking worker pool for host-side commands (`!cmd`, `/doctor`, `/review`, `/model`, git stat).
@@ -1227,6 +1228,138 @@ impl LocalWorkers {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(LocalMsg::GitStat(detect_git_diff_stat(&repo)));
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_subagent_turn(
+        &self,
+        repo: String,
+        parent_sid: String,
+        ui_id: String,
+        child_sid: String,
+        role: String,
+        model: Option<String>,
+        effort: Option<String>,
+        input: String,
+    ) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let role_enum = match role.as_str() {
+                "code" => crate::runtime::subagent::Role::Code,
+                "test" => crate::runtime::subagent::Role::Test,
+                "advisor" => crate::runtime::subagent::Role::Advisor,
+                "reviewer" => crate::runtime::subagent::Role::Reviewer,
+                _ => crate::runtime::subagent::Role::Scout,
+            };
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(LocalMsg::SubagentEvent(json!({
+                        "ev": "subagent.completed",
+                        "id": ui_id,
+                        "sid": child_sid,
+                        "role": role,
+                        "ok": false,
+                        "elapsed_secs": 0,
+                        "error": e.to_string(),
+                    })));
+                    return;
+                }
+            };
+            let pool_res = crate::runtime::subagent::SubagentPool::new_for_parent(
+                crate::runtime::subagent::SubagentConfig {
+                    twig: exe,
+                    repository: PathBuf::from(&repo),
+                    runs_root: paths::state_dir().join("subagents"),
+                    bwrap: "/usr/bin/bwrap".into(),
+                    concurrency: 2,
+                    timeout: Duration::from_secs(300),
+                    max_output_bytes: 64_000,
+                    network: true,
+                },
+                (!parent_sid.is_empty()).then_some(parent_sid),
+            );
+            let pool = match pool_res {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(LocalMsg::SubagentEvent(json!({
+                        "ev": "subagent.completed",
+                        "id": ui_id,
+                        "sid": child_sid,
+                        "role": role,
+                        "ok": false,
+                        "elapsed_secs": 0,
+                        "error": e.to_string(),
+                    })));
+                    return;
+                }
+            };
+            let tx_ev = tx.clone();
+            let ui_ev_id = ui_id.clone();
+            let ev_role = role.clone();
+            let event_cb = move |mut ev: Value| {
+                if let Some(obj) = ev.as_object_mut() {
+                    obj.insert("id".into(), Value::String(ui_ev_id.clone()));
+                    obj.insert("role".into(), Value::String(ev_role.clone()));
+                }
+                let _ = tx_ev.send(LocalMsg::SubagentEvent(ev));
+            };
+            let parent_artifacts = paths::state_dir().join("sessions").join("artifacts");
+            let run = pool.run_resumable_live(
+                role_enum,
+                &input,
+                model.as_deref(),
+                effort.as_deref(),
+                Some(&child_sid),
+                Some(&parent_artifacts),
+                None,
+                Some(&event_cb),
+            );
+            let elapsed_secs = started.elapsed().as_secs();
+            match run {
+                Ok(r) => {
+                    if model.as_deref().is_some_and(|m| m.starts_with("cli:")) {
+                        let text = r
+                            .result
+                            .as_ref()
+                            .and_then(|v| v["text"].as_str())
+                            .unwrap_or(&r.output);
+                        if !text.trim().is_empty() {
+                            let _ = tx.send(LocalMsg::SubagentEvent(json!({
+                                "ev": "subagent.stream",
+                                "id": ui_id,
+                                "role": role,
+                                "child": {"ev": "model.delta", "text": text},
+                            })));
+                        }
+                    }
+                    let _ = tx.send(LocalMsg::SubagentEvent(json!({
+                        "ev": "subagent.completed",
+                        "id": ui_id,
+                        "sid": r.sid,
+                        "model": model,
+                        "role": role,
+                        "ok": r.exit_code == Some(0) && !r.timed_out,
+                        "elapsed_secs": elapsed_secs,
+                        "patch_artifact": r.patch_artifact,
+                        "diff_stat": r.diff_stat,
+                    })));
+                }
+                Err(e) => {
+                    let _ = tx.send(LocalMsg::SubagentEvent(json!({
+                        "ev": "subagent.completed",
+                        "id": ui_id,
+                        "sid": child_sid,
+                        "model": model,
+                        "role": role,
+                        "ok": false,
+                        "elapsed_secs": elapsed_secs,
+                        "error": e.to_string(),
+                    })));
+                }
+            }
         });
     }
 }

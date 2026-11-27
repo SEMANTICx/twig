@@ -46,6 +46,7 @@ pub struct Tools {
     agent_pool: Option<SubagentPool>,
     agent_concurrency: usize,
     artifacts_dir: Option<PathBuf>,
+    parent_sid: Option<String>,
     tasks: TaskManager,
     blackboard: Vec<String>,
     undo_stack: Vec<FileSnapshot>,
@@ -81,6 +82,7 @@ impl Tools {
             agent_pool: None,
             agent_concurrency: cfg.subagent_concurrency,
             artifacts_dir: None,
+            parent_sid: None,
             tasks,
             blackboard: Vec::new(),
             undo_stack: Vec::new(),
@@ -92,6 +94,19 @@ impl Tools {
 
     pub fn with_artifacts_dir(mut self, dir: PathBuf) -> Self {
         self.artifacts_dir = Some(dir);
+        self
+    }
+
+    pub fn with_session_context(
+        mut self,
+        artifacts_dir: PathBuf,
+        parent_sid: impl Into<String>,
+    ) -> Self {
+        self.artifacts_dir = Some(artifacts_dir);
+        let p = parent_sid.into();
+        if !p.trim().is_empty() {
+            self.parent_sid = Some(p);
+        }
         self
     }
 
@@ -164,7 +179,8 @@ impl Tools {
              use outline(path=...) to map large files or directories before paginating with read(start_line=..., limit=...); \
              always read an existing file before editing or overwriting it; \
              inspect clipped outputs via read(path=\"artifact:<file>\") or past sessions via read(path=\"session:<sid>\"); \
-             use task for long/interactive background commands, parallel subagent batches for exploration/review, and papercut for harness defects. \
+             use task for long/interactive background commands, parallel subagent batches for exploration/review, and papercut for harness defects; \
+             when using todo for multi-step work, update it as steps finish and mark all completed steps `completed` before sending your final reply. \
              Skills use 3 tiers (.twig/skills > ~/.config/twig/skills, cold vault ~/.local/share/twig-skills-vault); \
              manage via `twig skill <list|enable|disable|add|doctor>`, and load `skill-creator` when authoring skills. \
              User TUI controls: /plan (Shift+Tab), /roles, /operator, /dual-plan, /btw, /walkthrough, /rewind (Esc×2), /undo, /skills, $skill-name, /evolve, /verify, !cmd, @file.",
@@ -328,7 +344,7 @@ impl Tools {
                                }}}}),
             json!({"type": "function", "function": {
                 "name": "todo",
-                "description": "Update the live multi-step task progress checklist shown to the user.",
+                "description": "Create or update the live multi-step task progress checklist shown to the user. Always send the full ordered list: mark the active step `in_progress`, mark finished steps `completed` as each step finishes, and BEFORE writing your final reply call `todo` one last time to mark all finished steps `completed`.",
                 "parameters": {"type": "object",
                                "properties": {
                                    "items": {
@@ -792,7 +808,14 @@ impl Tools {
         }
         emit(json!({"ev": "todo.updated", "items": normalized}));
         self.last_exit_code = Some(0);
-        format!("todo updated ({completed}/{} completed)", normalized.len())
+        if completed < normalized.len() {
+            format!(
+                "todo updated ({completed}/{} completed — call `todo` as steps finish and mark all completed steps `completed` before your final reply)",
+                normalized.len()
+            )
+        } else {
+            format!("todo updated ({completed}/{} completed)", normalized.len())
+        }
     }
 
     fn run_task(&mut self, args: &Value, control: &Control, emit: &mut dyn FnMut(Value)) -> String {
@@ -883,8 +906,10 @@ impl Tools {
                 max_output_bytes: 64_000,
                 network: self.network,
             };
-            self.agent_pool =
-                Some(SubagentPool::new(cfg).map_err(|e| format!("subagent setup: {e}"))?);
+            self.agent_pool = Some(
+                SubagentPool::new_for_parent(cfg, self.parent_sid.clone())
+                    .map_err(|e| format!("subagent setup: {e}"))?,
+            );
         }
         Ok(self.agent_pool.as_ref().unwrap().clone())
     }
@@ -904,6 +929,8 @@ struct SubagentSpec<'a> {
 
 struct SubagentOutcome<'a> {
     id: String,
+    child_sid: Option<String>,
+    model: Option<String>,
     text: String,
     raw_reply: String,
     slice: Option<&'a str>,
@@ -1054,6 +1081,7 @@ impl Tools {
                                     .and_then(|v| v["text"].as_str())
                                     .unwrap_or(&r.output)
                                     .to_owned();
+                                let child_sid = r.sid.clone();
                                 let summary = json!({
                                     "sid": r.sid,
                                     "role": r.role,
@@ -1071,6 +1099,8 @@ impl Tools {
                                 });
                                 Ok(SubagentOutcome {
                                     id: cid,
+                                    child_sid: Some(child_sid),
+                                    model: spec.model.map(str::to_owned),
                                     text: serde_json::to_string_pretty(&summary).unwrap_or_default(),
                                     raw_reply,
                                     slice: spec.slice,
@@ -1082,6 +1112,8 @@ impl Tools {
                             }
                             Err(e) => Ok(SubagentOutcome {
                                 id: cid,
+                                child_sid: spec.resume_sid.map(str::to_owned),
+                                model: spec.model.map(str::to_owned),
                                 text: format!("subagent error: {e}"),
                                 raw_reply: String::new(),
                                 slice: spec.slice,
@@ -1140,6 +1172,8 @@ impl Tools {
                     emit(json!({
                         "ev": "subagent.completed",
                         "id": done.id,
+                        "sid": done.child_sid,
+                        "model": done.model,
                         "role": done.role_name,
                         "ok": done.ok,
                         "elapsed_secs": done.elapsed_secs,
