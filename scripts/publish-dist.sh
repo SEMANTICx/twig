@@ -69,7 +69,7 @@ esac
 ARCH="$(uname -m)"
 case "$ARCH" in
   x86_64|amd64)
-    if rustup target list --installed 2>/dev/null | grep -qx "x86_64-unknown-linux-musl" && command -v musl-gcc >/dev/null 2>&1; then
+    if rustup target list --installed 2>/dev/null | grep -qx "x86_64-unknown-linux-musl"; then
       TARGET="x86_64-unknown-linux-musl"
       BUILD_ARGS=(--target "$TARGET")
       BIN_PATH="$ROOT/target/$TARGET/release/twig"
@@ -78,8 +78,8 @@ case "$ARCH" in
       BUILD_ARGS=()
       BIN_PATH="$ROOT/target/release/twig"
     else
-      echo "error: x86_64 release requires static musl toolchain (never mislabel glibc as musl)." >&2
-      echo "       Install via: rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y musl-tools" >&2
+      echo "error: x86_64 release requires static musl target (never mislabel glibc as musl)." >&2
+      echo "       Install via: rustup target add x86_64-unknown-linux-musl" >&2
       exit 1
     fi
     ;;
