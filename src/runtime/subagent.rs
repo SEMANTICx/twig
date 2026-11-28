@@ -1156,7 +1156,7 @@ impl SubagentPool {
         let mut effective_task = format!(
             "[Workspace root (cwd): `.` — inspect target files directly via relative paths like `src/...`]\n{normalized_task}"
         );
-        if let Some(role_card) = crate::eval::rci::load_role_note(orig_repo, role.as_str()) {
+        if let Some(role_card) = super::blackboard::load_role_note(orig_repo, role.as_str()) {
             effective_task = format!(
                 "[Role Protocol Card (.twig/notes/{}.md)]\n{role_card}\n\n{effective_task}",
                 role.as_str()

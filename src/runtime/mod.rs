@@ -1,6 +1,7 @@
 //! Agent session runtime: JSON-RPC daemon, turn execution, policy, guard,
 //! context compaction, playbooks/skills, subagents, and terminal client.
 
+pub mod blackboard;
 pub mod context;
 mod git_ops;
 pub mod guard;
@@ -1434,7 +1435,7 @@ impl<'a> Daemon<'a> {
                             "approval.resolve"
                                 if control.waiting().as_deref() == params["id"].as_str() =>
                             {
-                                control.resolve_full(
+                                control.resolve(
                                     params["id"].as_str().unwrap_or("").into(),
                                     params["allow"].as_bool().unwrap_or(false),
                                     params["remember"].as_bool().unwrap_or(false),

@@ -116,21 +116,6 @@ impl Roles {
             .map(String::as_str)
             .unwrap_or("aihub/gpt-6.1-sol")
     }
-
-    /// `TWIG_ROLES='{"code":"x"}'` overrides individual roles.
-    pub fn from_env() -> Self {
-        let mut roles = Self::default();
-        if let Ok(raw) = std::env::var("TWIG_ROLES") {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) {
-                for (k, v) in map {
-                    if let Some(s) = v.as_str() {
-                        roles.0.insert(k, s.to_string());
-                    }
-                }
-            }
-        }
-        roles
-    }
 }
 
 /// Extract a reply from an OpenAI-shaped response body.

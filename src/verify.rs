@@ -1,7 +1,7 @@
 //! Differential verification: the previous behaviour is the oracle.
 //!
-//! Covers both recorded journal replay (`Candidate` / `verify` / `gate`) and
-//! JSON-lines differential suites (`run_differential`). Depends strictly
+//! Replays recorded oracle journals (`Candidate` / `verify` / `gate`) with exact
+//! 64-bit integer precision and bounded process execution. Depends strictly
 //! downward on `crate::exec`.
 
 use std::io;
@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 
 use crate::exec::run_process;
 
-const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,69 +395,6 @@ pub fn gate(
     verdict
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DifferentialCase {
-    pub input: Value,
-    pub expected: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DifferentialResult {
-    pub passed: bool,
-    pub cases: usize,
-    pub failures: Vec<usize>,
-    pub output: String,
-}
-
-/// JSON-lines differential replay; malformed or extra output is a failure.
-pub fn run_differential(
-    cwd: &Path,
-    command: &str,
-    cases: &[DifferentialCase],
-    timeout: Duration,
-    max_output_bytes: usize,
-) -> io::Result<DifferentialResult> {
-    let mut payload = Vec::new();
-    for case in cases {
-        serde_json::to_writer(&mut payload, &case.input)?;
-        payload.push(b'\n');
-        if payload.len() > MAX_INPUT_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "differential input exceeds 8 MiB",
-            ));
-        }
-    }
-    let mut cmd = crate::exec::shell_command(command);
-    cmd.current_dir(cwd);
-    let out = run_process(&mut cmd, &payload, timeout, max_output_bytes)?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let actual: Result<Vec<Value>, _> = text.lines().map(serde_json::from_str).collect();
-    let failures = cases
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            actual
-                .as_ref()
-                .ok()
-                .and_then(|a| a.get(i))
-                .is_none_or(|a| !eq_json(a, &c.expected, 1e-9))
-                .then_some(i)
-        })
-        .collect::<Vec<_>>();
-    Ok(DifferentialResult {
-        passed: !cases.is_empty()
-            && !out.timed_out
-            && !out.truncated
-            && out.exit_code == Some(0)
-            && failures.is_empty()
-            && actual.as_ref().is_ok_and(|a| a.len() == cases.len()),
-        cases: cases.len(),
-        failures,
-        output: text,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,31 +487,6 @@ mod tests {
         assert!(text.contains(&"0".to_string()));
         assert!(text.contains(&"null".to_string()));
         assert!(text.iter().any(|t| t.contains("üñï")));
-    }
-
-    #[test]
-    fn differential_replay_is_strict() {
-        let cwd = Path::new("/tmp");
-        let cases = [DifferentialCase {
-            input: json!({"x": 1}),
-            expected: json!({"x": 1}),
-        }];
-        assert!(
-            run_differential(cwd, "cat", &cases, Duration::from_secs(1), 1024)
-                .unwrap()
-                .passed
-        );
-        assert!(
-            !run_differential(
-                cwd,
-                "echo not-json; cat",
-                &cases,
-                Duration::from_secs(1),
-                1024
-            )
-            .unwrap()
-            .passed
-        );
     }
 
     #[test]

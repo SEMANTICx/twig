@@ -362,9 +362,11 @@ pub fn lint(cfg: &HarnessConfig, banned: &[String]) -> Result<(), String> {
 
 const PROPOSER: &str = "\
 You tune the configuration of a coding-agent harness. You may change only these
-fields: system, bash_description, read_description, max_output (1000..64000),
-read_max_lines (50..2000), bash_timeout_secs (5..600), max_turns (5..80),
-stall_turns (2..20). You cannot change code, tests, or how runs are scored.
+fields: system (1..=6000 bytes), bash_description (1..=1500 bytes),
+read_description (1..=1500 bytes), max_output (1000..=64000),
+read_max_lines (50..=2000), bash_timeout_secs (5..=600), max_turns (5..=80),
+stall_turns (2..=20), context_max_bytes (8000..=2000000),
+subagent_concurrency (1..=8). You cannot change code, tests, or how runs are scored.
 
 You get the current configuration and evidence from failed or costly runs of a
 scoring set. The scoring set is a sample of real work; the harness will be used
@@ -957,6 +959,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn final_regression_retains_original_file_and_never_reaches_proposer() {
+        if !crate::exec::isolation::bwrap_userns_usable() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("twig-improvement-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();

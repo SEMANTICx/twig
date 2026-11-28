@@ -69,6 +69,45 @@ pub struct Record {
 }
 
 impl Record {
+    fn walk_verified(
+        path: &Path,
+        mut on_row: impl FnMut(Value),
+    ) -> Result<(String, u64), (usize, String)> {
+        let file = File::open(path).map_err(|e| (0, format!("open {}: {e}", path.display())))?;
+        let mut prev = GENESIS.to_string();
+        let mut seq = 0u64;
+        let mut index = 0usize;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|e| (index, e.to_string()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut value: Value =
+                serde_json::from_str(&line).map_err(|e| (index, format!("json: {e}")))?;
+            let claimed = value
+                .get("hash")
+                .and_then(Value::as_str)
+                .ok_or((index, "missing hash".to_string()))?
+                .to_string();
+            let full = value.clone();
+            value
+                .as_object_mut()
+                .ok_or((index, "not an object".to_string()))?
+                .remove("hash");
+            if hash_of(&value) != claimed {
+                return Err((index, "hash mismatch".into()));
+            }
+            if value.get("prev").and_then(Value::as_str) != Some(prev.as_str()) {
+                return Err((index, "chain break".into()));
+            }
+            prev = claimed;
+            seq += 1;
+            index += 1;
+            on_row(full);
+        }
+        Ok((prev, seq))
+    }
+
     /// Open or lazily prepare a hash-chained session record, returning any existing
     /// verified entries in a single pass without creating 0-byte files on disk.
     pub fn open_with_rows(
@@ -91,50 +130,10 @@ impl Record {
                 Vec::new(),
             ));
         }
-        let file = File::open(&path)?;
-        let mut prev = GENESIS.to_string();
-        let mut seq = 0u64;
-        let mut index = 0usize;
         let mut rows = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|e| {
-                std::io::Error::other(format!("record corruption at {index}: {e}"))
-            })?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut value: Value = serde_json::from_str(&line).map_err(|e| {
-                std::io::Error::other(format!("record corruption at {index}: json: {e}"))
-            })?;
-            let claimed = value
-                .get("hash")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    std::io::Error::other(format!("record corruption at {index}: missing hash"))
-                })?
-                .to_string();
-            let full = value.clone();
-            value
-                .as_object_mut()
-                .ok_or_else(|| {
-                    std::io::Error::other(format!("record corruption at {index}: not an object"))
-                })?
-                .remove("hash");
-            if hash_of(&value) != claimed {
-                return Err(std::io::Error::other(format!(
-                    "record corruption at {index}: hash mismatch"
-                )));
-            }
-            if value.get("prev").and_then(Value::as_str) != Some(prev.as_str()) {
-                return Err(std::io::Error::other(format!(
-                    "record corruption at {index}: chain break"
-                )));
-            }
-            prev = claimed;
-            seq += 1;
-            index += 1;
-            rows.push(full);
-        }
+        let (prev, seq) = Self::walk_verified(&path, |row| rows.push(row)).map_err(
+            |(index, why)| std::io::Error::other(format!("record corruption at {index}: {why}")),
+        )?;
         Ok((
             Self {
                 path,
@@ -225,37 +224,14 @@ impl Record {
 
     /// `Ok(entries)` when the whole chain is intact, `Err((index, reason))` otherwise.
     pub fn verify_chain(path: &Path) -> Result<u64, (usize, String)> {
-        let file = File::open(path).map_err(|e| (0, format!("open {}: {e}", path.display())))?;
-        let mut prev = GENESIS.to_string();
-        let mut count = 0u64;
-        let mut index = 0usize;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|e| (index, e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut value: Value =
-                serde_json::from_str(&line).map_err(|e| (index, format!("json: {e}")))?;
-            let claimed = value
-                .get("hash")
-                .and_then(Value::as_str)
-                .ok_or((index, "missing hash".to_string()))?
-                .to_string();
-            value
-                .as_object_mut()
-                .ok_or((index, "not an object".to_string()))?
-                .remove("hash");
-            if hash_of(&value) != claimed {
-                return Err((index, "hash mismatch".into()));
-            }
-            if value.get("prev").and_then(Value::as_str) != Some(prev.as_str()) {
-                return Err((index, "chain break".into()));
-            }
-            prev = claimed;
-            count += 1;
-            index += 1;
-        }
-        Ok(count)
+        Self::walk_verified(path, |_| {}).map(|(_, count)| count)
+    }
+
+    /// Verify the BLAKE3 hash chain and return all verified rows in a single pass.
+    pub fn verify_rows(path: &Path) -> Result<Vec<Value>, (usize, String)> {
+        let mut rows = Vec::new();
+        Self::walk_verified(path, |row| rows.push(row))?;
+        Ok(rows)
     }
 }
 
@@ -266,6 +242,28 @@ pub struct Lease {
 }
 
 impl Lease {
+    /// Non-blocking probe returning `true` if another process currently holds an active
+    /// exclusive OS `Lease` on `path` (distinguishes live daemons from stale `.lock` files).
+    pub fn is_locked(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            let Ok(file) = File::open(path) else {
+                return false;
+            };
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0;
+            if !locked {
+                unsafe {
+                    libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+                }
+            }
+            locked
+        }
+        #[cfg(not(unix))]
+        {
+            path.exists()
+        }
+    }
+
     pub fn acquire(path: &Path) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -278,7 +276,17 @@ impl Lease {
                 .append(true)
                 .mode(0o600)
                 .open(path)?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let mut acquired = false;
+            for attempt in 0..5 {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    acquired = true;
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            if !acquired {
                 return Err(std::io::Error::other(
                     "session is already owned by another process",
                 ));

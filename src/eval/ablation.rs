@@ -14,12 +14,14 @@ fn deleted_only(before: &str, after: &str) -> bool {
 }
 
 pub fn is_ablation(before: &HarnessConfig, after: &HarnessConfig) -> bool {
-    before != after
-        && before.max_output == after.max_output
-        && before.read_max_lines == after.read_max_lines
-        && before.bash_timeout_secs == after.bash_timeout_secs
-        && before.max_turns == after.max_turns
-        && before.stall_turns == after.stall_turns
+    if before == after {
+        return false;
+    }
+    let mut expected = before.clone();
+    expected.system = after.system.clone();
+    expected.bash_description = after.bash_description.clone();
+    expected.read_description = after.read_description.clone();
+    expected == *after
         && deleted_only(&before.system, &after.system)
         && deleted_only(&before.bash_description, &after.bash_description)
         && deleted_only(&before.read_description, &after.read_description)
@@ -70,6 +72,12 @@ mod tests {
         assert!(!is_ablation(&before, &after));
         let mut after = candidate(&before, 1).unwrap();
         after.max_turns += 1;
+        assert!(!is_ablation(&before, &after));
+        let mut after = candidate(&before, 1).unwrap();
+        after.context_max_bytes += 4_000;
+        assert!(!is_ablation(&before, &after));
+        let mut after = candidate(&before, 1).unwrap();
+        after.isolation = !after.isolation;
         assert!(!is_ablation(&before, &after));
     }
 

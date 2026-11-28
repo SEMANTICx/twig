@@ -5,7 +5,7 @@
 //! scoring set are deliberately out of reach: a loop that can edit its own
 //! exam learns to loosen the exam.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -222,13 +222,10 @@ impl HarnessConfig {
 
     /// `TWIG_CONFIG` if set; otherwise the XDG config file if present; otherwise defaults.
     pub fn resolve() -> Result<(Self, String), String> {
-        if let Ok(path) = std::env::var("TWIG_CONFIG") {
-            return Ok((Self::load(Path::new(&path))?, path));
-        }
-        let default_path = paths::config_path();
-        if default_path.exists() {
-            let label = default_path.display().to_string();
-            return Ok((Self::load(&default_path)?, label));
+        let path = paths::config_path();
+        if std::env::var_os("TWIG_CONFIG").is_some() || path.exists() {
+            let label = path.display().to_string();
+            return Ok((Self::load(&path)?, label));
         }
         Ok((Self::default(), "defaults".into()))
     }
@@ -254,8 +251,4 @@ impl HarnessConfig {
         }
         out
     }
-}
-
-pub fn project_config_path() -> PathBuf {
-    paths::config_path()
 }

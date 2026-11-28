@@ -22,9 +22,9 @@ use serde_json::{json, Value};
 use crate::config::paths;
 use crate::llm::{Llm, Provider};
 use crate::record::Record;
-
-pub const MAX_ROLE_NOTE_CHARS: usize = 1_200;
-pub const ROLES: &[&str] = &["scout", "code", "test", "advisor", "reviewer"];
+use crate::runtime::blackboard::{
+    baseline_role_note, extract_decisive_facts, status_report, validate_role_note, ROLES,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LadderReport {
@@ -376,49 +376,6 @@ fn read_jsonl_rows(path: &Path) -> Result<Vec<Value>, String> {
     Ok(rows)
 }
 
-/// Extract concise `file:line` / `[Observed]` / `Fact:` bullets from a subagent output.
-pub fn extract_decisive_facts(role: &str, slice: Option<&str>, text: &str) -> Vec<String> {
-    let tag = match slice.filter(|s| !s.trim().is_empty()) {
-        Some(sl) => format!("[{role} @ {sl}]"),
-        None => format!("[{role}]"),
-    };
-    let mut out = Vec::new();
-    for raw_line in text.lines() {
-        let trimmed = raw_line
-            .trim()
-            .trim_start_matches(['-', '*', '•'])
-            .trim();
-        if trimmed.len() < 12 || trimmed.len() > 280 {
-            continue;
-        }
-        let has_fact_prefix = trimmed.starts_with("[Fact]")
-            || trimmed.starts_with("Fact:")
-            || trimmed.starts_with("[Observed]");
-        let has_file_line = (trimmed.contains(".rs:")
-            || trimmed.contains(".py:")
-            || trimmed.contains(".ts:")
-            || trimmed.contains(".go:")
-            || trimmed.contains(".js:")
-            || trimmed.contains(".md:"))
-            && trimmed.chars().any(|c| c.is_ascii_digit());
-        if has_fact_prefix || has_file_line {
-            let clean = trimmed
-                .strip_prefix("[Fact]")
-                .or_else(|| trimmed.strip_prefix("Fact:"))
-                .unwrap_or(trimmed)
-                .trim();
-            let entry = format!("{tag} {clean}");
-            if !out.contains(&entry) {
-                out.push(entry);
-            }
-            if out.len() >= 6 {
-                break;
-            }
-        }
-    }
-    out
-}
-
 /// Label-free harvest over `<sessions_dir>/*.jsonl`: keeps ONLY hash-chain-verified
 /// sessions where automatic verification passed (`verify.passed` or `verify.completed(passed=true)`),
 /// attributing credit across subagent roles by downstream fact reuse and patch/review impact.
@@ -440,13 +397,10 @@ pub fn harvest_sessions(sessions_dir: &Path) -> Result<HarvestReport, String> {
             continue;
         }
         scanned += 1;
-        if Record::verify_chain(&path).is_err() {
-            continue;
-        }
-        valid_chains += 1;
-        let Ok(rows) = read_jsonl_rows(&path) else {
+        let Ok(rows) = Record::verify_rows(&path) else {
             continue;
         };
+        valid_chains += 1;
         let auto_verified = rows.iter().any(|r| {
             let kind = r["kind"].as_str().unwrap_or("");
             kind == "verify.passed"
@@ -542,71 +496,6 @@ pub fn harvest_sessions(sessions_dir: &Path) -> Result<HarvestReport, String> {
         role_credits: credits,
         sample_facts,
     })
-}
-
-/// Default compact protocol cards distilled from RCI findings: split decisive slices,
-/// forward verbatim `file:line` evidence, and avoid redundant shared-context debate.
-pub fn baseline_role_note(role: &str) -> &'static str {
-    match role {
-        "scout" => "\
-- Inspect ONLY your assigned `slice` (never re-scan unrelated directories).
-- Prefer `outline` -> targeted `read(start_line, limit)` / `grep` over broad shell dumps.
-- End your response with `Facts:` bullets citing exact `path:line` and observed invariants (no ungrounded speculation).",
-        "code" => "\
-- Stay strictly within your assigned module `slice` and interface contract.
-- Read every target file before editing; reuse `[Shared Fact Blackboard]` locations instead of re-exploring from scratch.
-- Run fast targeted unit/check commands and end with `Facts:` listing modified `path:line` and test exit status.",
-        "test" => "\
-- Construct minimal deterministic reproducers and edge-case assertions covering your assigned `slice`.
-- Report exact failing/passing test names and `path:line` assertions under `Facts:`.",
-        "advisor" => "\
-- Synthesize disjoint `[Shared Fact Blackboard]` evidence across slices; call out cross-module contradictions and simpler designs.
-- Cite concrete `path:line` facts rather than repeating generic advice.",
-        "reviewer" => "\
-- Verify proposed diffs against `[Shared Fact Blackboard]` invariants and security/sandbox boundaries.
-- Report `blockers` ONLY when backed by a concrete `file` and reproducible `trigger` path.",
-        _ => "- Forward concise `path:line` facts; avoid redundant exploration.",
-    }
-}
-
-/// Load `<repo>/.twig/notes/<role>.md` (falling back to `~/.config/twig/notes/<role>.md`),
-/// strictly bounded to `MAX_ROLE_NOTE_CHARS` so role cards never bloat subagent prompts.
-pub fn load_role_note(repo: &Path, role: &str) -> Option<String> {
-    if !ROLES.contains(&role) {
-        return None;
-    }
-    let project_card = repo.join(".twig").join("notes").join(format!("{role}.md"));
-    let global_card = paths::config_dir()
-        .join("notes")
-        .join(format!("{role}.md"));
-    let raw = std::fs::read_to_string(&project_card)
-        .ok()
-        .or_else(|| std::fs::read_to_string(&global_card).ok())?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(trimmed.chars().take(MAX_ROLE_NOTE_CHARS).collect())
-}
-
-/// Anti-overfitting guard for candidate role cards: rejects oversized notes or notes
-/// leaking repository-specific file stems from `banned_tokens`.
-pub fn validate_role_note(body: &str, banned_tokens: &[String]) -> Result<(), String> {
-    let chars = body.chars().count();
-    if chars == 0 {
-        return Err("role note is empty".into());
-    }
-    if chars > MAX_ROLE_NOTE_CHARS {
-        return Err(format!(
-            "role note exceeds {MAX_ROLE_NOTE_CHARS}-char budget ({chars} chars)"
-        ));
-    }
-    let low = body.to_lowercase();
-    if let Some(hit) = banned_tokens.iter().find(|tok| tok.len() >= 4 && low.contains(tok.as_str()))
-    {
-        return Err(format!("role note leaks task/repo-specific token {hit:?}"));
-    }
-    Ok(())
 }
 
 /// Distill compact `.twig/notes/<role>.md` protocol cards from verified collective harvest
@@ -830,35 +719,6 @@ pub fn gate_generation(
     })
 }
 
-/// Format current `.twig/notes/` RCI generation status for CLI and TUI `/rci`.
-pub fn status_report(repo: &Path) -> String {
-    let notes_dir = repo.join(".twig").join("notes");
-    let state_val = std::fs::read_to_string(notes_dir.join("state.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    let gen_n = state_val
-        .as_ref()
-        .and_then(|v| v["generation"].as_u64())
-        .unwrap_or(0);
-    let active_cards: Vec<(&str, usize)> = ROLES
-        .iter()
-        .filter_map(|&r| load_role_note(repo, r).map(|body| (r, body.chars().count())))
-        .collect();
-    if active_cards.is_empty() {
-        return format!(
-            "RCI status: generation {gen_n} · 0 active role cards (run `/rci distill` or `twig rci distill` to initialize `.twig/notes/`)"
-        );
-    }
-    let summary: Vec<String> = active_cards
-        .into_iter()
-        .map(|(r, c)| format!("{r} ({c}c)"))
-        .collect();
-    format!(
-        "RCI status: generation {gen_n} · active role protocol cards: {}",
-        summary.join(", ")
-    )
-}
-
 /// Unified CLI handler for `twig ladder ...` and `twig rci ...`.
 pub fn run_cli(cmd: &str, args: &[String]) -> Result<String, String> {
     let has_json = args.iter().any(|a| a == "--json");
@@ -948,6 +808,7 @@ pub fn run_cli(cmd: &str, args: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::blackboard::load_role_note;
 
     #[test]
     fn equal_budget_ladder_distinguishes_debate_tax_from_level3_emergence() {

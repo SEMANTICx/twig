@@ -429,7 +429,7 @@ impl Tools {
     /// Behavioral RPC façade for the RCI Split-Fact Blackboard (`list` / `add` / `clear`)
     /// paired with the repository's active `.twig/notes/` role-card generation status.
     pub fn blackboard_rpc(&mut self, params: &Value) -> Value {
-        let rci_status = crate::eval::rci::status_report(&self.worktree);
+        let rci_status = super::blackboard::status_report(&self.worktree);
         match params["action"].as_str().unwrap_or("list") {
             "clear" => {
                 let n = self.blackboard.len();
@@ -1144,7 +1144,7 @@ impl Tools {
             match res {
                 Ok(done) => {
                     if done.ok && done.use_blackboard {
-                        for fact in crate::eval::rci::extract_decisive_facts(
+                        for fact in super::blackboard::extract_decisive_facts(
                             done.role_name,
                             done.slice,
                             &done.raw_reply,

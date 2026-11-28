@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 .twig-splits/
 .twig-final/
+/.twig-worktrees/
+/.twig-workers/

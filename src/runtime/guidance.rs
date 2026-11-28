@@ -17,18 +17,6 @@ pub struct Playbook {
     pub steps: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StepStatus {
-    Pending,
-    Skipped(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct TodoItem {
-    pub step: String,
-    pub status: StepStatus,
-}
-
 impl Playbook {
     pub fn builtin() -> Vec<Self> {
         [
@@ -134,16 +122,6 @@ impl Playbook {
         }
         books
     }
-
-    pub fn todo(&self) -> Vec<TodoItem> {
-        self.steps
-            .iter()
-            .map(|step| TodoItem {
-                step: step.clone(),
-                status: StepStatus::Pending,
-            })
-            .collect()
-    }
 }
 
 /// Match a goal to a playbook by counting keyword hits from each `when:` line.
@@ -164,24 +142,6 @@ pub fn route<'a>(goal: &str, books: &'a [Playbook]) -> Option<&'a Playbook> {
         }
     }
     best.map(|(b, _)| b)
-}
-
-/// Every skip must carry a reason. Returns the offending step indices.
-pub fn validate_skips(items: &[TodoItem]) -> Result<(), Vec<usize>> {
-    let bad: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| match &item.status {
-            StepStatus::Skipped(reason) => reason.trim().is_empty(),
-            StepStatus::Pending => false,
-        })
-        .map(|(i, _)| i)
-        .collect();
-    if bad.is_empty() {
-        Ok(())
-    } else {
-        Err(bad)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1388,17 +1348,6 @@ when: bug, broken, crash, regression
             "bug-fix"
         );
         assert!(route("add a settings page", &books).is_none());
-    }
-
-    #[test]
-    fn skip_without_reason_is_rejected() {
-        let book = Playbook::parse(SAMPLE, "f").unwrap();
-        let mut items = book.todo();
-        items[1].status = StepStatus::Skipped(String::new());
-        assert_eq!(validate_skips(&items), Err(vec![1]));
-
-        items[1].status = StepStatus::Skipped("covered by tests/unit/x.rs".into());
-        assert!(validate_skips(&items).is_ok());
     }
 
     #[test]

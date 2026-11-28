@@ -388,13 +388,9 @@ fn main() {
             }
             #[cfg(target_os = "linux")]
             {
-                let bwrap_ns_ok = std::process::Command::new("bwrap")
-                    .args(["--ro-bind", "/", "/", "--", "/bin/true"])
-                    .output()
-                    .is_ok_and(|o| o.status.success());
                 println!(
                     "bwrap_ns:    {}",
-                    if bwrap_ns_ok {
+                    if twig::isolation::bwrap_userns_usable() {
                         "ok (user namespaces enabled)"
                     } else {
                         "unavailable (sandbox/subagent bwrap restricted in this environment)"
@@ -592,7 +588,7 @@ fn main() {
             let provider = Provider::new();
             let twig = std::env::current_exe().expect("current exe");
             let scratch = tempdir("improve");
-            let out = twig::config::project_config_path();
+            let out = paths::config_path();
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent).expect("config directory");
             }

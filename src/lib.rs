@@ -9,7 +9,7 @@
 //!   Verify     : `verify` (differential replay & admission gates)
 //!   Runtime    : `runtime` (daemon, turn loop, tools, policy, guard, context, guidance, subagent, terminal)
 //!   Evaluation : `eval` (scoring runner, protected datasets, improvement optimizer, lessons, ablation, classify, trajectory)
-//!   Automation : `automation` (durable GitHub maintenance queue, outer loop)
+//!   Automation : `automation` (durable GitHub maintenance queue, isolated worktrees & shipping)
 
 pub mod automation;
 pub mod config;

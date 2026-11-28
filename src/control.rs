@@ -30,24 +30,14 @@ impl Control {
     }
     pub fn steer(&self, text: String) { self.steering.lock().expect("steering").push_back(text); }
     pub fn take_steering(&self) -> Vec<String> { self.steering.lock().expect("steering").drain(..).collect() }
-    pub fn resolve(&self, id: String, allow: bool) {
-        self.resolve_full(id, allow, false, None);
-    }
-    pub fn resolve_with_scope(&self, id: String, allow: bool, remember: bool) {
-        self.resolve_full(id, allow, remember, None);
-    }
-    pub fn resolve_full(&self, id: String, allow: bool, remember: bool, note: Option<String>) {
+    pub fn resolve(&self, id: String, allow: bool, remember: bool, note: Option<String>) {
         self.approvals.lock().expect("approvals").insert(id, (allow, remember, note));
         self.wake.notify_all();
     }
-    pub fn begin_approval(&self, id: &str) { *self.waiting.lock().expect("waiting")=Some(id.into()); }
-    pub fn approval(&self, id: &str) -> Option<bool> {
-        self.approval_decision_full(id).map(|(allow, _, _)| allow)
+    pub fn begin_approval(&self, id: &str) {
+        *self.waiting.lock().expect("waiting") = Some(id.into());
     }
-    pub fn approval_decision(&self, id: &str) -> Option<(bool, bool)> {
-        self.approval_decision_full(id).map(|(allow, rem, _)| (allow, rem))
-    }
-    pub fn approval_decision_full(&self, id: &str) -> Option<(bool, bool, Option<String>)> {
+    pub fn wait_approval(&self, id: &str) -> Option<(bool, bool, Option<String>)> {
         *self.waiting.lock().expect("waiting") = Some(id.to_string());
         let mut pending = self.approvals.lock().expect("approvals");
         loop {

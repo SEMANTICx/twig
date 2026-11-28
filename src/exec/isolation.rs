@@ -83,17 +83,37 @@ pub fn shell(
     }
 }
 
+/// Cached probe returning `true` when `bwrap` user namespaces are available in the
+/// current Linux kernel/container environment.
+pub fn bwrap_userns_usable() -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
+        static USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *USABLE.get_or_init(|| {
+            Command::new("bwrap")
+                .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+    }
+}
+
 /// Evaluation sandbox with an allowlist filesystem: never mounts `/home`,
-/// checks, or source task metadata.
+/// checks, or source task metadata. Caller supplies explicit `(key, value)` env pairs.
 pub fn eval_command(
     twig: &Path,
     config: &Path,
     workspace: &Path,
     runs: &Path,
+    envs: &[(&str, &str)],
 ) -> Result<Command, String> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (twig, config, workspace, runs);
+        let _ = (twig, config, workspace, runs, envs);
         return Err("bwrap evaluation sandbox requires Linux".into());
     }
     #[cfg(target_os = "linux")]
@@ -172,32 +192,8 @@ pub fn eval_command(
             "TWIG_CONFIG",
             "/harness.json",
         ]);
-    for name in [
-        "TWIG_BASE_URL",
-        "TWIG_API_KEY",
-        "TWIG_ROLES",
-        "TWIG_MODEL",
-        "TWIG_EFFORT",
-    ] {
-        if let Ok(value) = std::env::var(name) {
-            cmd.args(["--setenv", name, &value]);
-        }
-    }
-    if std::env::var_os("TWIG_ROLES").is_none() && std::env::var_os("TWIG_MODEL").is_none() {
-        use crate::llm::Llm;
-        let provider = crate::llm::Provider::new();
-        if let Ok(roles_json) = serde_json::to_string(&provider.roles().0) {
-            cmd.args(["--setenv", "TWIG_ROLES", &roles_json]);
-        }
-    }
-    if std::env::var_os("TWIG_EFFORT").is_none() {
-        let effort_file = crate::config::paths::state_dir().join("effort.txt");
-        if let Ok(raw) = std::fs::read_to_string(&effort_file) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                cmd.args(["--setenv", "TWIG_EFFORT", trimmed]);
-            }
-        }
+    for (name, value) in envs {
+        cmd.args(["--setenv", name, value]);
     }
     cmd.args(["--", "/twig", "serve", "/workspace", "/runs"]);
     Ok(cmd)
@@ -219,6 +215,7 @@ mod tests {
             &root.join("config"),
             &root.join("workspace"),
             &root.join("runs"),
+            &[("TWIG_MODEL", "stub")],
         )
         .unwrap();
         let args: Vec<_> = cmd
@@ -233,6 +230,9 @@ mod tests {
 
     #[test]
     fn solver_cannot_read_checks_or_source_prompts_outside_workspace() {
+        if !bwrap_userns_usable() {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!("twig-hidden-{}", std::process::id()));
         std::fs::create_dir_all(root.join("workspace")).unwrap();
@@ -257,6 +257,7 @@ mod tests {
             &root.join("config"),
             &root.join("workspace"),
             &root.join("runs"),
+            &[],
         )
         .unwrap()
         .output()

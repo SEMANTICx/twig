@@ -1,10 +1,7 @@
 //! Isolated evaluation runner, external judge, and summary formatter.
 
-use std::io::{BufRead, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -13,8 +10,9 @@ use serde_json::{json, Value};
 use super::classify::{classify_rows, FailureKind};
 use super::dataset::{copy_all, Task};
 use super::trajectory;
-use crate::exec::{isolation, kill_tree};
-use crate::llm::summarize_usage;
+use crate::config::paths;
+use crate::exec::{isolation, run_check, run_process, Check};
+use crate::llm::{summarize_usage, Llm, Provider};
 
 fn initialize_repo(workspace: &Path, task: &Task) -> Result<(), String> {
     if workspace.join(".git").is_dir() {
@@ -67,55 +65,60 @@ fn initialize_repo(workspace: &Path, task: &Task) -> Result<(), String> {
     ])
 }
 
-/// Run the check in its own process group and kill the group afterwards.
+/// Run the check in its own bounded process group and reap all descendants afterwards.
 pub fn judge(worktree: &Path, check: &str) -> (bool, String) {
-    let mut cmd = crate::exec::shell_command(check);
-    cmd.current_dir(worktree)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn();
-    let mut child = match child {
-        Ok(c) => c,
+    let spec = Check {
+        command: check.to_owned(),
+        timeout_ms: 120_000,
+        max_output_bytes: 1_048_576,
+    };
+    let result = match run_check(worktree, &spec) {
+        Ok(r) => r,
         Err(e) => return (false, format!("judge spawn: {e}")),
     };
-    let pgid = child.id();
-    let drain = |r: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = r {
-                std::io::Read::read_to_end(&mut r, &mut buf).ok();
-            }
-            buf
-        })
-    };
-    let out = drain(child.stdout.take().map(|s| Box::new(s) as _));
-    let err = drain(child.stderr.take().map(|s| Box::new(s) as _));
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => break None,
-        }
-    };
-    kill_tree(pgid);
-    child.wait().ok();
-    let mut text = String::from_utf8_lossy(&out.join().unwrap_or_default()).to_string();
-    text.push_str(&String::from_utf8_lossy(&err.join().unwrap_or_default()));
-    let tail: Vec<char> = text.chars().rev().take(300).collect();
+    let tail: Vec<char> = result.output.chars().rev().take(300).collect();
     let tail = tail
         .into_iter()
         .rev()
         .collect::<String>()
         .trim()
         .to_string();
-    match status {
-        Some(s) => (s.success(), tail),
-        None => (false, format!("check timed out after 120s\n{tail}")),
+    if result.timed_out {
+        (false, format!("check timed out after 120s\n{tail}"))
+    } else {
+        (result.passed, tail)
     }
+}
+
+fn resolve_eval_env() -> Vec<(&'static str, String)> {
+    let mut envs = Vec::new();
+    for name in [
+        "TWIG_BASE_URL",
+        "TWIG_API_KEY",
+        "TWIG_ROLES",
+        "TWIG_MODEL",
+        "TWIG_EFFORT",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            envs.push((name, value));
+        }
+    }
+    if std::env::var_os("TWIG_ROLES").is_none() && std::env::var_os("TWIG_MODEL").is_none() {
+        let provider = Provider::new();
+        if let Ok(roles_json) = serde_json::to_string(&provider.roles().0) {
+            envs.push(("TWIG_ROLES", roles_json));
+        }
+    }
+    if std::env::var_os("TWIG_EFFORT").is_none() {
+        let effort_file = paths::state_dir().join("effort.txt");
+        if let Ok(raw) = std::fs::read_to_string(&effort_file) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                envs.push(("TWIG_EFFORT", trimmed.to_owned()));
+            }
+        }
+    }
+    envs
 }
 
 pub struct Spec<'a> {
@@ -183,62 +186,39 @@ pub fn run_one(task: &Task, rep: u32, spec: &Spec<'_>) -> Value {
     if let Err(e) = initialize_repo(&worktree, task) {
         return json!({"task": task.name, "rep": rep, "pass": null, "outcome": e});
     }
-    let stderr = std::fs::File::create(runs.join("stderr.log"))
-        .map(Stdio::from)
-        .unwrap_or(Stdio::null());
     let started = Instant::now();
-    let mut command = match isolation::eval_command(spec.twig, spec.config, &worktree, &runs) {
-        Ok(command) => command,
-        Err(e) => {
-            return json!({"task": task.name, "rep": rep, "pass": null, "outcome": e, "isolation": false})
-        }
-    };
-    #[cfg(unix)]
-    command.process_group(0);
-    let spawned = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(stderr)
-        .spawn();
-    let mut child = match spawned {
+    let env_owned = resolve_eval_env();
+    let env_refs: Vec<(&str, &str)> = env_owned
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    let mut command =
+        match isolation::eval_command(spec.twig, spec.config, &worktree, &runs, &env_refs) {
+            Ok(command) => command,
+            Err(e) => {
+                return json!({"task": task.name, "rep": rep, "pass": null, "outcome": e, "isolation": false})
+            }
+        };
+    let request = format!(
+        "{}\n",
+        json!({"id": 1, "method": "turn", "params": {"input": task.goal}})
+    );
+    let capture = match run_process(&mut command, request.as_bytes(), spec.wall, 4 * 1024 * 1024) {
         Ok(c) => c,
         Err(e) => {
             return json!({"task": task.name, "rep": rep, "pass": null, "outcome": format!("sandbox spawn: {e}"), "isolation": false})
         }
     };
-    let pgid = child.id();
-    if let Some(mut stdin) = child.stdin.take() {
-        let request = json!({"id": 1, "method": "turn", "params": {"input": task.goal}});
-        writeln!(stdin, "{request}").ok();
-    }
-    let stdout = child.stdout.take().expect("piped stdout");
-    let reader = std::thread::spawn(move || {
-        BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .collect::<Vec<_>>()
-    });
-    let mut killed = false;
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-        if started.elapsed() >= spec.wall {
-            killed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    kill_tree(pgid);
-    child.wait().ok();
-    let lines = reader.join().unwrap_or_default();
+    let _ = std::fs::write(runs.join("stderr.log"), &capture.stderr);
+    let killed = capture.timed_out;
+    let stdout_text = String::from_utf8_lossy(&capture.stdout);
     let secs = started.elapsed().as_secs_f64();
-    let result = lines
-        .iter()
+    let result = stdout_text
+        .lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .find(|v| v.get("ev").is_none());
     if result.is_none() && !killed {
-        let error = std::fs::read_to_string(runs.join("stderr.log")).unwrap_or_default();
+        let error = String::from_utf8_lossy(&capture.stderr);
         return json!({"task": task.name, "rep": rep, "pass": null, "outcome": format!("sandbox/agent exited without response: {error}"), "isolation": false});
     }
     let rows: Vec<Value> = std::fs::read_dir(&runs)

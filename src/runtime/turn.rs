@@ -498,7 +498,7 @@ pub fn run_turn_live(
                 )
                 .map_err(|e| e.to_string())?;
             let decision = if interactive {
-                control.approval_decision_full(&call.id)
+                control.wait_approval(&call.id)
             } else {
                 None
             };

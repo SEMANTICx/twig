@@ -1415,7 +1415,7 @@ impl App {
                         }
                     }
                     _ => {
-                        let msg = crate::eval::rci::status_report(repo_path);
+                        let msg = crate::runtime::blackboard::status_report(repo_path);
                         self.transcript.push_notice(NoticeKind::Info, msg);
                     }
                 }
