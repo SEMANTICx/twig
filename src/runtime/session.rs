@@ -794,6 +794,8 @@ pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -
         "model": snap.model.unwrap_or_default(),
         "effort": snap.saved_effort,
         "plan": snap.plan_mode,
+        "gate_edits": snap.gate_edits,
+        "context_bytes": snap.messages.iter().map(|m| m.to_string().len()).sum::<usize>(),
         "running": running,
         "todos": snap.todos,
         "usage": usage,

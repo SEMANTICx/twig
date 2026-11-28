@@ -288,10 +288,33 @@ aside.sidebar.collapsed~.stage .sb-open-btn{display:inline-flex}
 .a-row a:hover,.file-chip:hover{text-decoration:underline;text-underline-offset:3px}
 .file-chip{display:inline-flex;align-items:center;gap:4px;padding:0 6px;border-radius:5px;background:var(--accent-soft);color:var(--accent);font:500 12px/19px ui-monospace,SFMono-Regular,Menlo,monospace}
 .file-chip code{background:none;border:0;padding:0;color:inherit;font:inherit}
-.code-box{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 0}
+.code-box{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:10px 0;position:relative}
 .code-bar{height:32px;padding:0 12px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;font:11.5px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--fg-muted)}
 .code-box pre{margin:0;padding:12px 14px;overflow-x:auto;font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--fg)}
+.code-box.wrap pre{white-space:pre-wrap;word-break:break-word}
+.code-box.collapsed pre{max-height:290px;overflow:hidden}
+.code-exp-bar{display:none;width:100%;height:30px;border:0;border-top:1px solid var(--border);background:var(--card);color:var(--accent);font-size:11.5px;font-weight:600;cursor:pointer}
+.code-box.collapsed .code-exp-bar{display:block}
 .code-box pre code{background:none;border:0;padding:0}
+.d-int-add{background:rgba(52,211,153,.32);color:inherit;border-radius:3px;padding:0 1px}
+.d-int-del{background:rgba(251,113,133,.32);color:inherit;border-radius:3px;padding:0 1px}
+.jump-pill{position:absolute;left:50%;transform:translateX(-50%);bottom:124px;z-index:30;height:30px;padding:0 13px;border-radius:99px;border:1px solid var(--border-hi);background:var(--popover);color:var(--fg);box-shadow:var(--shadow);font-size:12px;font-weight:500;cursor:pointer;display:none;align-items:center;gap:6px}
+.jump-pill.show{display:inline-flex}
+.jump-pill.live{border-color:var(--accent);color:var(--accent)}
+.inline-ttl-in{background:var(--card);border:1px solid var(--accent);border-radius:6px;padding:1px 7px;font-size:13px;font-weight:500;color:var(--fg);outline:none;width:min(320px,48vw)}
+.ap-note-in{width:100%;height:31px;padding:0 10px;border-radius:8px;border:1px solid var(--border-hi);background:var(--bg);font-size:12.5px;color:var(--fg);outline:none}
+.ap-note-in:focus{border-color:var(--accent)}
+.ap-rem{height:34px;padding:0 12px;border-radius:8px;border:1px solid var(--border-hi);background:var(--bg);color:var(--fg);font-size:12.5px;font-weight:600;cursor:pointer}
+.ap-rem:hover{background:var(--hover);border-color:var(--accent)}
+.draft-pill{font-size:10px;padding:0 5px;border-radius:4px;background:var(--accent-soft);color:var(--accent);font-weight:600}
+.ask-backdrop{position:fixed;inset:0;z-index:82;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:16px}
+.ask-backdrop.open{display:flex}
+.ask-modal{width:min(92vw,440px);background:var(--popover);border:1px solid var(--border-hi);border-radius:14px;box-shadow:var(--shadow);padding:16px 18px;display:flex;flex-direction:column;gap:11px}
+@media(hover:none){
+  .msg-acts{opacity:.9}
+  .t-card.active .t-hover-acts{display:inline-flex}
+  .t-card.active .t-status.calm{display:none}
+}
 .a-row table{width:100%;border-collapse:collapse;font-size:13px;margin:12px 0}
 .a-row th{font-weight:600;color:var(--fg-muted);text-align:left;padding:7px 10px 7px 0;border-bottom:1px solid var(--border-hi)}
 .a-row td{padding:8px 10px 8px 0;border-bottom:1px solid var(--border);color:var(--fg)}
@@ -628,6 +651,7 @@ aside.inspector.shut{display:none}
         <div class="timeline" id="pane">
           <div class="tl-inner" id="tl-inner"></div>
         </div>
+        <button class="jump-pill" id="jump-latest" onclick="jumpToBottom()">↓ Jump to bottom</button>
 
         <div class="term-drawer" id="term-drawer">
           <div class="td-bar">
@@ -643,7 +667,7 @@ aside.inspector.shut{display:none}
           <div class="td-out" id="td-out">Ready. Policy-guarded commands run inside the active thread worktree.</div>
           <div class="td-in-row">
             <span style="color:var(--accent);font-family:ui-monospace,monospace">$</span>
-            <input id="td-in" placeholder="Run command in worktree (Enter)…" onkeydown="if(event.key==='Enter'){runQuickCmd(this.value);this.value='';}">
+            <input id="td-in" placeholder="Run command in worktree (Enter)…" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229){runQuickCmd(this.value);this.value='';}">
           </div>
         </div>
 
@@ -704,7 +728,7 @@ aside.inspector.shut{display:none}
           <div style="color:var(--fg-muted);font-size:12.5px">Ask contextual questions about the active thread without interrupting or polluting its conversation ledger.</div>
         </div>
         <div class="sc-foot">
-          <input id="sc-in" placeholder="Ask side question…" onkeydown="if(event.key==='Enter')askSideChat()">
+          <input id="sc-in" placeholder="Ask side question…" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)askSideChat()">
           <button class="btn-xs" onclick="askSideChat()">Ask</button>
         </div>
       </aside>
@@ -818,9 +842,14 @@ aside.inspector.shut{display:none}
 
         <div class="env-card">
           <div class="ec-sec">
-            <div class="ec-ttl">Telemetry</div>
+            <div class="ec-ttl">Telemetry & Context</div>
             <div style="font:11.5px/1.4 ui-monospace,monospace;color:var(--fg-dim)" id="usage-kv">0 in · 0 out · cache 0%</div>
             <div class="meter"><div id="cache-bar" style="width:0%"></div></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;font:11px/1.3 ui-monospace,monospace;color:var(--fg-muted)">
+              <span id="ctx-kv">Context: 0 KB / 180 KB</span>
+              <button class="meta-lnk" style="color:var(--accent);font-size:11px" onclick="compactCurrent()">Compact</button>
+            </div>
+            <div class="meter"><div id="ctx-bar" style="width:0%;background:var(--ok)"></div></div>
           </div>
         </div>
       </aside>
@@ -843,9 +872,10 @@ aside.inspector.shut{display:none}
 </div>
 
 <div class="pop" id="role-pop">
-  <div class="pop-lbl">Execution Mode</div>
-  <button class="pop-opt sel" id="ro-code" onclick="pickRole('code')"><span>Full Access (code)</span><span>✓</span></button>
-  <button class="pop-opt" id="ro-plan" onclick="pickRole('plan')"><span>Plan Only (read-only)</span><span></span></button>
+  <div class="pop-lbl">Execution Mode (Shift+Tab)</div>
+  <button class="pop-opt sel" id="ro-auto" onclick="pickExecMode('auto')"><span>⚡ Full Auto (code)</span><span>✓</span></button>
+  <button class="pop-opt" id="ro-review" onclick="pickExecMode('review')"><span>⛨ Review Edits (gate writes)</span><span></span></button>
+  <button class="pop-opt" id="ro-plan" onclick="pickExecMode('plan')"><span>◈ Plan Only (read-only)</span><span></span></button>
 </div>
 
 <div class="pop" id="ed-pop">
@@ -889,22 +919,39 @@ aside.inspector.shut{display:none}
   </div>
 </div>
 
+<!-- Studio Non-Blocking Input / Confirm Modal (Replaces native window.prompt) -->
+<div class="ask-backdrop" id="ask-modal" onclick="if(event.target===this)resolveAskModal(null)">
+  <div class="ask-modal">
+    <div>
+      <div style="font-size:14px;font-weight:600;color:var(--fg)" id="ask-ttl">Input</div>
+      <div class="stg-sub" id="ask-sub" style="margin-top:2px"></div>
+    </div>
+    <input class="stg-in" id="ask-in" style="width:100%" onkeydown="onAskModalKey(event)">
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:2px">
+      <button class="btn-xs" onclick="resolveAskModal(null)">Cancel</button>
+      <button class="btn-pri" id="ask-ok" onclick="submitAskModal()">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 const tok=new URLSearchParams(location.search).get('token')||localStorage.getItem('twig_tok')||'';
 if(tok)localStorage.setItem('twig_tok',tok);
 
-let curSid='',curWt='',defaultWt='',defaultBranch='main',activeModel='default',selModel='',selEffort='',selRole='code';
+let curSid='',curWt='',defaultWt='',defaultBranch='main',defaultDiff='',activeModel='default',selModel='',selEffort='',selRole='code',execMode='auto';
 let filter='all',sbMode='threads',allRepos=false,diffOpen=false,scOpen=false,artOpen=false,termOpen=false,diffMode='unified',artTab='preview',artVp='desktop',ccShut=false;
-let sessions=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,autoData=null,lastHtml='',lastDiffSig='',forceTail=true,draftNew=false,newWt=false;
-let notifOn=localStorage.getItem('twig_notif')==='1',editor=localStorage.getItem('twig_ed')||'cursor';
+let sessions=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,autoData=null,lastHtml='',lastDiffSig='',forceTail=true,stickToBottom=true,progScroll=false,draftNew=false,draftReady=false,newWt=false;
+let notifOn=localStorage.getItem('twig_notif')==='1',editor=localStorage.getItem('twig_ed')||'cursor',sendKeyMode=localStorage.getItem('twig_send_key')||'enter';
 let theme=localStorage.getItem('twig_theme_v2')||'midnight';
 let pinned=new Set(JSON.parse(localStorage.getItem('twig_pins')||'[]'));
+let drafts={};try{drafts=JSON.parse(localStorage.getItem('twig_drafts_v1')||'{}')||{};}catch(_){drafts={};}
 let shutGroups={},images=[],reviewNotes=[],prevStates={},openLogs={},openTools={};
-let acItems=[],acIdx=0,cmdkItems=[],cmdkIdx=0,recog=null;
+let acItems=[],acIdx=0,cmdkItems=[],cmdkIdx=0,recog=null,askResolve=null,askConfirmOnly=false,busyRpc=false;
 let artStore=[],artMap=new Map(),curArt=null;
-let sseOk=false,liveText={},liveTool={},liveSteer={},userTurnTexts=[];
+let sseOk=false,liveText={},liveTool={},liveSteer={},userTurnTexts=[],histIdx=-1,histDraft='';
+let searchHits=[],searchQ='',searchTm=null;
 
 const ED_NAMES={cursor:'Cursor',vscode:'VS Code',windsurf:'Windsurf',zed:'Zed'};
 const FAV_PAL=[['#122b26','#34d399'],['#17213a','#818cf8'],['#2a1b38','#c084fc'],['#332214','#fb923c'],['#311824','#f472b6']];
@@ -922,7 +969,51 @@ const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+
 async function api(p,o={}){const r=await fetch(p,{...o,headers:hdrs()});return r.json();}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._tm);t._tm=setTimeout(()=>t.classList.remove('show'),2400);}
-function copyText(txt,msg='Copied'){navigator.clipboard?.writeText(txt||'');toast(msg);}
+function copyText(txt,msg='Copied',btnEl){
+  navigator.clipboard?.writeText(txt||'');toast(msg);
+  if(btnEl&&btnEl.tagName==='BUTTON'){
+    const orig=btnEl.dataset.orig||btnEl.textContent;btnEl.dataset.orig=orig;
+    btnEl.textContent='✓ Copied';btnEl.style.color='var(--ok)';
+    clearTimeout(btnEl._ctm);btnEl._ctm=setTimeout(()=>{btnEl.textContent=orig;btnEl.style.color='';},1200);
+  }
+}
+function openInputModal({title='Input',sub='',placeholder='',value='',okText='Confirm',confirmOnly=false}){
+  return new Promise(res=>{
+    askResolve=res;askConfirmOnly=!!confirmOnly;
+    document.getElementById('ask-ttl').textContent=title;
+    const subEl=document.getElementById('ask-sub');subEl.textContent=sub;subEl.style.display=sub?'block':'none';
+    const inp=document.getElementById('ask-in');
+    inp.style.display=confirmOnly?'none':'block';
+    inp.placeholder=placeholder;inp.value=value||'';
+    document.getElementById('ask-ok').textContent=okText;
+    document.getElementById('ask-modal').classList.add('open');
+    setTimeout(()=>{if(confirmOnly)document.getElementById('ask-ok').focus();else{inp.focus();inp.select();}},20);
+  });
+}
+function resolveAskModal(val){
+  document.getElementById('ask-modal').classList.remove('open');
+  const fn=askResolve;askResolve=null;if(fn)fn(val);
+}
+function submitAskModal(){resolveAskModal(askConfirmOnly?true:document.getElementById('ask-in').value);}
+function onAskModalKey(e){
+  if(e.isComposing||e.keyCode===229)return;
+  if(e.key==='Escape'){e.preventDefault();resolveAskModal(null);}
+  else if(e.key==='Enter'){e.preventDefault();submitAskModal();}
+}
+function draftKey(sid){return sid||'__new__';}
+function saveCurDraft(){
+  if(!draftReady)return;
+  const inp=document.getElementById('inp');if(!inp)return;
+  const k=draftKey(curSid),v=inp.value;
+  if(v&&v.trim())drafts[k]=v;else delete drafts[k];
+  try{localStorage.setItem('twig_drafts_v1',JSON.stringify(drafts));}catch(_){}
+}
+function restoreCurDraft(){
+  const inp=document.getElementById('inp');if(!inp)return;
+  inp.value=drafts[draftKey(curSid)]||'';
+  draftReady=true;
+  histIdx=-1;histDraft='';autoGrow(inp);syncActionBtn();
+}
 function baseName(p){const s=String(p||'').replace(/\/+$/,'');return s.split('/').pop()||'workspace';}
 function projFav(name){
   const clean=String(name||'tw');let h=0;for(let i=0;i<clean.length;i++)h=(h*31+clean.charCodeAt(i))>>>0;
@@ -1063,11 +1154,12 @@ function syncComposerPills(){
   const m=shortModel(selModel||activeModel);
   const e=selEffort?` · ${selEffort[0].toUpperCase()+selEffort.slice(1)}`:'';
   document.getElementById('model-lbl').textContent=m+e;
-  document.getElementById('role-lbl').textContent=selRole==='plan'?'Plan Only':'Full Access';
-  document.getElementById('ro-code').classList.toggle('sel',selRole==='code');
-  document.getElementById('ro-code').lastElementChild.textContent=selRole==='code'?'✓':'';
-  document.getElementById('ro-plan').classList.toggle('sel',selRole==='plan');
-  document.getElementById('ro-plan').lastElementChild.textContent=selRole==='plan'?'✓':'';
+  const modeNames={auto:'⚡ Full Auto',review:'⛨ Review Edits',plan:'◈ Plan Only'};
+  document.getElementById('role-lbl').textContent=modeNames[execMode]||'⚡ Full Auto';
+  ['auto','review','plan'].forEach(k=>{
+    const el=document.getElementById('ro-'+k);
+    if(el){el.classList.toggle('sel',execMode===k);el.lastElementChild.textContent=execMode===k?'✓':'';}
+  });
   document.querySelectorAll('#eff-seg button').forEach(b=>b.classList.toggle('sel',b.dataset.e===selEffort));
   document.getElementById('open-ed-lbl').textContent='Open in '+(ED_NAMES[editor]||'Editor');
   document.querySelectorAll('#ed-pop .pop-opt').forEach(b=>{const on=b.dataset.ed===editor;b.classList.toggle('sel',on);b.lastElementChild.textContent=on?'✓':'';});
@@ -1082,7 +1174,22 @@ function renderModelPop(){
   }).join('');
 }
 function pickEffort(e){selEffort=e;syncComposerPills();}
-function pickRole(r){selRole=r;syncComposerPills();closeAllPops();}
+async function pickExecMode(mode,quiet=false){
+  execMode=['auto','review','plan'].includes(mode)?mode:'auto';
+  selRole=execMode==='plan'?'plan':'code';
+  syncComposerPills();closeAllPops();
+  if(!quiet){
+    const lbl={auto:'Full Auto',review:'Review Edits (gates file writes)',plan:'Plan Only (read-only)'}[execMode];
+    toast('Mode: '+lbl);
+    if(curSid&&detail&&!detail.running){
+      await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'mode.set',params:{plan:execMode==='plan',gate_edits:execMode==='review'}})});
+    }
+  }
+}
+function cycleExecMode(){
+  const order=['auto','review','plan'];
+  pickExecMode(order[(order.indexOf(execMode)+1)%order.length]);
+}
 function pickEditor(ed){editor=ed;localStorage.setItem('twig_ed',ed);syncComposerPills();renderInspector();closeAllPops();}
 
 /* Lightweight Single-Pass Client Syntax Highlighter (Code + Diffs) */
@@ -1264,14 +1371,18 @@ function fmtMd(src){
       if(lang==='math'||lang==='latex'||lang==='tex')out+=`<div class="math-blk">${fmtTex(raw)}</div>`;
       else if(lang==='mermaid'){
         const aid=registerArt('mermaid',raw),svg=renderMermaidSvg(raw),uri=svg?svgDataUri(svg):'';
-        out+=uri?`<div class="code-box"><div class="code-bar"><span>mermaid diagram</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied mermaid')">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="mermaid diagram" style="max-width:100%;height:auto;display:block;margin:0 auto"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
+        out+=uri?`<div class="code-box"><div class="code-bar"><span>mermaid diagram</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied mermaid',this)">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="mermaid diagram" style="max-width:100%;height:auto;display:block;margin:0 auto"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
       }else if(lang==='svg'||raw.trim().startsWith('<svg')){
         const aid=registerArt('svg',raw),uri=svgDataUri(raw);
-        out+=uri?`<div class="code-box"><div class="code-bar"><span>svg</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied svg')">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="diagram" style="max-width:100%;height:auto;display:block"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
-      }else if(lang==='html'||lang==='htm'){
-        const aid=registerArt('html',raw);
-        out+=`<div class="code-box"><div class="code-bar"><span>${esc(lang)}</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent);font-weight:600" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" onclick="copyText(this.closest('.code-bar').nextElementSibling.textContent,'Copied code')">Copy</button></span></div><pre><code>${shCode(raw)}</code></pre></div>`;
-      }else out+=`<div class="code-box"><div class="code-bar"><span>${esc(lang||'code')}</span><button class="meta-lnk" onclick="copyText(this.parentElement.nextElementSibling.textContent,'Copied code')">Copy</button></div><pre><code>${shCode(raw)}</code></pre></div>`;
+        out+=uri?`<div class="code-box"><div class="code-bar"><span>svg</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied svg',this)">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="diagram" style="max-width:100%;height:auto;display:block"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
+      }else{
+        const isHtml=lang==='html'||lang==='htm';
+        const aid=isHtml?registerArt('html',raw):-1;
+        const lnCnt=buf.length,longCls=lnCnt>32?' collapsed':'';
+        const prevBtn=isHtml?`<button class="meta-lnk" style="color:var(--accent);font-weight:600" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button>`:'';
+        const expBar=lnCnt>32?`<button class="code-exp-bar" onclick="const b=this.closest('.code-box');b.classList.toggle('collapsed');this.textContent=b.classList.contains('collapsed')?'↕ Expand all ${lnCnt} lines':'↑ Collapse'">↕ Expand all ${lnCnt} lines</button>`:'';
+        out+=`<div class="code-box${longCls}"><div class="code-bar"><span>${esc(lang||'code')} · ${lnCnt}L</span><span style="display:inline-flex;gap:10px">${prevBtn}<button class="meta-lnk" onclick="this.closest('.code-box').classList.toggle('wrap')">Wrap</button><button class="meta-lnk" onclick="copyText(this.closest('.code-bar').nextElementSibling.textContent,'Copied code',this)">Copy</button></span></div><pre><code>${shCode(raw)}</code></pre>${expBar}</div>`;
+      }
       continue;
     }
     if(tr.startsWith('$$')||tr.startsWith('\\[')){
@@ -1301,6 +1412,17 @@ function fmtMd(src){
 }
 
 /* Diff Parser + Granular Line Review Comments */
+function intralineDiff(a,b){
+  let p=0,la=a.length,lb=b.length,lim=Math.min(la,lb);
+  while(p<lim&&a[p]===b[p])p++;
+  let s=0,rem=Math.min(la-p,lb-p);
+  while(s<rem&&a[la-1-s]===b[lb-1-s])s++;
+  if(p+s<2)return null;
+  return[
+    `${esc(a.slice(0,p))}<mark class="d-int-del">${esc(a.slice(p,la-s))}</mark>${esc(a.slice(la-s))}`,
+    `${esc(b.slice(0,p))}<mark class="d-int-add">${esc(b.slice(p,lb-s))}</mark>${esc(b.slice(lb-s))}`
+  ];
+}
 function parseDiffFiles(rawDiff){
   if(!rawDiff||!rawDiff.trim())return[];
   return rawDiff.split(/(?=^diff --git )/m).filter(Boolean).map((c,idx)=>{
@@ -1315,15 +1437,30 @@ function parseDiffFiles(rawDiff){
       else if(l.startsWith('-')){del++;rows.push({t:'d',o:oLn++,n:'',txt:l.slice(1)});}
       else{rows.push({t:'c',o:oLn++,n:nLn++,txt:l.startsWith(' ')?l.slice(1):l});}
     }
+    for(let i=0;i+1<rows.length;i++){
+      if(rows[i].t==='d'&&rows[i+1].t==='a'){
+        const pair=intralineDiff(rows[i].txt,rows[i+1].txt);
+        if(pair){rows[i].hl=pair[0];rows[i+1].hl=pair[1];i++;}
+      }
+    }
     return{idx,name,ins,del,rows};
   });
 }
-function addLineReview(file,ln){
-  const note=prompt(`Add review comment on ${file}:${ln}:`);
+async function addLineReview(file,ln){
+  const note=await openInputModal({title:`Review comment · ${file}:${ln}`,sub:'Attached automatically to your next prompt',placeholder:'Describe what should change on this line…',okText:'Queue Comment'});
   if(!note||!note.trim())return;
   reviewNotes.push({loc:`${file}:${ln}`,note:note.trim()});
   renderAttachments();
   toast(`Queued comment on ${file}:${ln}`);
+}
+async function discardFileChanges(file){
+  const ok=await openInputModal({title:`Discard changes in ${file}?`,sub:'Reverts uncommitted modifications in this single file back to HEAD.',okText:'Discard File',confirmOnly:true});
+  if(!ok)return;
+  const r=await api('/api/discard',{method:'POST',body:JSON.stringify({worktree:curWt||defaultWt,file})});
+  if(r.error)return toast(r.error);
+  toast(`Reverted ${file}`);lastDiffSig='';
+  if(curSid)openSid(curSid);else await loadMeta();
+  loadList();
 }
 function renderDiffDock(){
   if(!diffOpen)return;
@@ -1341,30 +1478,33 @@ function renderDiffDock(){
     let trs='';
     for(const r of f.rows){
       const ln=r.n||r.o||1;
+      const codeHtml=r.hl||shCode(r.txt);
       const cmtBtn=`<button class="d-cmt-btn" data-f="${esc(f.name)}" data-l="${ln}" onclick="event.stopPropagation();addLineReview(this.dataset.f,this.dataset.l)" title="Comment on line ${ln}">+</button>`;
       if(diffMode==='split'){
         if(r.t==='h')trs+=`<tr class="d-hunk-row"><td colspan="4">${esc(r.txt)}</td></tr>`;
-        else if(r.t==='d')trs+=`<tr><td class="d-ln" style="background:var(--del-num);color:var(--err)">${cmtBtn}${r.o}</td><td style="background:var(--del-line)">${shCode(r.txt)}</td><td class="d-ln"></td><td></td></tr>`;
-        else if(r.t==='a')trs+=`<tr><td class="d-ln"></td><td></td><td class="d-ln" style="background:var(--add-num);color:var(--ok)">${cmtBtn}${r.n}</td><td style="background:var(--add-line)">${shCode(r.txt)}</td></tr>`;
-        else trs+=`<tr><td class="d-ln">${r.o}</td><td>${shCode(r.txt)}</td><td class="d-ln">${cmtBtn}${r.n}</td><td>${shCode(r.txt)}</td></tr>`;
+        else if(r.t==='d')trs+=`<tr><td class="d-ln" style="background:var(--del-num);color:var(--err)">${cmtBtn}${r.o}</td><td style="background:var(--del-line)">${codeHtml}</td><td class="d-ln"></td><td></td></tr>`;
+        else if(r.t==='a')trs+=`<tr><td class="d-ln"></td><td></td><td class="d-ln" style="background:var(--add-num);color:var(--ok)">${cmtBtn}${r.n}</td><td style="background:var(--add-line)">${codeHtml}</td></tr>`;
+        else trs+=`<tr><td class="d-ln">${r.o}</td><td>${codeHtml}</td><td class="d-ln">${cmtBtn}${r.n}</td><td>${codeHtml}</td></tr>`;
       }else{
         if(r.t==='h')trs+=`<tr class="d-hunk-row"><td colspan="3">${esc(r.txt)}</td></tr>`;
         else{
           const cls=r.t==='a'?'d-add-row':r.t==='d'?'d-del-row':'';
           const pfx=r.t==='a'?'+':r.t==='d'?'-':' ';
-          trs+=`<tr class="${cls}"><td class="d-ln">${r.o}</td><td class="d-ln">${cmtBtn}${r.n}</td><td>${pfx}${shCode(r.txt)}</td></tr>`;
+          trs+=`<tr class="${cls}"><td class="d-ln">${r.o}</td><td class="d-ln">${cmtBtn}${r.n}</td><td>${pfx}${codeHtml}</td></tr>`;
         }
       }
     }
+    const cols=diffMode==='split'?'<colgroup><col style="width:44px"><col><col style="width:44px"><col></colgroup>':'<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>';
     return `<div class="df-block" id="dfb-${f.idx}">
       <div class="df-hdr">
         <a class="file-chip" style="background:none;padding:0" href="${esc(ideUri(abs,''))}">${esc(f.name)}</a>
-        <div style="display:flex;align-items:center;gap:8px">
-          <button class="meta-lnk" data-f="${esc(f.name)}" onclick="copyText(this.dataset.f,'Copied path')">Copy path</button>
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="meta-lnk" style="color:var(--err)" data-f="${esc(f.name)}" onclick="discardFileChanges(this.dataset.f)" title="Revert uncommitted changes in this file">↺ Discard</button>
+          <button class="meta-lnk" data-f="${esc(f.name)}" onclick="copyText(this.dataset.f,'Copied path',this)">Copy path</button>
           <span><span class="c-add">+${f.ins}</span> <span class="c-del">-${f.del}</span></span>
         </div>
       </div>
-      <table class="d-table"><tbody>${trs}</tbody></table>
+      <table class="d-table">${cols}<tbody>${trs}</tbody></table>
     </div>`;
   }).join('');
 }
@@ -1375,11 +1515,12 @@ async function loadMeta(){
   if(m.version)document.getElementById('ver').textContent='v'+m.version;
   if(m.default_repo){defaultWt=m.default_repo;if(!curWt)curWt=defaultWt;}
   if(m.branch)defaultBranch=m.branch;
+  if(typeof m.diff==='string'){defaultDiff=m.diff;if(!curSid&&detail){detail.diff=defaultDiff;lastDiffSig='';}}
   if(m.active_model)activeModel=m.active_model;
   if(m.effort&&!selEffort)selEffort=m.effort;
   if(Array.isArray(m.models))models=m.models;
   if(Array.isArray(m.skills))skills=m.skills;
-  syncComposerPills();renderModelPop();renderInspector();syncContextStrip();
+  syncComposerPills();renderModelPop();renderInspector();renderDiffDock();syncContextStrip();
   ensureRepoFiles();
 }
 async function ensureRepoFiles(){
@@ -1413,6 +1554,13 @@ function updateDocTitle(){
 function renderList(){
   if(sbMode==='auto'){renderAutoSidebar();return;}
   const q=(document.getElementById('q').value||'').trim().toLowerCase();
+  if(q.length>=2&&q!==searchQ){
+    searchQ=q;clearTimeout(searchTm);
+    searchTm=setTimeout(async()=>{
+      const r=await api('/api/search?q='+encodeURIComponent(q)+(allRepos?'&all=1':''));
+      searchHits=r.hits||[];renderList();
+    },220);
+  }else if(q.length<2&&searchQ){searchQ='';searchHits=[];}
   const byParent={};
   for(const s of sessions){if(s.parent_sid)(byParent[s.parent_sid]=byParent[s.parent_sid]||[]).push(s);}
   const roots=sessions.filter(s=>!s.parent_sid||!sessions.some(p=>p.sid===s.parent_sid));
@@ -1425,7 +1573,8 @@ function renderList(){
   const card=(s,child=false)=>{
     const proj=baseName(s.worktree||defaultWt);
     const isPin=pinned.has(s.sid);
-    let stHtml=`<span class="t-status calm">${esc(shortAge(s.age))}</span>`;
+    const hasDraft=!!(drafts[s.sid]&&drafts[s.sid].trim());
+    let stHtml=`<span class="t-status calm">${hasDraft?'<span class="draft-pill">draft</span> ':''}${esc(shortAge(s.age))}</span>`;
     if(s.status==='approval')stHtml=`<span class="t-status st-wait">⛨ Approval</span>`;
     else if(s.status==='running')stHtml=`<span class="t-status st-run shimmer">● Working</span>`;
     const diffHtml=(s.diff_add||s.diff_del)?`<span class="c-add">+${s.diff_add||0}</span><span class="c-del">-${s.diff_del||0}</span>`:`<span style="opacity:.6">t${s.turns||0}</span>`;
@@ -1463,6 +1612,16 @@ function renderList(){
     }
     if(!shut){
       for(const r of byProj[p]){html+=card(r,false);for(const k of(byParent[r.sid]||[]))if(match(k))html+=card(k,true);}
+    }
+  }
+  if(q.length>=2&&searchHits.length){
+    html+=`<div class="grp-hdr"><span>✦ Transcript Matches</span><span>${searchHits.length}</span></div>`;
+    for(const h of searchHits){
+      const snip=(h.matches&&h.matches[0])||'';
+      html+=`<div class="t-card ${h.sid===curSid?'active':''}" data-sid="${esc(h.sid)}" onclick="openSid(this.dataset.sid)">
+        <div class="t-row1"><span class="proj-name" style="color:var(--accent)">${esc(h.sid.slice(0,12))}</span></div>
+        <div class="t-title" style="font-size:11.5px;white-space:normal;line-height:1.35">${esc(snip)}</div>
+      </div>`;
     }
   }
   document.getElementById('slist').innerHTML=html||'<div style="padding:18px 12px;font-size:12.5px;color:var(--fg-muted)">No matching threads</div>';
@@ -1514,21 +1673,30 @@ function ensureThreadsMode(){
 }
 async function openSid(sid,resetScroll=false,fromPoll=false){
   if(!fromPoll)ensureThreadsMode();
+  const changed=sid!==curSid||draftNew;
+  if(!fromPoll&&changed)saveCurDraft();
   draftNew=false;newWt=false;
-  if(sid!==curSid)forceTail=true;
-  if(resetScroll)forceTail=true;
+  if(changed){forceTail=true;stickToBottom=true;}
+  if(resetScroll){forceTail=true;stickToBottom=true;}
   curSid=sid;
+  if(!fromPoll&&changed)restoreCurDraft();
   if(!fromPoll&&innerWidth<=760)closeMobilePanels();
   detail=await api('/api/session/'+sid);
   curWt=detail.worktree||curWt||defaultWt;
+  if(!fromPoll&&detail){
+    const nextMode=detail.plan?'plan':detail.gate_edits?'review':'auto';
+    if(nextMode!==execMode)pickExecMode(nextMode,true);
+  }
   ensureRepoFiles();syncWtUi();render();renderList();
 }
 function openParent(){if(detail&&detail.parent_sid)openSid(detail.parent_sid,true);}
 function newThread(withWorktree=false){
   ensureThreadsMode();
+  saveCurDraft();
   draftNew=true;curSid='';curWt=defaultWt;newWt=!!withWorktree;
-  forceTail=true;lastHtml='';
-  detail={messages:[],pending:[],todos:[],children:[],usage:{},diff:'',branch:defaultBranch,worktree:defaultWt,running:false};
+  forceTail=true;stickToBottom=true;lastHtml='';
+  detail={messages:[],pending:[],todos:[],children:[],usage:{},diff:defaultDiff,branch:defaultBranch,worktree:defaultWt,running:false};
+  restoreCurDraft();
   if(innerWidth<=760)closeMobilePanels();
   syncWtUi();render();renderList();
   document.getElementById('inp').focus();
@@ -1693,6 +1861,28 @@ function renderInspector(){
   const fmtK=n=>n>=1000?(n/1000).toFixed(1)+'k':String(n);
   document.getElementById('usage-kv').textContent=`${fmtK(inp)} in · ${fmtK(out)} out · cache ${pct}%`;
   document.getElementById('cache-bar').style.width=pct+'%';
+
+  const ctxBytes=(detail&&detail.context_bytes)||0,ctxMax=184320;
+  const ctxPct=Math.min(100,Math.round((ctxBytes*100)/ctxMax));
+  const ctxBar=document.getElementById('ctx-bar');
+  document.getElementById('ctx-kv').textContent=`Context: ${(ctxBytes/1024).toFixed(1)} KB / 180 KB (${ctxPct}%)`;
+  ctxBar.style.width=ctxPct+'%';
+  ctxBar.style.background=ctxPct>82?'var(--warn)':'var(--ok)';
+}
+
+function syncJumpPill(){
+  const pill=document.getElementById('jump-latest');if(!pill)return;
+  const show=sbMode==='threads'&&!stickToBottom&&!!(detail&&((detail.messages&&detail.messages.length)||detail.running));
+  pill.classList.toggle('show',show);
+  const live=!!(detail&&detail.running);
+  pill.classList.toggle('live',live);
+  pill.textContent=live?'↓ Live output · Jump to latest':'↓ Jump to bottom';
+}
+function jumpToBottom(){
+  const pane=document.getElementById('pane');
+  stickToBottom=true;progScroll=true;
+  pane.scrollTo({top:pane.scrollHeight,behavior:'smooth'});
+  setTimeout(()=>{progScroll=false;syncJumpPill();},260);
 }
 
 function syncActionBtn(){
@@ -1719,11 +1909,12 @@ function render(){
   document.querySelector('.composer-dock').style.display='';
   document.getElementById('parent-btn').style.display=detail.parent_sid?'inline-flex':'none';
   const sMeta=sessions.find(s=>s.sid===curSid);
-  document.getElementById('stitle').textContent=detail.title||(sMeta&&sMeta.label)||(curSid?curSid:'New thread');
+  const stEl=document.getElementById('stitle');
+  if(!stEl.querySelector('input'))stEl.textContent=detail.title||(sMeta&&sMeta.label)||(curSid?curSid:'New thread');
   syncContextStrip();renderInspector();renderDiffDock();updateDocTitle();syncActionBtn();
 
   const pane=document.getElementById('pane'),inner=document.getElementById('tl-inner');
-  const nearBottom=forceTail||(pane.scrollHeight-pane.scrollTop-pane.clientHeight<64);
+  if(forceTail)stickToBottom=true;
   const grouped=groupTimeline(detail.messages||[],detail.snapshots||[]);
   const pending=detail.pending||[];
   const diffFiles=parseDiffFiles(detail.diff||'');
@@ -1745,7 +1936,7 @@ function render(){
           <div class="u-bubble">${imgRow}${esc(it.txt)}</div>
           <div class="msg-acts">
             ${revCodeBtn}${revChatBtn}
-            <button class="meta-lnk" data-u="${it.uIdx}" onclick="copyText(userTurnTexts[+this.dataset.u]||'','Copied prompt')">Copy</button>
+            <button class="meta-lnk" data-u="${it.uIdx}" onclick="copyText(userTurnTexts[+this.dataset.u]||'','Copied prompt',this)">Copy</button>
             <button class="meta-lnk" onclick="forkCurrent()">⑂ Fork</button>
           </div>
         </div>`;
@@ -1773,7 +1964,7 @@ function render(){
         </div>`;
       }
       return `<div class="a-row">${fmtMd(it.txt)}<div class="msg-acts" style="justify-content:flex-end;margin-top:4px">
-        <button class="meta-lnk" onclick="copyText(${esc(JSON.stringify(it.txt))},'Copied reply')">Copy</button>
+        <button class="meta-lnk" onclick="copyText(${esc(JSON.stringify(it.txt))},'Copied reply',this)">Copy</button>
         <button class="meta-lnk" onclick="forkCurrent()">⑂ Fork thread</button>
         <button class="meta-lnk" onclick="toggleSideChat('Explain this part in more detail: ')">💬 Ask Side chat</button>
       </div></div>`;
@@ -1802,9 +1993,11 @@ function render(){
     html+=pending.map(a=>`<div class="ap-card">
       <div class="ap-eyebrow">⛨ Approval needed · ${esc(a.name)}</div>
       <div class="ap-cmd">${esc(a.args&&a.args.command?a.args.command:JSON.stringify(a.args))}</div>
+      <input class="ap-note-in" id="ap-note-${esc(a.id)}" placeholder="Optional feedback or alternative instruction if declining…">
       <div class="ap-btns">
-        <button class="ap-allow" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true)">Allow</button>
-        <button class="ap-deny" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false)">Decline</button>
+        <button class="ap-allow" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true,false)">Allow & continue</button>
+        <button class="ap-rem" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true,true)" title="Remember command pattern for this session">Allow & remember</button>
+        <button class="ap-deny" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false,false)">Decline</button>
       </div>
     </div>`).join('');
 
@@ -1835,11 +2028,13 @@ function render(){
     const prevTop=pane.scrollTop;
     inner.innerHTML=html;
     lastHtml=html;
-    pane.scrollTop=nearBottom?pane.scrollHeight:prevTop;
+    if(stickToBottom){progScroll=true;pane.scrollTop=pane.scrollHeight;progScroll=false;}
+    else pane.scrollTop=prevTop;
   }else if(forceTail){
-    pane.scrollTop=pane.scrollHeight;
+    progScroll=true;pane.scrollTop=pane.scrollHeight;progScroll=false;
   }
   forceTail=false;
+  syncJumpPill();
 }
 
 /* Inline Composer Autocomplete (/, @, $) */
@@ -1923,21 +2118,34 @@ function renderCmdk(){
 }
 function runCmdk(i){const it=cmdkItems[i];closeCmdk();if(it)it.fn();}
 function onCmdkKey(e){
+  if(e.isComposing||e.keyCode===229)return;
   if(e.key==='Escape'){e.preventDefault();closeCmdk();}
   else if(e.key==='ArrowDown'){e.preventDefault();cmdkIdx=(cmdkIdx+1)%Math.max(1,cmdkItems.length);renderCmdk();}
   else if(e.key==='ArrowUp'){e.preventDefault();cmdkIdx=(cmdkIdx-1+Math.max(1,cmdkItems.length))%Math.max(1,cmdkItems.length);renderCmdk();}
   else if(e.key==='Enter'){e.preventDefault();runCmdk(cmdkIdx);}
 }
+function switchAdjacentThread(delta){
+  if(!sessions.length)return;
+  const idx=sessions.findIndex(s=>s.sid===curSid);
+  const next=idx<0?0:(idx+delta+sessions.length)%sessions.length;
+  openSid(sessions[next].sid,true);
+}
 document.addEventListener('keydown',e=>{
+  if(e.isComposing||e.keyCode===229)return;
   if(e.key==='Escape'){
+    if(document.getElementById('ask-modal').classList.contains('open')){e.preventDefault();resolveAskModal(null);return;}
     if(document.getElementById('stg-modal').classList.contains('open')){e.preventDefault();closeSettings();return;}
     if(!document.getElementById('cmdk').classList.contains('open')&&!acItems.length){closeAllPops();closeMobilePanels();}
   }
+  else if(e.shiftKey&&e.key==='Tab'){e.preventDefault();cycleExecMode();}
+  else if(e.altKey&&e.key==='ArrowUp'){e.preventDefault();switchAdjacentThread(-1);}
+  else if(e.altKey&&e.key==='ArrowDown'){e.preventDefault();switchAdjacentThread(1);}
   else if((e.metaKey||e.ctrlKey)&&e.key===','){e.preventDefault();openSettings('general');}
   else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openCmdk();}
   else if((e.metaKey||e.ctrlKey)&&e.key===';'){e.preventDefault();toggleSideChat();}
   else if((e.metaKey||e.ctrlKey)&&e.key==='`'){e.preventDefault();toggleTerminal();}
   else if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='d'&&document.activeElement?.tagName!=='INPUT'){e.preventDefault();toggleDiffPanel();}
+  else if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName||'')){e.preventDefault();document.getElementById('inp')?.focus();}
 });
 
 /* Studio Settings Modal (5 Tabs: General, Roles, Runtime & Hooks, Skills & Vault, MCP & Memory) */
@@ -1958,6 +2166,7 @@ function syncStgNav(){
   document.getElementById('stg-title').textContent=STG_TITLES[stgTab]||'Settings';
   document.querySelectorAll('.stg-tab').forEach(b=>b.classList.toggle('active',b.dataset.st===stgTab));
 }
+function setSendKey(m){sendKeyMode=m;localStorage.setItem('twig_send_key',m);renderStgBody();syncActionBtn();}
 function renderStgBody(){
   const box=document.getElementById('stg-body');
   if(!stgData)return;
@@ -1968,6 +2177,7 @@ function renderStgBody(){
       {id:'daylight',n:'Daylight Crisp',c:'#ffffff',a:'#4f46e5'},
       {id:'paper',n:'Warm Paper',c:'#faf8f5',a:'#c96442'},
     ];
+    const pairUrl=location.origin+(tok?'/?token='+encodeURIComponent(tok):'');
     box.innerHTML=`
       <div class="stg-card">
         <div class="stg-lbl">Color Palette</div>
@@ -1982,13 +2192,28 @@ function renderStgBody(){
           <div style="display:flex;gap:4px">${Object.entries(ED_NAMES).map(([k,v])=>`<button class="f-pill ${editor===k?'active':''}" onclick="pickEditor('${k}');renderStgBody()">${v}</button>`).join('')}</div>
         </div>
         <div class="stg-row">
+          <div><div class="stg-lbl">Composer Send Shortcut</div><div class="stg-sub">IME composition (\`isComposing\`) is always protected against premature send</div></div>
+          <div style="display:flex;gap:4px">
+            <button class="f-pill ${sendKeyMode==='enter'?'active':''}" onclick="setSendKey('enter')">Enter</button>
+            <button class="f-pill ${sendKeyMode==='mod_enter'?'active':''}" onclick="setSendKey('mod_enter')">Ctrl/⌘ + Enter</button>
+          </div>
+        </div>
+        <div class="stg-row">
           <div><div class="stg-lbl">Background Browser Notifications</div><div class="stg-sub">Alert when an unfocused thread finishes or pauses for approval</div></div>
           <button class="sw-btn ${notifOn?'on':''}" onclick="toggleNotif().then(()=>renderStgBody())"></button>
         </div>
       </div>
       <div class="stg-card">
+        <div class="stg-row">
+          <div><div class="stg-lbl">Mobile & LAN Companion URL</div><div class="stg-sub" style="font-family:ui-monospace,monospace">${esc(pairUrl)}</div></div>
+          <button class="btn-xs" onclick="copyText(${esc(JSON.stringify(pairUrl))},'Copied companion URL',this)">Copy URL</button>
+        </div>
+      </div>
+      <div class="stg-card">
         <div class="stg-lbl">Studio Keyboard Shortcuts</div>
         <div class="stg-row"><span class="stg-sub">Global Command Palette</span><kbd>Ctrl+K / ⌘K</kbd></div>
+        <div class="stg-row"><span class="stg-sub">Cycle Execution Mode (Auto ⇄ Review Edits ⇄ Plan)</span><kbd>Shift+Tab</kbd></div>
+        <div class="stg-row"><span class="stg-sub">Switch Previous / Next Thread</span><kbd>Alt+↑ / Alt+↓</kbd></div>
         <div class="stg-row"><span class="stg-sub">Settings & Configuration</span><kbd>Ctrl+, / ⌘,</kbd></div>
         <div class="stg-row"><span class="stg-sub">Contextual Side Chat (/btw)</span><kbd>Ctrl+;</kbd></div>
         <div class="stg-row"><span class="stg-sub">Worktree Quick Terminal</span><kbd>Ctrl+\`</kbd></div>
@@ -2219,18 +2444,19 @@ function primaryAction(){
   }else sendPrompt();
 }
 
-async function sendPrompt(){
+async function sendPrompt(overridePrompt){
   const inp=document.getElementById('inp');
-  let text=inp.value.trim();
+  let text=(typeof overridePrompt==='string'?overridePrompt:inp.value).trim();
   if(!text&&!images.length&&!reviewNotes.length)return;
   if(reviewNotes.length){
     const notes=reviewNotes.splice(0,reviewNotes.length).map(n=>`- \`${n.loc}\`: ${n.note}`).join('\n');
     text=`Address these inline diff review comments:\n${notes}${text?'\n\n'+text:''}`;
   }
-  inp.value='';autoGrow(inp);closeAc();forceTail=true;syncActionBtn();
+  if(typeof overridePrompt!=='string'){inp.value='';saveCurDraft();}
+  histIdx=-1;histDraft='';autoGrow(inp);closeAc();forceTail=true;stickToBottom=true;syncActionBtn();
   const slug=(!curSid&&newWt)?(document.getElementById('wt-slug').value.trim()||text.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||'task'):'';
   const imgs=images.splice(0,images.length);renderAttachments();
-  const r=await api('/api/send',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,new_worktree_slug:slug,role:selRole,model:selModel,effort:selEffort,prompt:text,images:imgs})});
+  const r=await api('/api/send',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,new_worktree_slug:slug,role:selRole,gate_edits:execMode==='review',model:selModel,effort:selEffort,prompt:text,images:imgs})});
   if(r.error)return toast(r.error);
   if(r.sid){draftNew=false;newWt=false;curSid=r.sid;liveText[curSid]='';liveTool[curSid]=null;liveSteer[curSid]='';if(r.worktree)curWt=r.worktree;syncWtUi();setTimeout(()=>openSid(curSid,true),160);}
 }
@@ -2238,7 +2464,7 @@ async function steerActiveTurn(){
   if(!curSid)return;
   const inp=document.getElementById('inp'),text=inp.value.trim();
   if(!text)return;
-  inp.value='';autoGrow(inp);closeAc();syncActionBtn();
+  inp.value='';saveCurDraft();autoGrow(inp);closeAc();syncActionBtn();
   const r=await api('/api/steer',{method:'POST',body:JSON.stringify({sid:curSid,input:text})});
   if(r.error)return toast(r.error);
   if(r.idle){inp.value=text;return sendPrompt();}
@@ -2255,43 +2481,60 @@ async function rewindTurn(uIdx,restoreCode){
   if(r.error)return toast(r.error);
   toast(restoreCode?'↺ Restored worktree & rewound chat':`↶ Rewound ${r.rewound_turns||turns} turn(s)`);
   const inp=document.getElementById('inp');
-  if(origTxt&&!inp.value.trim()){inp.value=origTxt;autoGrow(inp);inp.focus();}
   lastHtml='';await openSid(curSid,true);loadList();
+  if(origTxt&&!inp.value.trim()){inp.value=origTxt;saveCurDraft();autoGrow(inp);inp.focus();}
 }
 async function cancelRun(){if(!curSid)return;const r=await api('/api/cancel',{method:'POST',body:JSON.stringify({sid:curSid})});toast(r.stopped?'Interrupted active turn':'No active process');setTimeout(()=>openSid(curSid),220);}
-async function archiveSid(sid){const r=await api('/api/archive',{method:'POST',body:JSON.stringify({sid})});if(r.error)return toast(r.error);toast('Archived thread');if(curSid===sid)newThread(false);loadList();}
-async function approve(id,allow){await api('/api/approve',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,id,allow})});toast(allow?'Approved':'Declined');openSid(curSid);}
+async function archiveSid(sid){const r=await api('/api/archive',{method:'POST',body:JSON.stringify({sid})});if(r.error)return toast(r.error);delete drafts[sid];toast('Archived thread');if(curSid===sid)newThread(false);loadList();}
+async function approve(id,allow,remember=false){
+  const noteEl=document.getElementById('ap-note-'+id);
+  const note=noteEl?noteEl.value.trim():'';
+  const wasSingle=(detail&&detail.pending&&detail.pending.length===1);
+  await api('/api/approve',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,id,allow,remember,note:note||undefined})});
+  toast(allow?(remember?'Allowed & remembered pattern':'Allowed'):(note?'Declined with guidance':'Declined'));
+  await openSid(curSid);
+  if(wasSingle&&(allow||note))sendPrompt('Continue from the resolved tool approval.');
+}
 async function smartCommit(withHint){
   if(!curSid)return toast('Open a thread with changes first');
+  if(busyRpc)return;
   let hint=undefined;
   if(withHint){
-    const h=prompt('Custom commit message hint (leave blank for auto repo-style message):','');
+    const h=await openInputModal({title:'Smart commit hint',sub:'Leave blank to auto-generate a repo-style commit message from the diff',placeholder:'e.g. feat(web): refine streaming scroll lock',okText:'Commit'});
     if(h===null)return;
     hint=h.trim()||undefined;
   }
-  toast('✦ Generating smart commit…');
-  const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,hint})});
-  toast(r.summary||r.error||'Committed changes');openSid(curSid);loadList();
+  busyRpc=true;toast('✦ Generating smart commit…');
+  try{
+    const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,hint})});
+    toast(r.summary||r.error||'Committed changes');openSid(curSid);loadList();
+  }finally{busyRpc=false;}
 }
 async function shipPr(){
   if(!curSid)return toast('Open an active thread first');
-  toast('⇪ Pushing branch & creating zero-trailer Pull Request…');
-  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.pr',params:{}})});
-  if(r.error)return toast(r.error);
-  toast(r.url?`Shipped PR #${r.number||''}`:(r.summary||'Pull Request created'));
-  openSid(curSid);loadList();
+  if(busyRpc)return;
+  busyRpc=true;toast('⇪ Pushing branch & creating zero-trailer Pull Request…');
+  try{
+    const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.pr',params:{}})});
+    if(r.error)return toast(r.error);
+    toast(r.url?`Shipped PR #${r.number||''}`:(r.summary||'Pull Request created'));
+    openSid(curSid);loadList();
+  }finally{busyRpc=false;}
 }
 async function moveToWorktree(){
   if(!curSid)return toast('Open an active thread first');
+  if(busyRpc)return;
   const def=(document.getElementById('stitle').textContent||'feature').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||'feature';
-  const slug=prompt('Move thread & uncommitted changes into isolated branch worktree:',def);
+  const slug=await openInputModal({title:'Move thread to isolated Worktree',sub:'Creates a new Git branch worktree and carries over all uncommitted changes',placeholder:'branch-slug',value:def,okText:'Move Thread'});
   if(slug===null)return;
-  toast('⑂ Provisioning worktree & carrying uncommitted state…');
-  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.worktree',params:{arg:slug.trim()||def}})});
-  if(r.error)return toast(r.error);
-  if(r.worktree)curWt=r.worktree;
-  toast(r.branch?`Switched to ${r.branch}`:'Moved to isolated worktree');
-  openSid(curSid);loadList();
+  busyRpc=true;toast('⑂ Provisioning worktree & carrying uncommitted state…');
+  try{
+    const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.worktree',params:{arg:slug.trim()||def}})});
+    if(r.error)return toast(r.error);
+    if(r.worktree)curWt=r.worktree;
+    toast(r.branch?`Switched to ${r.branch}`:'Moved to isolated worktree');
+    openSid(curSid);loadList();
+  }finally{busyRpc=false;}
 }
 async function applySubagentPatch(childSid){
   if(!curSid||!childSid)return;
@@ -2299,14 +2542,32 @@ async function applySubagentPatch(childSid){
   if(r.error)return toast(r.error);
   toast(r.summary||'Applied subagent patch');openSid(curSid);loadList();
 }
-async function renameCurrent(){
-  if(!curSid)return;
-  const cur=document.getElementById('stitle').textContent;
-  const next=prompt('Rename thread:',cur);
-  if(!next||!next.trim()||next.trim()===cur)return;
-  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'session.rename',params:{title:next.trim()}})});
-  if(r.error)return toast(r.error);
-  toast('Renamed thread');openSid(curSid);loadList();
+function renameCurrent(){
+  if(!curSid||sbMode==='auto')return;
+  const st=document.getElementById('stitle');
+  if(st.querySelector('input'))return;
+  const cur=st.textContent.trim();
+  const inp=document.createElement('input');
+  inp.className='inline-ttl-in';inp.value=cur;
+  st.textContent='';st.appendChild(inp);
+  inp.focus();inp.select();
+  let done=false;
+  const finish=async save=>{
+    if(done)return;done=true;
+    const next=inp.value.trim();
+    st.textContent=save&&next?next:cur;
+    if(save&&next&&next!==cur){
+      const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'session.rename',params:{title:next}})});
+      if(r.error){st.textContent=cur;return toast(r.error);}
+      toast('Renamed thread');openSid(curSid);loadList();
+    }
+  };
+  inp.addEventListener('keydown',e=>{
+    if(e.isComposing||e.keyCode===229)return;
+    if(e.key==='Enter'){e.preventDefault();finish(true);}
+    else if(e.key==='Escape'){e.preventDefault();finish(false);}
+  });
+  inp.addEventListener('blur',()=>finish(true));
 }
 async function forkCurrent(){
   if(!curSid)return toast('Open a thread first to fork');
@@ -2493,16 +2754,35 @@ function connectSse(){
   }catch(_){}
 }
 
-const inpEl=document.getElementById('inp'),compCard=document.querySelector('.composer-card');
-inpEl.addEventListener('input',()=>{autoGrow(inpEl);updateAc();syncActionBtn();});
+const inpEl=document.getElementById('inp'),compCard=document.querySelector('.composer-card'),paneEl=document.getElementById('pane');
+paneEl.addEventListener('scroll',()=>{
+  if(progScroll)return;
+  stickToBottom=(paneEl.scrollHeight-paneEl.scrollTop-paneEl.clientHeight)<52;
+  syncJumpPill();
+},{passive:true});
+inpEl.addEventListener('input',()=>{autoGrow(inpEl);updateAc();syncActionBtn();saveCurDraft();});
 inpEl.addEventListener('keydown',e=>{
+  if(e.isComposing||e.keyCode===229)return;
   if(acItems.length){
     if(e.key==='ArrowDown'){e.preventDefault();acIdx=(acIdx+1)%acItems.length;renderAc();return;}
     if(e.key==='ArrowUp'){e.preventDefault();acIdx=(acIdx-1+acItems.length)%acItems.length;renderAc();return;}
     if(e.key==='Tab'||(e.key==='Enter'&&!e.shiftKey)){e.preventDefault();applyAc(acIdx);return;}
     if(e.key==='Escape'){e.preventDefault();closeAc();return;}
   }
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();primaryAction();}
+  if(e.key==='ArrowUp'&&userTurnTexts.length&&!inpEl.value.slice(0,inpEl.selectionStart||0).includes('\n')&&(!inpEl.value.trim()||histIdx>=0)){
+    e.preventDefault();
+    if(histIdx<0){histDraft=inpEl.value;histIdx=userTurnTexts.length-1;}
+    else if(histIdx>0)histIdx--;
+    inpEl.value=userTurnTexts[histIdx]||'';autoGrow(inpEl);syncActionBtn();return;
+  }
+  if(e.key==='ArrowDown'&&histIdx>=0&&!inpEl.value.slice(inpEl.selectionEnd||0).includes('\n')){
+    e.preventDefault();
+    if(histIdx<userTurnTexts.length-1){histIdx++;inpEl.value=userTurnTexts[histIdx]||'';}
+    else{histIdx=-1;inpEl.value=histDraft;}
+    autoGrow(inpEl);syncActionBtn();return;
+  }
+  const wantSend=sendKeyMode==='mod_enter'?(e.key==='Enter'&&(e.metaKey||e.ctrlKey)):(e.key==='Enter'&&!e.shiftKey);
+  if(wantSend){e.preventDefault();primaryAction();}
 });
 document.addEventListener('paste',e=>{
   const items=[...(e.clipboardData?.items||[])].filter(it=>it.type.startsWith('image/'));

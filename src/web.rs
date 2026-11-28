@@ -25,7 +25,7 @@ use crate::llm::{cli, ConfigOp, Llm, Provider};
 use crate::runtime::guidance::SkillStore;
 use crate::runtime::mcp::McpRegistry;
 use crate::runtime::policy::{Policy, Tier};
-use crate::runtime::session::{archive_session, scan_sessions};
+use crate::runtime::session::{archive_session, scan_sessions, search_sessions};
 use crate::runtime::workflows::build_goal_prompt;
 use crate::runtime::Daemon;
 
@@ -269,6 +269,16 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
     let resp_json: Result<Value, String> = match (method, path) {
         ("GET", "/api/meta") => Ok(collect_meta(state)),
         ("GET", "/api/files") => Ok(list_worktree_files(query, &state.default_repo)),
+        ("GET", "/api/search") => {
+            let q = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("q="))
+                .map(url_decode_simple)
+                .unwrap_or_default();
+            let all = query.split('&').any(|kv| kv == "all=1");
+            let filter = (!all).then_some(state.default_repo.as_path());
+            Ok(json!({ "hits": search_sessions(&q, filter, 20) }))
+        }
         ("GET", "/api/settings") => collect_settings(query, &state.default_repo),
         ("GET", "/api/automations") => Ok(collect_automations(query, state)),
         ("GET", "/api/sessions") => {
@@ -328,6 +338,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("POST", "/api/settings") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| apply_settings(&req, &state.default_repo)),
+        ("POST", "/api/discard") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| discard_worktree_file(&req, &state.default_repo)),
         ("POST", "/api/automations") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| apply_automations(&req, state)),
@@ -395,6 +408,15 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(&state.default_repo)
+        .args(["diff", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(64_000).collect::<String>())
+        .unwrap_or_default();
     let skills: Vec<Value> = SkillStore::default_for(Some(&state.default_repo))
         .catalog_for_autocomplete()
         .into_iter()
@@ -405,6 +427,7 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "default_repo": state.default_repo.display().to_string(),
         "branch": branch,
+        "diff": diff,
         "active_model": active_model,
         "effort": provider.effort(),
         "models": models,
@@ -675,12 +698,15 @@ fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value,
             json!({"id": "cfg-e", "method": "effort.set", "params": {"effort": e}})
         );
     }
-    if let Some(ref r) = role {
-        let is_ro = matches!(r.as_str(), "plan" | "advisor" | "scout" | "reviewer");
+    let gate_edits = req.get("gate_edits").and_then(Value::as_bool);
+    if role.is_some() || gate_edits.is_some() {
+        let is_ro = role
+            .as_deref()
+            .is_some_and(|r| matches!(r, "plan" | "advisor" | "scout" | "reviewer"));
         let _ = writeln!(
             stdin_pipe,
             "{}",
-            json!({"id": "cfg-p", "method": "mode.set", "params": {"plan": is_ro}})
+            json!({"id": "cfg-p", "method": "mode.set", "params": {"plan": is_ro, "gate_edits": gate_edits.unwrap_or(false)}})
         );
     }
     let turn_req = json!({
@@ -815,6 +841,8 @@ fn resolve_session_approval(req: &Value, default_repo: &Path) -> Result<Value, S
     let sid = req["sid"].as_str().ok_or("sid required")?;
     let call_id = req["id"].as_str().ok_or("approval id required")?;
     let allow = req["allow"].as_bool().unwrap_or(false);
+    let remember = req["remember"].as_bool().unwrap_or(false);
+    let note = req.get("note").and_then(Value::as_str);
     let wt = req["worktree"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -826,9 +854,60 @@ fn resolve_session_approval(req: &Value, default_repo: &Path) -> Result<Value, S
     let mut daemon = Daemon::new(&provider, &wt, &runs, sid, &cfg)?;
     daemon.dispatch(
         "approval.resolve",
-        &json!({"id": call_id, "allow": allow}),
+        &json!({"id": call_id, "allow": allow, "remember": remember, "note": note}),
         &mut |_| {},
     )
+}
+
+fn discard_worktree_file(req: &Value, default_repo: &Path) -> Result<Value, String> {
+    let rel = req["file"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("file path required")?;
+    if rel.starts_with('/')
+        || Path::new(rel).components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err("invalid relative file path".into());
+    }
+    let wt = req["worktree"]
+        .as_str()
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["reset", "-q", "HEAD", "--", rel])
+        .output();
+    let co = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["checkout", "--", rel])
+        .output()
+        .map_err(|e| format!("git checkout: {e}"))?;
+    if !co.status.success() {
+        let cl = Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["clean", "-f", "--", rel])
+            .output()
+            .map_err(|e| format!("git clean: {e}"))?;
+        if !cl.status.success() {
+            return Err(format!(
+                "discard failed: {}",
+                String::from_utf8_lossy(&co.stderr).trim()
+            ));
+        }
+    }
+    Ok(json!({"discarded": rel}))
 }
 
 fn commit_session_worktree(req: &Value, default_repo: &Path) -> Result<Value, String> {
@@ -856,6 +935,7 @@ fn dispatch_session_rpc(req: &Value, default_repo: &Path) -> Result<Value, Strin
             | "session.compact"
             | "session.rewind"
             | "session.apply"
+            | "mode.set"
             | "git.pr"
             | "git.worktree"
     ) {
