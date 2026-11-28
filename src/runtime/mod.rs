@@ -436,26 +436,31 @@ impl<'a> Daemon<'a> {
             "model.set" => {
                 let requested = params.get("model").and_then(Value::as_str).map(str::trim).unwrap_or("");
                 self.model_override = (!requested.is_empty() && requested != "reset" && requested != "default").then(|| requested.to_owned());
-                let _ = crate::llm::Provider::configure(&json!({"action": "save_model", "model": self.model_override}));
+                let _ = crate::llm::Provider::apply_config(crate::llm::ConfigOp::SaveModel(
+                    self.model_override.as_deref(),
+                ));
                 let active = self.model_override.clone().unwrap_or_else(|| self.llm.roles().get("code").to_string());
                 let env_override = std::env::var_os("TWIG_MODEL").is_some() || std::env::var_os("TWIG_ROLES").is_some();
                 self.frozen_system = None;
                 Ok(json!({"model": active, "env_override": env_override}))
             }
 
-            "roles.get" => crate::llm::Provider::configure(&json!({"action": "get_roles"})),
+            "roles.get" => crate::llm::Provider::apply_config(crate::llm::ConfigOp::RolesReport),
 
             "roles.set" => {
                 let action = params.get("action").and_then(Value::as_str).unwrap_or("set");
                 let res = if action == "reset" {
-                    crate::llm::Provider::configure(&json!({"action": "reset_roles"}))?
+                    crate::llm::Provider::apply_config(crate::llm::ConfigOp::ResetRoles)?
                 } else {
-                    crate::llm::Provider::configure(&json!({
-                        "action": "set_role",
-                        "role": params.get("role"),
-                        "model": params.get("model"),
-                        "effort": params.get("effort"),
-                    }))?
+                    let role = params
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .ok_or("roles.set requires `role`")?;
+                    crate::llm::Provider::apply_config(crate::llm::ConfigOp::SetRole {
+                        role,
+                        model: params.get("model").and_then(Value::as_str),
+                        effort: params.get("effort").and_then(Value::as_str),
+                    })?
                 };
                 self.frozen_system = None;
                 Ok(res)
@@ -541,9 +546,9 @@ impl<'a> Daemon<'a> {
                 let next = crate::llm::normalize_effort(raw)?;
                 self.effort = next.clone();
                 self.llm.set_effort(next.as_deref());
-                let _ = crate::llm::Provider::configure(
-                    &json!({"action": "save_effort", "effort": next}),
-                );
+                let _ = crate::llm::Provider::apply_config(crate::llm::ConfigOp::SaveEffort(
+                    next.as_deref(),
+                ));
                 self.record
                     .append("effort.changed", json!({"effort": next}))
                     .map_err(|e| e.to_string())?;
@@ -821,8 +826,8 @@ impl<'a> Daemon<'a> {
                     .get("role")
                     .and_then(Value::as_str)
                     .unwrap_or(default_role);
-                let resolved_role = crate::llm::Provider::configure(
-                    &json!({"action": "resolve_role", "role": role}),
+                let resolved_role = crate::llm::Provider::apply_config(
+                    crate::llm::ConfigOp::ResolveRole(role),
                 )
                 .unwrap_or_else(|_| json!({}));
                 let model = self.model_override.clone().unwrap_or_else(|| {

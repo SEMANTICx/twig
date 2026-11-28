@@ -358,7 +358,7 @@ fn main() {
                 provider.roles().get("code"),
                 provider.effort().as_deref().unwrap_or("off")
             );
-            if let Ok(roles_val) = Provider::configure(&json!({"action": "get_roles"})) {
+            if let Ok(roles_val) = Provider::apply_config(twig::llm::ConfigOp::RolesReport) {
                 if let Some(roles_text) = roles_val["report"].as_str() {
                     for line in roles_text.lines().skip(1) {
                         println!("{line}");
@@ -680,14 +680,8 @@ fn main() {
         "subagent" | "review" => {
             let repo = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| ".".into()));
             let cfg = twig::subagent::SubagentConfig {
-                twig: std::env::current_exe().expect("executable"),
-                repository: repo,
-                runs_root: paths::state_dir().join("subagents"),
-                bwrap: "/usr/bin/bwrap".into(),
-                concurrency: 3,
                 timeout: std::time::Duration::from_secs(120),
-                max_output_bytes: 128_000,
-                network: true,
+                ..twig::subagent::SubagentConfig::for_repo(repo).expect("executable")
             };
             let result = twig::subagent::SubagentPool::new(cfg).and_then(|pool| {
                 if cmd == "review" {
@@ -702,13 +696,9 @@ fn main() {
                             .unwrap_or("No evidence supplied"),
                     )
                 } else {
-                    let role = match args.get(2).map(String::as_str).unwrap_or("scout") {
-                        "code" => twig::subagent::Role::Code,
-                        "test" => twig::subagent::Role::Test,
-                        "advisor" => twig::subagent::Role::Advisor,
-                        "reviewer" => twig::subagent::Role::Reviewer,
-                        _ => twig::subagent::Role::Scout,
-                    };
+                    let role = twig::subagent::Role::from_str_or_scout(
+                        args.get(2).map(String::as_str).unwrap_or("scout"),
+                    );
                     pool.run(
                         role,
                         args.get(3)

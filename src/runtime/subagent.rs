@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::config::paths;
 use crate::exec::run_process_streaming;
+use crate::llm::cli::{build_command as build_cli_command, is_cli_model};
 use crate::llm::Llm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,25 @@ impl Role {
     pub fn read_only(self) -> bool {
         matches!(self, Self::Scout | Self::Advisor | Self::Reviewer)
     }
+
+    pub fn from_str_or_scout(s: &str) -> Self {
+        s.parse().unwrap_or(Self::Scout)
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "code" => Ok(Self::Code),
+            "test" => Ok(Self::Test),
+            "scout" => Ok(Self::Scout),
+            "advisor" => Ok(Self::Advisor),
+            "reviewer" => Ok(Self::Reviewer),
+            _ => Err("invalid subagent role".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +70,21 @@ pub struct SubagentConfig {
     pub timeout: Duration,
     pub max_output_bytes: usize,
     pub network: bool,
+}
+
+impl SubagentConfig {
+    pub fn for_repo(repository: impl Into<PathBuf>) -> io::Result<Self> {
+        Ok(Self {
+            twig: std::env::current_exe()?,
+            repository: repository.into(),
+            runs_root: paths::state_dir().join("subagents"),
+            bwrap: PathBuf::from("/usr/bin/bwrap"),
+            concurrency: 3,
+            timeout: Duration::from_secs(300),
+            max_output_bytes: 128_000,
+            network: true,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,82 +547,6 @@ fn build_linux_bwrap_command(
     command
 }
 
-fn build_external_cli_command(
-    cli_spec: &str,
-    role: Role,
-    task: &str,
-    worktree: &Path,
-) -> io::Result<Command> {
-    let rest = cli_spec.strip_prefix("cli:").unwrap_or(cli_spec);
-    let (engine, submodel) = match rest.split_once(':') {
-        Some((e, m)) if !m.trim().is_empty() => (e.trim(), Some(m.trim())),
-        _ => (rest.trim(), None),
-    };
-    match engine {
-        "codex" => {
-            let mut cmd = Command::new("codex");
-            cmd.arg("exec")
-                .arg("--skip-git-repo-check")
-                .arg("-C")
-                .arg(worktree);
-            if role.read_only() {
-                cmd.args(["--sandbox", "read-only"]);
-            } else {
-                cmd.arg("--full-auto");
-            }
-            if let Some(m) = submodel {
-                cmd.args(["-m", m]);
-            }
-            cmd.arg(task).current_dir(worktree);
-            Ok(cmd)
-        }
-        "claude" => {
-            let mut cmd = Command::new("claude");
-            cmd.args(["-p", task]);
-            if role.read_only() {
-                cmd.args(["--permission-mode", "plan"]);
-            } else {
-                cmd.arg("--dangerously-skip-permissions");
-            }
-            if let Some(m) = submodel {
-                cmd.args(["--model", m]);
-            }
-            cmd.current_dir(worktree);
-            Ok(cmd)
-        }
-        "gemini" => {
-            let mut cmd = Command::new("gemini");
-            cmd.args(["-p", task]);
-            if !role.read_only() {
-                cmd.arg("--yolo");
-            }
-            if let Some(m) = submodel {
-                cmd.args(["-m", m]);
-            }
-            cmd.current_dir(worktree);
-            Ok(cmd)
-        }
-        "agy" | "antigravity" => {
-            let mut cmd = Command::new("agy");
-            cmd.args(["-p", task, "--disable-slash-commands"]);
-            if role.read_only() {
-                cmd.args(["--mode", "plan"]);
-            } else {
-                cmd.arg("--dangerously-skip-permissions");
-            }
-            if let Some(m) = submodel {
-                cmd.args(["--model", m]);
-            }
-            cmd.current_dir(worktree);
-            Ok(cmd)
-        }
-        other => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported external CLI runner {other:?}; expected cli:codex, cli:claude, cli:agy, or cli:gemini"),
-        )),
-    }
-}
-
 impl SubagentPool {
     pub fn new(config: SubagentConfig) -> io::Result<Self> {
         Self::new_for_parent(config, None)
@@ -1006,9 +965,9 @@ impl SubagentPool {
             .map(str::to_owned)
             .unwrap_or_else(|| provider.roles().get(role.as_str()).to_owned());
 
-        // External CLI worker bridge (`cli:codex`, `cli:claude`, `cli:gemini`) running inside
-        // the isolated Git worktree with automatic diff & review extraction.
-        if resolved_model.starts_with("cli:") {
+        // External CLI worker bridge (`cli:codex`, `cli:claude`, `cli:agy`, `cli:gemini`) running
+        // inside the isolated Git worktree with automatic diff & review extraction.
+        if is_cli_model(&resolved_model) {
             if let Some(cb) = on_event {
                 cb(json!({
                     "ev": "subagent.progress",
@@ -1021,16 +980,14 @@ impl SubagentPool {
                 "/runs/review.diff",
                 &host_runs.join("review.diff").display().to_string(),
             );
-            let mut ext_cmd =
-                build_external_cli_command(&resolved_model, role, &effective_task, &host_worktree)?;
-            if (resolved_model.starts_with("cli:agy")
-                || resolved_model.starts_with("cli:antigravity"))
-                && effort_override
-                    .map(str::trim)
-                    .is_some_and(|e| matches!(e, "low" | "medium" | "high" | "xhigh"))
-            {
-                ext_cmd.args(["--effort", effort_override.unwrap().trim()]);
-            }
+            let mut ext_cmd = build_cli_command(
+                &resolved_model,
+                &effective_task,
+                role.read_only(),
+                Some(&host_worktree),
+                effort_override,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
             let capture = run_process_streaming(
                 &mut ext_cmd,
                 &[],
@@ -1486,11 +1443,12 @@ mod tests {
         assert_eq!(parsed["approved"], false);
         assert_eq!(parsed["blockers"].as_array().unwrap().len(), 1);
 
-        let ro_cmd = build_external_cli_command(
+        let ro_cmd = build_cli_command(
             "cli:codex:o3",
-            Role::Advisor,
             "review plan",
-            Path::new("/tmp"),
+            Role::Advisor.read_only(),
+            Some(Path::new("/tmp")),
+            None,
         )
         .unwrap();
         let ro_args: Vec<String> = ro_cmd
@@ -1500,9 +1458,14 @@ mod tests {
         assert!(ro_args.contains(&"read-only".to_owned()));
         assert!(ro_args.contains(&"o3".to_owned()));
 
-        let rw_cmd =
-            build_external_cli_command("cli:claude:sonnet", Role::Code, "fix bug", Path::new("/tmp"))
-                .unwrap();
+        let rw_cmd = build_cli_command(
+            "cli:claude:sonnet",
+            "fix bug",
+            Role::Code.read_only(),
+            Some(Path::new("/tmp")),
+            None,
+        )
+        .unwrap();
         let rw_args: Vec<String> = rw_cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

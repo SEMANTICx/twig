@@ -1,11 +1,14 @@
-//! OpenAI-compatible client pointed at magpie.
+//! OpenAI-compatible client pointed at magpie, role-routing configuration,
+//! and local CLI runner bridges (`cli`).
 //!
-//! Strict DAG: `mod` (Provider) -> `stream` -> `types`; `stub` -> `types`.
+//! Strict DAG: `mod` (Provider) -> `{cli, stream}` -> `types`; `stub` -> `types`.
 
+pub(crate) mod cli;
 pub mod stream;
 pub mod stub;
 pub mod types;
 
+use cli::is_cli_model;
 pub use types::{parse_reply, summarize_usage, Llm, Reply, Roles, ToolCall, Usage};
 
 use std::collections::{BTreeMap, HashMap};
@@ -19,7 +22,19 @@ use serde_json::{json, Value};
 use crate::config::paths;
 use crate::control::Control;
 
-pub const DEFAULT_BASE: &str = "http://127.0.0.1:3425/v1";
+pub enum ConfigOp<'a> {
+    RolesReport,
+    ResetRoles,
+    SetRole {
+        role: &'a str,
+        model: Option<&'a str>,
+        effort: Option<&'a str>,
+    },
+    ResolveRole(&'a str),
+    SaveModel(Option<&'a str>),
+    SaveEffort(Option<&'a str>),
+}
+const DEFAULT_BASE: &str = "http://127.0.0.1:3425/v1";
 const CANONICAL_ROLES: &[&str] = &["plan", "advisor", "code", "scout", "reviewer"];
 const MAX_RETRIES: u32 = 3;
 
@@ -283,26 +298,23 @@ impl Provider {
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     }
 
-    /// Unified persisted model, effort, and role-routing configuration entrypoint.
-    pub fn configure(params: &Value) -> Result<Value, String> {
-        match params.get("action").and_then(Value::as_str).unwrap_or("get_roles") {
-            "get_roles" => Ok(build_roles_report()),
-            "reset_roles" => {
+    /// Typed configuration façade for persisted default model, reasoning effort, and role routing.
+    pub fn apply_config(op: ConfigOp<'_>) -> Result<Value, String> {
+        match op {
+            ConfigOp::RolesReport => Ok(build_roles_report()),
+            ConfigOp::ResetRoles => {
                 write_optional_file(&roles_path(), None)?;
                 Ok(build_roles_report())
             }
-            "set_role" => {
-                let role = params
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .ok_or("set_role requires `role`")?;
-                let model = params.get("model").and_then(Value::as_str);
-                let effort = params.get("effort").and_then(Value::as_str);
+            ConfigOp::SetRole {
+                role,
+                model,
+                effort,
+            } => {
                 update_role_spec(role, model, effort)?;
                 Ok(build_roles_report())
             }
-            "resolve_role" => {
-                let role = params.get("role").and_then(Value::as_str).unwrap_or("code");
+            ConfigOp::ResolveRole(role) => {
                 let specs = load_role_specs();
                 let canon = canonicalize_role_name(role).unwrap_or(role);
                 let pinned = specs.get(canon);
@@ -311,21 +323,14 @@ impl Provider {
                     "effort": pinned.and_then(|s| s.effort.clone()),
                 }))
             }
-            "save_model" => {
-                write_optional_file(
-                    &paths::state_dir().join("model.txt"),
-                    params.get("model").and_then(Value::as_str),
-                )?;
+            ConfigOp::SaveModel(model) => {
+                write_optional_file(&paths::state_dir().join("model.txt"), model)?;
                 Ok(json!({"ok": true}))
             }
-            "save_effort" => {
-                write_optional_file(
-                    &paths::state_dir().join("effort.txt"),
-                    params.get("effort").and_then(Value::as_str),
-                )?;
+            ConfigOp::SaveEffort(effort) => {
+                write_optional_file(&paths::state_dir().join("effort.txt"), effort)?;
                 Ok(json!({"ok": true}))
             }
-            other => Err(format!("unknown Provider::configure action {other:?}")),
         }
     }
 
@@ -408,9 +413,19 @@ impl Llm for Provider {
         messages: &[Value],
         tools: Option<&Value>,
     ) -> Result<Reply, String> {
-        if model.starts_with("cli:") {
+        let eff = self.effort();
+        if is_cli_model(model) {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            return complete_via_cli(model, system, messages, tools, self.timeout, None, None);
+            return cli::complete(
+                model,
+                system,
+                messages,
+                tools,
+                eff.as_deref(),
+                self.timeout,
+                None,
+                None,
+            );
         }
         let mut msgs = vec![json!({"role": "system", "content": system})];
         msgs.extend_from_slice(messages);
@@ -419,7 +434,7 @@ impl Llm for Provider {
             "model": model,
             "messages": msgs,
         });
-        if let Some(level) = self.effort() {
+        if let Some(level) = eff {
             payload["reasoning_effort"] = json!(level);
         } else {
             payload["temperature"] = json!(0.0);
@@ -431,12 +446,17 @@ impl Llm for Provider {
 
         self.calls.fetch_add(1, Ordering::Relaxed);
         let body_str = payload.to_string();
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15).min(self.timeout))
+            .timeout_write(Duration::from_secs(30).min(self.timeout))
+            .timeout_read(self.timeout)
+            .build();
         let mut attempt = 0u32;
         let text = loop {
-            let response = ureq::post(&format!("{}/chat/completions", self.base))
+            let response = agent
+                .post(&format!("{}/chat/completions", self.base))
                 .set("Content-Type", "application/json")
                 .set("Authorization", &format!("Bearer {}", self.key))
-                .timeout(self.timeout)
                 .send_string(&body_str);
             match response {
                 Ok(r) => break r.into_string().map_err(|e| format!("read body: {e}"))?,
@@ -474,13 +494,15 @@ impl Llm for Provider {
         control: &Control,
         emit: &mut dyn FnMut(Value),
     ) -> Result<Reply, String> {
-        if model.starts_with("cli:") {
+        let eff = self.effort();
+        if is_cli_model(model) {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            return complete_via_cli(
+            return cli::complete(
                 model,
                 system,
                 messages,
                 tools,
+                eff.as_deref(),
                 self.timeout,
                 Some(control),
                 Some(emit),
@@ -494,7 +516,7 @@ impl Llm for Provider {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
-        if let Some(level) = self.effort() {
+        if let Some(level) = eff {
             payload["reasoning_effort"] = json!(level);
         }
         if let Some(t) = tools {
@@ -509,379 +531,5 @@ impl Llm for Provider {
             control,
             emit,
         )
-    }
-}
-
-fn format_cli_prompt(system: &str, messages: &[Value], read_only: bool) -> String {
-    let mut sections = Vec::new();
-    if read_only {
-        sections.push("[Mode: strict read-only — do NOT modify, create, or delete files.]".to_owned());
-    }
-    let sys_trimmed = system.trim();
-    if !sys_trimmed.is_empty() && sys_trimmed.len() <= 4_000 {
-        sections.push(format!("[System]\n{sys_trimmed}"));
-    }
-    let mut tail = Vec::new();
-    let mut budget = 48_000usize;
-    for msg in messages.iter().rev() {
-        let role = msg["role"].as_str().unwrap_or("user");
-        let content = msg["content"]
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| msg["content"].to_string());
-        let trimmed = content.trim();
-        if trimmed.is_empty() || trimmed == "null" {
-            continue;
-        }
-        let clipped: String = trimmed.chars().take(16_000).collect();
-        let entry = format!("[{role}]\n{clipped}");
-        if entry.len() > budget && !tail.is_empty() {
-            break;
-        }
-        budget = budget.saturating_sub(entry.len());
-        tail.push(entry);
-    }
-    tail.reverse();
-    sections.extend(tail);
-    sections.join("\n\n")
-}
-
-fn absorb_cli_stream_line(
-    engine: &str,
-    line: &str,
-    acc_text: &mut String,
-    usage: &mut Usage,
-    emit: &mut Option<&mut dyn FnMut(Value)>,
-) {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        if let Some(u) = v.get("usage") {
-            let parsed = Usage::parse(u);
-            if parsed.input_tokens.is_some() {
-                usage.input_tokens = parsed.input_tokens;
-            }
-            if parsed.output_tokens.is_some() {
-                usage.output_tokens = parsed.output_tokens;
-            }
-            if parsed.cached_input_tokens.is_some() {
-                usage.cached_input_tokens = parsed.cached_input_tokens;
-            }
-        }
-        match engine {
-            "codex" => {
-                if v["type"] == "item.completed" {
-                    let item = &v["item"];
-                    match item["type"].as_str() {
-                        Some("agent_message") => {
-                            if let Some(t) = item["text"].as_str().filter(|s| !s.is_empty()) {
-                                if !acc_text.is_empty() {
-                                    acc_text.push('\n');
-                                }
-                                acc_text.push_str(t);
-                                if let Some(ref mut sink) = emit {
-                                    sink(json!({"ev": "model.delta", "text": format!("{t}\n")}));
-                                }
-                            }
-                        }
-                        Some("reasoning") => {
-                            if let Some(t) = item["text"].as_str().filter(|s| !s.is_empty()) {
-                                if let Some(ref mut sink) = emit {
-                                    sink(json!({"ev": "model.reasoning", "text": format!("{t}\n")}));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                return;
-            }
-            "claude" => {
-                match v["type"].as_str() {
-                    Some("stream_event") => {
-                        let delta = &v["event"]["delta"];
-                        match delta["type"].as_str() {
-                            Some("text_delta") => {
-                                if let Some(t) = delta["text"].as_str().filter(|s| !s.is_empty()) {
-                                    acc_text.push_str(t);
-                                    if let Some(ref mut sink) = emit {
-                                        sink(json!({"ev": "model.delta", "text": t}));
-                                    }
-                                }
-                            }
-                            Some("thinking_delta") => {
-                                if let Some(t) =
-                                    delta["thinking"].as_str().filter(|s| !s.is_empty())
-                                {
-                                    if let Some(ref mut sink) = emit {
-                                        sink(json!({"ev": "model.reasoning", "text": t}));
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some("assistant") if acc_text.is_empty() => {
-                        for block in v["message"]["content"].as_array().into_iter().flatten() {
-                            if block["type"] == "text" {
-                                if let Some(t) = block["text"].as_str().filter(|s| !s.is_empty()) {
-                                    acc_text.push_str(t);
-                                    if let Some(ref mut sink) = emit {
-                                        sink(json!({"ev": "model.delta", "text": t}));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Some("result") if acc_text.is_empty() => {
-                        if let Some(r) = v["result"].as_str().filter(|s| !s.is_empty()) {
-                            acc_text.push_str(r);
-                            if let Some(ref mut sink) = emit {
-                                sink(json!({"ev": "model.delta", "text": r}));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    // Plain-text fallback (`gemini -p` or non-JSON lines): stream line immediately.
-    if !acc_text.is_empty() {
-        acc_text.push('\n');
-    }
-    acc_text.push_str(line.trim_end_matches(['\r', '\n']));
-    if let Some(ref mut sink) = emit {
-        sink(json!({"ev": "model.delta", "text": format!("{}\n", line.trim_end_matches(['\r', '\n']))}));
-    }
-}
-
-fn complete_via_cli(
-    cli_spec: &str,
-    system: &str,
-    messages: &[Value],
-    tools: Option<&Value>,
-    timeout: Duration,
-    control: Option<&Control>,
-    mut emit: Option<&mut dyn FnMut(Value)>,
-) -> Result<Reply, String> {
-    use std::io::{BufRead, BufReader, Read};
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::time::Instant;
-
-    let rest = cli_spec.strip_prefix("cli:").unwrap_or(cli_spec);
-    let (engine, submodel) = match rest.split_once(':') {
-        Some((e, m)) if !m.trim().is_empty() => (e.trim(), Some(m.trim())),
-        _ => (rest.trim(), None),
-    };
-    let read_only = tools.is_none()
-        || system.contains("Plan mode")
-        || system.contains("read-only")
-        || messages.iter().any(|m| {
-            m["role"] == "system"
-                && m["content"]
-                    .as_str()
-                    .is_some_and(|s| s.contains("Plan mode is active") || s.contains("read-only"))
-        });
-    let prompt = format_cli_prompt(system, messages, read_only);
-    let streaming = emit.is_some();
-
-    let mut cmd = match engine {
-        "codex" => {
-            let mut c = Command::new("codex");
-            c.args(["exec", "--skip-git-repo-check"]);
-            if streaming {
-                c.arg("--json");
-            }
-            if read_only {
-                c.args(["--sandbox", "read-only"]);
-            } else {
-                c.arg("--full-auto");
-            }
-            if let Some(m) = submodel {
-                c.args(["-m", m]);
-            }
-            c.arg(&prompt);
-            c
-        }
-        "claude" => {
-            let mut c = Command::new("claude");
-            c.args(["-p", &prompt]);
-            if streaming {
-                c.args(["--output-format", "stream-json", "--verbose"]);
-            }
-            if read_only {
-                c.args(["--permission-mode", "plan"]);
-            } else {
-                c.arg("--dangerously-skip-permissions");
-            }
-            if let Some(m) = submodel {
-                c.args(["--model", m]);
-            }
-            c
-        }
-        "gemini" => {
-            let mut c = Command::new("gemini");
-            c.args(["-p", &prompt]);
-            if !read_only {
-                c.arg("--yolo");
-            }
-            if let Some(m) = submodel {
-                c.args(["-m", m]);
-            }
-            c
-        }
-        "agy" | "antigravity" => {
-            let mut c = Command::new("agy");
-            c.args(["-p", &prompt, "--disable-slash-commands"]);
-            if read_only {
-                c.args(["--mode", "plan"]);
-            } else {
-                c.arg("--dangerously-skip-permissions");
-            }
-            if let Some(m) = submodel {
-                c.args(["--model", m]);
-            }
-            c
-        }
-        other => {
-            return Err(format!(
-                "unsupported CLI model {other:?}; expected cli:codex, cli:claude, cli:agy, or cli:gemini"
-            ));
-        }
-    };
-
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn {cli_spec}: {e}"))?;
-    let out_pipe = child.stdout.take().ok_or("cli missing stdout")?;
-    let mut err_pipe = child.stderr.take().ok_or("cli missing stderr")?;
-    let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(out_pipe).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = err_pipe.read_to_string(&mut buf);
-        buf
-    });
-
-    let mut acc_text = String::new();
-    let mut usage = Usage::default();
-    let started = Instant::now();
-    let status = loop {
-        while let Ok(line) = rx.try_recv() {
-            absorb_cli_stream_line(engine, &line, &mut acc_text, &mut usage, &mut emit);
-        }
-        if control.is_some_and(Control::cancelled) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("cancelled".into());
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("{cli_spec} timed out after {}s", timeout.as_secs()));
-        }
-        match child.try_wait().map_err(|e| format!("wait {cli_spec}: {e}"))? {
-            Some(s) => break s,
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    while let Ok(line) = rx.try_recv() {
-        absorb_cli_stream_line(engine, &line, &mut acc_text, &mut usage, &mut emit);
-    }
-
-    let stderr = err_handle.join().unwrap_or_default();
-    if !status.success() {
-        let detail = if !stderr.trim().is_empty() {
-            stderr.trim()
-        } else {
-            acc_text.trim()
-        };
-        let clipped: String = detail.chars().take(600).collect();
-        return Err(format!("{cli_spec} failed ({status}): {clipped}"));
-    }
-    Ok(Reply {
-        text: acc_text.trim().to_owned(),
-        calls: Vec::new(),
-        usage,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cli_stream_parser_extracts_codex_and_claude_deltas_and_token_usage() {
-        let mut codex_text = String::new();
-        let mut codex_usage = Usage::default();
-        let mut events = Vec::new();
-        {
-            let mut sink_fn = |ev: Value| events.push(ev);
-            let mut opt_sink: Option<&mut dyn FnMut(Value)> = Some(&mut sink_fn);
-            absorb_cli_stream_line(
-                "codex",
-                r#"{"type":"item.completed","item":{"type":"reasoning","text":"checking invariants"}}"#,
-                &mut codex_text,
-                &mut codex_usage,
-                &mut opt_sink,
-            );
-            absorb_cli_stream_line(
-                "codex",
-                r#"{"type":"item.completed","item":{"type":"agent_message","text":"fixed parser"}}"#,
-                &mut codex_text,
-                &mut codex_usage,
-                &mut opt_sink,
-            );
-            absorb_cli_stream_line(
-                "codex",
-                r#"{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":900,"output_tokens":85}}"#,
-                &mut codex_text,
-                &mut codex_usage,
-                &mut opt_sink,
-            );
-        }
-        assert_eq!(codex_text, "fixed parser");
-        assert_eq!(codex_usage.input_tokens, Some(1200));
-        assert_eq!(codex_usage.cached_input_tokens, Some(900));
-        assert_eq!(codex_usage.output_tokens, Some(85));
-        assert_eq!(events.len(), 2);
-
-        let mut claude_text = String::new();
-        let mut claude_usage = Usage::default();
-        let mut no_sink: Option<&mut dyn FnMut(Value)> = None;
-        absorb_cli_stream_line(
-            "claude",
-            r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"hello "}}}"#,
-            &mut claude_text,
-            &mut claude_usage,
-            &mut no_sink,
-        );
-        absorb_cli_stream_line(
-            "claude",
-            r#"{"type":"result","result":"hello world","usage":{"input_tokens":500,"cache_read_input_tokens":400,"output_tokens":40}}"#,
-            &mut claude_text,
-            &mut claude_usage,
-            &mut no_sink,
-        );
-        assert_eq!(claude_text, "hello ");
-        assert_eq!(claude_usage.input_tokens, Some(500));
-        assert_eq!(claude_usage.cached_input_tokens, Some(400));
-        assert_eq!(claude_usage.output_tokens, Some(40));
     }
 }

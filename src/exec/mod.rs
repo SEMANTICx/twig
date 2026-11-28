@@ -521,12 +521,32 @@ pub fn run_process(
 
 /// Like `run_process`, invoking `on_stdout_line` incrementally as complete newline-delimited
 /// stdout lines arrive (even if total stdout later exceeds `max_output_bytes`).
-#[cfg(unix)]
 pub fn run_process_streaming(
     command: &mut Command,
     input: &[u8],
     timeout: Duration,
     max_output_bytes: usize,
+    on_stdout_line: &mut dyn FnMut(&str),
+) -> io::Result<Capture> {
+    run_process_cancellable(
+        command,
+        input,
+        timeout,
+        max_output_bytes,
+        None,
+        on_stdout_line,
+    )
+}
+
+/// Bounded nonblocking process runner with incremental stdout line callbacks, optional
+/// `Control` cancellation, and full process-group tree reaping on exit/timeout/cancel.
+#[cfg(unix)]
+pub fn run_process_cancellable(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    max_output_bytes: usize,
+    control: Option<&Control>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> io::Result<Capture> {
     let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
@@ -557,6 +577,7 @@ pub fn run_process_streaming(
     let mut pending_line = Vec::new();
     let mut sent = 0;
     let mut closed = false;
+    let mut cancelled = false;
     loop {
         if !closed {
             match stdin.write(&input[sent..]) {
@@ -587,6 +608,10 @@ pub fn run_process_streaming(
             capture.exit_code = Some(code);
             break;
         }
+        if control.is_some_and(Control::cancelled) {
+            cancelled = true;
+            break;
+        }
         if Instant::now() >= deadline {
             capture.timed_out = true;
             break;
@@ -613,15 +638,19 @@ pub fn run_process_streaming(
     if let Some(mut child) = owner.0.take() {
         child.wait()?;
     }
+    if cancelled {
+        return Err(io::Error::new(ErrorKind::Interrupted, "cancelled"));
+    }
     Ok(capture)
 }
 
 #[cfg(not(unix))]
-pub fn run_process_streaming(
+pub fn run_process_cancellable(
     command: &mut Command,
     input: &[u8],
     timeout: Duration,
     max_output_bytes: usize,
+    control: Option<&Control>,
     on_stdout_line: &mut dyn FnMut(&str),
 ) -> io::Result<Capture> {
     let (timeout, max_output_bytes) = validate_process_limits(input, timeout, max_output_bytes)?;
@@ -669,9 +698,14 @@ pub fn run_process_streaming(
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "timeout overflow"))?;
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut cancelled = false;
     loop {
         if let Some(code) = status_without_reaping(owner.0.as_mut().unwrap())? {
             exit_code = Some(code);
+            break;
+        }
+        if control.is_some_and(Control::cancelled) {
+            cancelled = true;
             break;
         }
         if Instant::now() >= deadline {
@@ -687,6 +721,9 @@ pub fn run_process_streaming(
     }
     let (stdout, t1) = out_h.join().unwrap_or_default();
     let (stderr, t2) = err_h.join().unwrap_or_default();
+    if cancelled {
+        return Err(io::Error::new(ErrorKind::Interrupted, "cancelled"));
+    }
     let mut pending = Vec::new();
     feed_stdout_lines(&mut pending, &stdout, on_stdout_line);
     if !pending.is_empty() {

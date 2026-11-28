@@ -20,7 +20,7 @@ use super::mcp::McpRegistry;
 use super::policy::Tier;
 use super::subagent::{Role, SubagentConfig, SubagentPool};
 use super::tasks::TaskManager;
-use crate::config::{paths, HarnessConfig};
+use crate::config::HarnessConfig;
 use crate::control::Control;
 use crate::exec::{isolation, run_live as exec_run_live, Owner};
 use crate::llm::ToolCall;
@@ -895,16 +895,12 @@ impl Tools {
 
     fn ensure_agent_pool(&mut self) -> Result<SubagentPool, String> {
         if self.agent_pool.is_none() {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
             let cfg = SubagentConfig {
-                twig: executable,
-                repository: self.worktree.clone(),
-                runs_root: paths::state_dir().join("subagents"),
-                bwrap: "/usr/bin/bwrap".into(),
                 concurrency: self.agent_concurrency.max(4),
                 timeout: self.timeout.max(Duration::from_secs(300)),
                 max_output_bytes: 64_000,
                 network: self.network,
+                ..SubagentConfig::for_repo(&self.worktree).map_err(|e| e.to_string())?
             };
             self.agent_pool = Some(
                 SubagentPool::new_for_parent(cfg, self.parent_sid.clone())
@@ -946,15 +942,8 @@ impl Tools {
             return Err("subagent recursion is disabled; return a result to the parent".into());
         }
         let role_name = args["role"].as_str().unwrap_or("code");
-        let role = match role_name {
-            "code" => Role::Code,
-            "test" => Role::Test,
-            "scout" => Role::Scout,
-            "advisor" => Role::Advisor,
-            "reviewer" => Role::Reviewer,
-            _ => return Err("invalid subagent role".into()),
-        };
-        if self.is_read_only() && matches!(role, Role::Code | Role::Test) {
+        let role: Role = role_name.parse()?;
+        if self.is_read_only() && !role.read_only() {
             return Err("refused: read-only mode only permits scout, advisor, or reviewer subagents".into());
         }
         Ok(SubagentSpec {

@@ -295,19 +295,14 @@ pub fn run_walkthrough(repo: &str) -> Result<String, String> {
 }
 
 fn run_readonly_planning_agent(repo: &str, role: &str, model: &str, prompt: &str) -> Result<String, String> {
-    if model.starts_with("cli:") {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let pool = crate::runtime::subagent::SubagentPool::new(crate::runtime::subagent::SubagentConfig {
-            twig: exe,
-            repository: PathBuf::from(repo),
-            runs_root: paths::state_dir().join("subagents"),
-            bwrap: "/usr/bin/bwrap".into(),
+    if crate::llm::cli::is_cli_model(model) {
+        let cfg = crate::runtime::subagent::SubagentConfig {
             concurrency: 2,
             timeout: Duration::from_secs(180),
-            max_output_bytes: 128_000,
-            network: true,
-        })
-        .map_err(|e| e.to_string())?;
+            ..crate::runtime::subagent::SubagentConfig::for_repo(repo)
+                .map_err(|e| e.to_string())?
+        };
+        let pool = crate::runtime::subagent::SubagentPool::new(cfg).map_err(|e| e.to_string())?;
         let res = pool
             .run_with_options(
                 crate::runtime::subagent::Role::Advisor,
@@ -388,7 +383,7 @@ pub fn run_dual_plan(repo: &str, goal: &str) -> Result<String, String> {
     let plan_a = res_a?;
     let plan_b = res_b?;
 
-    if plan_model.starts_with("cli:") {
+    if crate::llm::cli::is_cli_model(&plan_model) {
         return Ok(format!(
             "*Dual-Plan (`plan`: `{plan_model}` × `advisor`: `{advisor_model}`)*\n\n### Plan A (`{plan_model}`)\n{plan_a}\n\n### Plan B (`{advisor_model}`)\n{plan_b}"
         ));
@@ -413,24 +408,7 @@ pub fn run_dual_plan(repo: &str, goal: &str) -> Result<String, String> {
 
 /// Query available models from magpie (`GET /v1/models`) plus detected local CLI runners (`cli:*`) for `/model`.
 pub fn fetch_magpie_models() -> Result<Vec<String>, String> {
-    let mut cli_runners = Vec::new();
-    for (bin, id) in [
-        ("codex", "cli:codex"),
-        ("claude", "cli:claude"),
-        ("agy", "cli:agy"),
-        ("gemini", "cli:gemini"),
-    ] {
-        let found = Command::new(bin)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok();
-        if found {
-            cli_runners.push(id.to_owned());
-        }
-    }
+    let cli_runners = crate::llm::cli::detected_runners();
     match crate::llm::Provider::new().list_models() {
         Ok(mut models) => {
             models.extend(cli_runners);
@@ -1247,15 +1225,13 @@ impl LocalWorkers {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let started = Instant::now();
-            let role_enum = match role.as_str() {
-                "code" => crate::runtime::subagent::Role::Code,
-                "test" => crate::runtime::subagent::Role::Test,
-                "advisor" => crate::runtime::subagent::Role::Advisor,
-                "reviewer" => crate::runtime::subagent::Role::Reviewer,
-                _ => crate::runtime::subagent::Role::Scout,
-            };
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
+            let role_enum = crate::runtime::subagent::Role::from_str_or_scout(&role);
+            let cfg = match crate::runtime::subagent::SubagentConfig::for_repo(&repo) {
+                Ok(mut c) => {
+                    c.concurrency = 2;
+                    c.max_output_bytes = 64_000;
+                    c
+                }
                 Err(e) => {
                     let _ = tx.send(LocalMsg::SubagentEvent(json!({
                         "ev": "subagent.completed",
@@ -1270,16 +1246,7 @@ impl LocalWorkers {
                 }
             };
             let pool_res = crate::runtime::subagent::SubagentPool::new_for_parent(
-                crate::runtime::subagent::SubagentConfig {
-                    twig: exe,
-                    repository: PathBuf::from(&repo),
-                    runs_root: paths::state_dir().join("subagents"),
-                    bwrap: "/usr/bin/bwrap".into(),
-                    concurrency: 2,
-                    timeout: Duration::from_secs(300),
-                    max_output_bytes: 64_000,
-                    network: true,
-                },
+                cfg,
                 (!parent_sid.is_empty()).then_some(parent_sid),
             );
             let pool = match pool_res {
@@ -1321,7 +1288,7 @@ impl LocalWorkers {
             let elapsed_secs = started.elapsed().as_secs();
             match run {
                 Ok(r) => {
-                    if model.as_deref().is_some_and(|m| m.starts_with("cli:")) {
+                    if model.as_deref().is_some_and(crate::llm::cli::is_cli_model) {
                         let text = r
                             .result
                             .as_ref()

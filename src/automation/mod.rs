@@ -1107,16 +1107,12 @@ impl TaskExecutor for TwigExecutor {
     }
 
     fn review(&mut self, item: &WorkItem, diff: &str, evidence: &str) -> Result<Review, String> {
-        let config = SubagentConfig {
-            twig: self.executable.clone(),
-            repository: self.repository.clone().ok_or("author workspace missing")?,
-            runs_root: self.runs.join("reviewers"),
-            bwrap: "/usr/bin/bwrap".into(),
-            concurrency: 1,
-            timeout: self.task_timeout.min(Duration::from_secs(600)),
-            max_output_bytes: 128_000,
-            network: true,
-        };
+        let repo = self.repository.clone().ok_or("author workspace missing")?;
+        let mut config = SubagentConfig::for_repo(repo).map_err(|e| e.to_string())?;
+        config.twig = self.executable.clone();
+        config.runs_root = self.runs.join("reviewers");
+        config.concurrency = 1;
+        config.timeout = self.task_timeout.min(Duration::from_secs(600));
         let result = SubagentPool::new(config)
             .map_err(|e| e.to_string())?
             .fresh_review(
