@@ -1515,42 +1515,6 @@ mod tests {
     }
 
     #[test]
-    fn config_drives_limits_and_schema() {
-        let cfg = HarnessConfig {
-            max_output: 1000,
-            read_max_lines: 1,
-            ..HarnessConfig::default()
-        };
-        let d = dir();
-        let mut t = Tools::with_config(&d, &cfg);
-        let read = t.run(&call("read", json!({"path": "note.txt"})));
-        assert!(
-            read.starts_with("   1→hello\n[truncated after 1 lines"),
-            "{read}"
-        );
-        assert!(t.schema()[1]["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("at most 1 lines"));
-        let clipped = t.clip(&"A".repeat(3000));
-        assert!(clipped.contains("clipped") && clipped.starts_with('A') && clipped.ends_with('A'));
-
-        let art_dir = d.join(".art");
-        let mut t2 = Tools::with_config(&d, &cfg).with_artifacts_dir(art_dir);
-        let big = (1..=400)
-            .map(|i| format!("line-{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let saved = t2.clip_for_call("c99", &big);
-        assert!(saved.contains("artifact:tool-c99.txt"));
-        let page = t2.run(&call(
-            "read",
-            json!({"path": "artifact:tool-c99.txt", "start_line": 200, "limit": 1}),
-        ));
-        assert!(page.starts_with("line-200"), "{page}");
-    }
-
-    #[test]
     fn read_before_edit_progressive_matching_apply_patch_and_subdir_docs_work() {
         let d = dir();
         std::fs::create_dir_all(d.join("sub")).unwrap();

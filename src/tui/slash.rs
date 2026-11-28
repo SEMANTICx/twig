@@ -1,5 +1,5 @@
-//! TUI message ingestion, event rendering updates, and slash-command execution
-//! for `App` (split out to keep `tui/mod.rs` lean and cohesive).
+//! TUI message ingestion, `PendingRpc` correlation, event rendering updates,
+//! and slash-command execution for `App`.
 
 use std::io;
 use std::time::Instant;
@@ -11,23 +11,33 @@ use serde_json::{json, Value};
 use super::client::{
     edit_file_in_external_editor, ensure_memory_file, format_config_report, format_init_report,
     format_mcp_report, format_tasks_report, format_verify_report, init_project_files,
-    load_image_data_url, paste_clipboard_image, read_memory_preview, run_git_diff,
-    write_export_file, LocalMsg, LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
-    EVOLVE_PROMPT,
+    load_image_data_url, paste_clipboard_image, read_memory_preview, write_export_file, LocalMsg,
+    LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
 };
 use super::composer::{parse_slash, SlashCommand};
 use super::overlays::OverlayPicker;
 use super::strips::{parse_todos, BtwCard, SubagentEntry, SubagentStatus, TodoEntry};
-use super::theme::{format_status_notice, summarize_tool_args, title_tool_name, FooterMode};
+use super::theme::{format_status_notice, title_tool_name, FooterMode};
 use super::transcript::NoticeKind;
+use super::{Action, App, PendingRpc};
 use crate::llm::Llm;
-use super::{Action, App};
+use crate::runtime::workflows::{run_git_diff, EVOLVE_PROMPT};
 
 impl App {
-    pub(super) fn apply_server_msg(&mut self, msg: ServerMsg) {
+    /// Process a message from `twig serve`. Returns `Some(new_sid)` when a `Fork` RPC completes.
+    pub(super) fn apply_server_msg(&mut self, msg: ServerMsg) -> Option<String> {
         match msg {
-            ServerMsg::Event(ev) => self.apply_event(&ev),
+            ServerMsg::Event(ev) => {
+                self.apply_event(&ev);
+                None
+            }
             ServerMsg::Reply { id, result } => {
+                let pending = self.pending_rpcs.remove(&id);
+                if matches!(pending, Some(PendingRpc::Fork)) {
+                    if let Some(new_sid) = result.get("sid").and_then(Value::as_str) {
+                        return Some(new_sid.to_owned());
+                    }
+                }
                 if let Some(sid) = result.get("sid").and_then(Value::as_str) {
                     self.sid = sid.to_owned();
                 }
@@ -79,262 +89,6 @@ impl App {
                 if let Some(env) = result.get("env_summary").and_then(Value::as_str) {
                     self.env_summary = env.to_owned();
                 }
-                if self.history_req == Some(id) {
-                    self.history_req = None;
-                    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
-                        self.transcript.replay_history(messages);
-                    }
-                    if let Some(children) = result.get("child_threads").and_then(Value::as_array) {
-                        self.subagents.clear();
-                        self.subagent_transcripts.clear();
-                        for child in children {
-                            let Some(csid) = child["sid"].as_str().filter(|s| !s.is_empty()) else {
-                                continue;
-                            };
-                            let role = child["role"].as_str().unwrap_or("scout").to_owned();
-                            let model = child["model"].as_str().map(str::to_owned);
-                            let task = child["task"].as_str().unwrap_or("").to_owned();
-                            let turns = child["turns"].as_u64().unwrap_or(0) as u32;
-                            let tool_count = child["tool_count"].as_u64().unwrap_or(0) as u32;
-                            let mut tr = super::transcript::Transcript::new();
-                            if let Some(msgs) = child.get("messages").and_then(Value::as_array) {
-                                tr.replay_history(msgs);
-                            } else if !task.is_empty() {
-                                tr.push_user(task.clone());
-                            }
-                            self.subagent_transcripts.insert(csid.to_owned(), tr);
-                            self.subagents.push(SubagentEntry {
-                                id: csid.to_owned(),
-                                child_sid: Some(csid.to_owned()),
-                                role,
-                                model,
-                                task,
-                                parallel: false,
-                                active_turn: false,
-                                started_at: Instant::now(),
-                                elapsed_secs: Some(0),
-                                status: SubagentStatus::Completed,
-                                error: None,
-                                activity: None,
-                                turns,
-                                tool_count,
-                                trace: Vec::new(),
-                            });
-                        }
-                    }
-                }
-                if self.verify_req == Some(id) {
-                    self.verify_req = None;
-                    let (chain_ok, report) = format_verify_report(&result);
-                    self.transcript.push_notice(
-                        if chain_ok {
-                            NoticeKind::Success
-                        } else {
-                            NoticeKind::Error
-                        },
-                        report,
-                    );
-                }
-                if self.undo_req == Some(id) {
-                    self.undo_req = None;
-                    self.git_stat_dirty = true;
-                    if let Some(summary) = result.get("summary").and_then(Value::as_str) {
-                        self.flash(summary);
-                        self.transcript
-                            .push_notice(NoticeKind::Success, format!("undo: {summary}"));
-                    }
-                }
-                if self.rewind_req == Some(id) {
-                    self.rewind_req = None;
-                    self.git_stat_dirty = true;
-                    let n = result["rewound_turns"].as_u64().unwrap_or(1);
-                    if let Some(messages) = result.get("messages").and_then(Value::as_array) {
-                        self.transcript.clear();
-                        self.transcript.replay_history(messages);
-                    }
-                    self.approvals.clear();
-                    if let Some(prefill) = self.rewind_prefill.take() {
-                        self.composer.set(&prefill);
-                    }
-                    let extra = result["code_restored"]
-                        .as_str()
-                        .map(|s| format!(" · {s}"))
-                        .unwrap_or_default();
-                    self.flash(format!("Rewound {n} turn(s)"));
-                    self.transcript.push_notice(
-                        NoticeKind::Success,
-                        format!("rewound conversation by {n} turn(s){extra}"),
-                    );
-                }
-                if self.mcp_req == Some(id) {
-                    self.mcp_req = None;
-                    if let Some(notice) = result.get("notice").and_then(Value::as_str) {
-                        self.flash(notice);
-                        self.transcript
-                            .push_notice(NoticeKind::Success, notice.to_owned());
-                    }
-                    let report = format_mcp_report(&result);
-                    if report.starts_with("no MCP") {
-                        self.transcript.push_notice(NoticeKind::Info, report);
-                    } else {
-                        self.transcript
-                            .push_notice(NoticeKind::Playbook, "configured MCP servers");
-                        self.transcript.push_assistant(report);
-                    }
-                }
-                if self.blackboard_req == Some(id) {
-                    self.blackboard_req = None;
-                    if let Some(cleared) = result.get("cleared").and_then(Value::as_u64) {
-                        let msg = format!("Cleared {cleared} fact(s) from RCI blackboard");
-                        self.flash(&msg);
-                        self.transcript.push_notice(NoticeKind::Info, msg);
-                    } else {
-                        let facts = result["facts"].as_array().cloned().unwrap_or_default();
-                        if facts.is_empty() {
-                            self.transcript.push_notice(
-                                NoticeKind::Info,
-                                "RCI split-fact blackboard is empty (parallel subagents populate `path:line` facts automatically)",
-                            );
-                        } else {
-                            let body: Vec<String> = facts
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(|f| format!("- {f}"))
-                                .collect();
-                            self.transcript.push_notice(
-                                NoticeKind::Playbook,
-                                format!("RCI split-fact blackboard ({} facts)", body.len()),
-                            );
-                            self.transcript.push_assistant(body.join("\n"));
-                        }
-                    }
-                }
-                if self.tasks_req == Some(id) {
-                    self.tasks_req = None;
-                    if let Some(r) = result.get("running").and_then(Value::as_u64) {
-                        self.running_tasks = r as usize;
-                    }
-                    if let Some(arr) = result.get("tasks").and_then(Value::as_array) {
-                        self.cached_tasks = arr.clone();
-                    }
-                    if self.open_tasks_drawer {
-                        self.open_tasks_drawer = false;
-                        self.overlay_picker = Some(OverlayPicker::tasks(
-                            self.subagents.clone(),
-                            self.cached_tasks.clone(),
-                        ));
-                    } else {
-                        let report = format_tasks_report(&result);
-                        if report.starts_with("no background") {
-                            self.transcript.push_notice(NoticeKind::Info, report);
-                        } else {
-                            self.transcript
-                                .push_notice(NoticeKind::Playbook, "background tasks");
-                            self.transcript.push_assistant(report);
-                        }
-                    }
-                }
-                if self.skills_req == Some(id) {
-                    self.skills_req = None;
-                    let action = result["action"].as_str().unwrap_or("list");
-                    let ok = result["ok"] != false;
-                    let report = result["report"].as_str().unwrap_or("").trim_end();
-                    if matches!(action, "enable" | "disable") {
-                        self.composer.refresh_skills(&self.repo_raw);
-                        self.flash(report);
-                        self.transcript
-                            .push_notice(NoticeKind::Success, report.to_owned());
-                    } else {
-                        self.transcript.push_notice(
-                            if ok {
-                                NoticeKind::Playbook
-                            } else {
-                                NoticeKind::Warn
-                            },
-                            format!("skills · {action}"),
-                        );
-                        if !report.is_empty() {
-                            self.transcript
-                                .push_assistant(format!("```text\n{report}\n```"));
-                        }
-                    }
-                }
-                if self.roles_req == Some(id) {
-                    self.roles_req = None;
-                    let report = result["report"].as_str().unwrap_or("").trim_end();
-                    self.transcript
-                        .push_notice(NoticeKind::Playbook, "multi-model role routing");
-                    if !report.is_empty() {
-                        self.transcript
-                            .push_assistant(format!("```text\n{report}\n```"));
-                    }
-                }
-                if self.btw_req == Some(id) {
-                    self.btw_req = None;
-                    let q = result["question"].as_str().unwrap_or("btw").to_owned();
-                    let ans = result["answer"].as_str().unwrap_or("").to_owned();
-                    self.absorb_usage(&result["usage"]);
-                    self.btw_card = Some(BtwCard {
-                        question: q,
-                        answer: Some(ans),
-                    });
-                }
-                if self.apply_req == Some(id) {
-                    self.apply_req = None;
-                    self.git_stat_dirty = true;
-                    let sum = result["summary"].as_str().unwrap_or("patch applied");
-                    self.flash(sum);
-                    self.transcript.push_notice(
-                        NoticeKind::Success,
-                        format!("{sum} (reversible via `/undo`)"),
-                    );
-                }
-                if self.commit_req == Some(id) {
-                    self.commit_req = None;
-                    self.git_stat_dirty = true;
-                    let sum = result["summary"].as_str().unwrap_or("committed changes");
-                    let full_msg = result["message"].as_str().unwrap_or("");
-                    self.flash(sum);
-                    self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
-                    if full_msg.contains('\n') {
-                        self.transcript
-                            .push_assistant(format!("```text\n{full_msg}\n```"));
-                    }
-                }
-                if self.pr_req == Some(id) {
-                    self.pr_req = None;
-                    self.git_stat_dirty = true;
-                    let sum = result["summary"].as_str().unwrap_or("pull request ready");
-                    self.flash(sum);
-                    self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
-                }
-                if self.worktree_req == Some(id) {
-                    self.worktree_req = None;
-                    if result["action"] == "switched" {
-                        if let Some(wt) = result["worktree"].as_str() {
-                            self.repo_raw = wt.to_owned();
-                            self.repo_path = super::client::shorten_home(wt);
-                            self.repo_label = std::path::Path::new(wt)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| wt.to_owned());
-                            self.git_branch = result["branch"]
-                                .as_str()
-                                .map(str::to_owned)
-                                .or_else(|| super::client::detect_git_branch(wt));
-                            self.composer = super::composer::Composer::new(wt);
-                            self.git_stat_dirty = true;
-                        }
-                        let sum = result["summary"].as_str().unwrap_or("switched worktree");
-                        self.flash(sum);
-                        self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
-                    } else if let Some(rep) = result["report"].as_str() {
-                        self.transcript
-                            .push_notice(NoticeKind::Playbook, "git worktrees");
-                        self.transcript
-                            .push_assistant(format!("```text\n{rep}\n```"));
-                    }
-                }
                 if let Some(compacted) = result.get("compacted").and_then(Value::as_bool) {
                     if !compacted {
                         self.transcript.push_notice(
@@ -343,55 +97,32 @@ impl App {
                         );
                     }
                 }
-                if let Some(pending) = result.get("pending").and_then(Value::as_array) {
-                    for p in pending {
+                if let Some(pending_apps) = result.get("pending").and_then(Value::as_array) {
+                    for p in pending_apps {
                         let _ = self.approvals.push_from_value(p);
                     }
                 }
-                if self.active_turn_req == Some(id) {
-                    self.running = false;
-                    self.run_started = None;
-                    self.last_delta_at = None;
-                    self.active_turn_req = None;
-                    self.git_stat_dirty = true;
-                    if let Some(reason) = result.get("reason").and_then(Value::as_str) {
-                        if reason != "final" {
-                            self.transcript.push_notice(
-                                if reason == "verify_failed" {
-                                    NoticeKind::Error
-                                } else {
-                                    NoticeKind::Warn
-                                },
-                                format!("turn ended: {reason}"),
-                            );
-                        } else if result["verified"] == true {
-                            self.transcript
-                                .push_notice(NoticeKind::Success, "verification passed");
-                        }
-                        self.pending_notify = Some((
-                            "twig".into(),
-                            format!("{} · turn {reason}", self.repo_label),
-                        ));
-                        if reason == "final" && self.approvals.is_empty() {
-                            if !self.todos_updated_in_turn && !self.todos.is_empty() {
-                                self.todos.clear();
-                                self.todos_done_at = None;
-                            }
-                            if let Some(next_q) = self.queued_turns.pop_front() {
-                                self.auto_send_next = Some(next_q);
-                            }
-                        }
-                    }
+                if let Some(kind) = pending {
+                    self.apply_tracked_reply(kind, &result);
                 }
+                None
             }
             ServerMsg::Error { id, message } => {
-                if self.active_turn_req == id {
-                    self.running = false;
-                    self.run_started = None;
-                    self.last_delta_at = None;
-                    self.active_turn_req = None;
+                if let Some(kind) = id.and_then(|i| self.pending_rpcs.remove(&i)) {
+                    match kind {
+                        PendingRpc::Turn => {
+                            self.running = false;
+                            self.run_started = None;
+                            self.last_delta_at = None;
+                        }
+                        PendingRpc::Btw => {
+                            self.btw_card = None;
+                        }
+                        _ => {}
+                    }
                 }
                 self.transcript.push_notice(NoticeKind::Error, message);
+                None
             }
             ServerMsg::Stderr(line) => {
                 if let Some(rest) = line.strip_prefix("twig: ") {
@@ -403,14 +134,267 @@ impl App {
                 } else {
                     self.transcript.push_notice(NoticeKind::Warn, line);
                 }
+                None
             }
             ServerMsg::Exited => {
                 self.running = false;
                 self.run_started = None;
                 self.last_delta_at = None;
+                self.pending_rpcs.clear();
+                self.btw_card = None;
                 self.transcript
                     .push_notice(NoticeKind::Error, "twig serve process exited");
+                None
             }
+        }
+    }
+
+    fn apply_tracked_reply(&mut self, kind: PendingRpc, result: &Value) {
+        match kind {
+            PendingRpc::History => {
+                if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+                    self.transcript.replay_history(messages);
+                }
+                if let Some(children) = result.get("child_threads").and_then(Value::as_array) {
+                    self.subagents.clear();
+                    self.subagent_transcripts.clear();
+                    for child in children {
+                        let Some(entry) = SubagentEntry::from_history_json(child) else {
+                            continue;
+                        };
+                        let mut tr = super::transcript::Transcript::new();
+                        if let Some(msgs) = child.get("messages").and_then(Value::as_array) {
+                            tr.replay_history(msgs);
+                        } else if !entry.task.is_empty() {
+                            tr.push_user(entry.task.clone());
+                        }
+                        self.subagent_transcripts.insert(entry.id.clone(), tr);
+                        self.subagents.push(entry);
+                    }
+                }
+            }
+            PendingRpc::Verify => {
+                let (chain_ok, report) = format_verify_report(result);
+                self.transcript.push_notice(
+                    if chain_ok {
+                        NoticeKind::Success
+                    } else {
+                        NoticeKind::Error
+                    },
+                    report,
+                );
+            }
+            PendingRpc::Undo => {
+                self.git_stat_dirty = true;
+                if let Some(summary) = result.get("summary").and_then(Value::as_str) {
+                    self.flash(summary);
+                    self.transcript
+                        .push_notice(NoticeKind::Success, format!("undo: {summary}"));
+                }
+            }
+            PendingRpc::Rewind { prefill } => {
+                self.git_stat_dirty = true;
+                let n = result["rewound_turns"].as_u64().unwrap_or(1);
+                if let Some(messages) = result.get("messages").and_then(Value::as_array) {
+                    self.transcript.clear();
+                    self.transcript.replay_history(messages);
+                }
+                self.approvals.clear();
+                if let Some(prompt) = prefill {
+                    self.composer.set(&prompt);
+                }
+                let extra = result["code_restored"]
+                    .as_str()
+                    .map(|s| format!(" · {s}"))
+                    .unwrap_or_default();
+                self.flash(format!("Rewound {n} turn(s)"));
+                self.transcript.push_notice(
+                    NoticeKind::Success,
+                    format!("rewound conversation by {n} turn(s){extra}"),
+                );
+            }
+            PendingRpc::Mcp => {
+                if let Some(notice) = result.get("notice").and_then(Value::as_str) {
+                    self.flash(notice);
+                    self.transcript
+                        .push_notice(NoticeKind::Success, notice.to_owned());
+                }
+                let report = format_mcp_report(result);
+                if report.starts_with("no MCP") {
+                    self.transcript.push_notice(NoticeKind::Info, report);
+                } else {
+                    self.transcript
+                        .push_notice(NoticeKind::Playbook, "configured MCP servers");
+                    self.transcript.push_assistant(report);
+                }
+            }
+            PendingRpc::Blackboard => {
+                if let Some(cleared) = result.get("cleared").and_then(Value::as_u64) {
+                    let msg = format!("Cleared {cleared} fact(s) from RCI blackboard");
+                    self.flash(&msg);
+                    self.transcript.push_notice(NoticeKind::Info, msg);
+                } else {
+                    let facts = result["facts"].as_array().cloned().unwrap_or_default();
+                    if facts.is_empty() {
+                        self.transcript.push_notice(
+                            NoticeKind::Info,
+                            "RCI split-fact blackboard is empty (parallel subagents populate `path:line` facts automatically)",
+                        );
+                    } else {
+                        let body: Vec<String> = facts
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|f| format!("- {f}"))
+                            .collect();
+                        self.transcript.push_notice(
+                            NoticeKind::Playbook,
+                            format!("RCI split-fact blackboard ({} facts)", body.len()),
+                        );
+                        self.transcript.push_assistant(body.join("\n"));
+                    }
+                }
+            }
+            PendingRpc::Tasks { open_drawer } => {
+                if let Some(r) = result.get("running").and_then(Value::as_u64) {
+                    self.running_tasks = r as usize;
+                }
+                if let Some(arr) = result.get("tasks").and_then(Value::as_array) {
+                    self.cached_tasks = arr.clone();
+                }
+                if open_drawer {
+                    self.overlay_picker = Some(OverlayPicker::tasks(
+                        self.subagents.clone(),
+                        self.cached_tasks.clone(),
+                    ));
+                } else {
+                    let report = format_tasks_report(result);
+                    if report.starts_with("no background") {
+                        self.transcript.push_notice(NoticeKind::Info, report);
+                    } else {
+                        self.transcript
+                            .push_notice(NoticeKind::Playbook, "background tasks");
+                        self.transcript.push_assistant(report);
+                    }
+                }
+            }
+            PendingRpc::Skills => {
+                let action = result["action"].as_str().unwrap_or("list");
+                let ok = result["ok"] != false;
+                let report = result["report"].as_str().unwrap_or("").trim_end();
+                if matches!(action, "enable" | "disable") {
+                    self.composer.refresh_skills(&self.repo_raw);
+                    self.flash(report);
+                    self.transcript
+                        .push_notice(NoticeKind::Success, report.to_owned());
+                } else {
+                    self.transcript.push_notice(
+                        if ok {
+                            NoticeKind::Playbook
+                        } else {
+                            NoticeKind::Warn
+                        },
+                        format!("skills · {action}"),
+                    );
+                    if !report.is_empty() {
+                        self.transcript
+                            .push_assistant(format!("```text\n{report}\n```"));
+                    }
+                }
+            }
+            PendingRpc::Roles => {
+                let report = result["report"].as_str().unwrap_or("").trim_end();
+                self.transcript
+                    .push_notice(NoticeKind::Playbook, "multi-model role routing");
+                if !report.is_empty() {
+                    self.transcript
+                        .push_assistant(format!("```text\n{report}\n```"));
+                }
+            }
+            PendingRpc::Btw => {
+                let q = result["question"].as_str().unwrap_or("btw").to_owned();
+                let ans = result["answer"].as_str().unwrap_or("").to_owned();
+                self.absorb_usage(&result["usage"]);
+                self.btw_card = Some(BtwCard {
+                    question: q,
+                    answer: Some(ans),
+                });
+            }
+            PendingRpc::Apply => {
+                self.git_stat_dirty = true;
+                let sum = result["summary"].as_str().unwrap_or("patch applied");
+                self.flash(sum);
+                self.transcript.push_notice(
+                    NoticeKind::Success,
+                    format!("{sum} (reversible via `/undo`)"),
+                );
+            }
+            PendingRpc::Commit => {
+                self.git_stat_dirty = true;
+                let sum = result["summary"].as_str().unwrap_or("committed changes");
+                let full_msg = result["message"].as_str().unwrap_or("");
+                self.flash(sum);
+                self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
+                if full_msg.contains('\n') {
+                    self.transcript
+                        .push_assistant(format!("```text\n{full_msg}\n```"));
+                }
+            }
+            PendingRpc::Pr => {
+                self.git_stat_dirty = true;
+                let sum = result["summary"].as_str().unwrap_or("pull request ready");
+                self.flash(sum);
+                self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
+            }
+            PendingRpc::Worktree => {
+                if result["action"] == "switched" {
+                    if let Some(wt) = result["worktree"].as_str() {
+                        self.set_workspace_repo(wt, result["branch"].as_str().map(str::to_owned));
+                    }
+                    let sum = result["summary"].as_str().unwrap_or("switched worktree");
+                    self.flash(sum);
+                    self.transcript.push_notice(NoticeKind::Success, sum.to_owned());
+                } else if let Some(rep) = result["report"].as_str() {
+                    self.transcript
+                        .push_notice(NoticeKind::Playbook, "git worktrees");
+                    self.transcript
+                        .push_assistant(format!("```text\n{rep}\n```"));
+                }
+            }
+            PendingRpc::Turn => {
+                self.running = false;
+                self.run_started = None;
+                self.last_delta_at = None;
+                self.git_stat_dirty = true;
+                if let Some(reason) = result.get("reason").and_then(Value::as_str) {
+                    if reason != "final" {
+                        self.transcript.push_notice(
+                            if reason == "verify_failed" {
+                                NoticeKind::Error
+                            } else {
+                                NoticeKind::Warn
+                            },
+                            format!("turn ended: {reason}"),
+                        );
+                    } else if result["verified"] == true {
+                        self.transcript
+                            .push_notice(NoticeKind::Success, "verification passed");
+                    }
+                    self.pending_notify = Some((
+                        "twig".into(),
+                        format!("{} · turn {reason}", self.repo_label),
+                    ));
+                    if reason == "final" && self.approvals.is_empty() {
+                        if !self.todos_updated_in_turn && !self.todos.is_empty() {
+                            self.todos.clear();
+                            self.todos_done_at = None;
+                        }
+                        if let Some(next_q) = self.queued_turns.pop_front() {
+                            self.auto_send_next = Some(next_q);
+                        }
+                    }
+                }
+            }
+            PendingRpc::Fork => {}
         }
     }
 
@@ -517,51 +501,22 @@ impl App {
                     self.context_max = m as usize;
                 }
             }
-            Some("model.reasoning") => {
-                let delta = ev["text"].as_str().unwrap_or("");
-                if !delta.is_empty() {
+            Some(
+                kind @ ("model.reasoning"
+                | "model.delta"
+                | "tool.started"
+                | "tool.output"
+                | "tool.completed"
+                | "model.retry"),
+            ) => {
+                if matches!(kind, "model.reasoning" | "model.delta")
+                    && ev["text"].as_str().is_some_and(|s| !s.is_empty())
+                {
                     self.last_delta_at = Some(Instant::now());
-                    self.transcript.append_reasoning_delta(delta);
                 }
-            }
-            Some("model.retry") => {
-                let attempt = ev["attempt"].as_u64().unwrap_or(1);
-                let secs = ev["backoff_secs"].as_u64().unwrap_or(1);
-                self.transcript.push_notice(
-                    NoticeKind::Warn,
-                    format!(
-                        "model transient error — retrying (attempt {attempt}, {secs}s backoff)…"
-                    ),
-                );
-            }
-            Some("model.delta") => {
-                let delta = ev["text"].as_str().unwrap_or("");
-                if !delta.is_empty() {
-                    self.last_delta_at = Some(Instant::now());
-                    self.transcript.append_assistant_delta(delta);
+                if let Some(tool_name) = self.transcript.apply_stream_event(ev) {
+                    self.update_status_header(format!("Running {}", title_tool_name(&tool_name)));
                 }
-            }
-            Some("tool.started") => {
-                let id = ev["id"].as_str().unwrap_or("").to_owned();
-                let name = ev["tool"].as_str().unwrap_or("tool").to_owned();
-                let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
-                let summary = summarize_tool_args(&name, &ev["args"]);
-                self.update_status_header(format!("Running {}", title_tool_name(&name)));
-                self.transcript.push_tool_started(id, name, summary, tier);
-            }
-            Some("tool.output") => {
-                self.transcript.append_tool_output(
-                    ev["id"].as_str().unwrap_or(""),
-                    ev["text"].as_str().unwrap_or(""),
-                );
-            }
-            Some("tool.completed") => {
-                self.transcript.finish_tool(
-                    ev["id"].as_str().unwrap_or(""),
-                    None,
-                    ev["exit_code"].as_i64().map(|c| c as i32),
-                    None,
-                );
             }
             Some("approval.requested") => {
                 if let Some((name, summary)) = self.approvals.push_from_value(ev) {
@@ -656,42 +611,20 @@ impl App {
             }
             Some("subagent.started") => {
                 let raw_id = ev["id"].as_str().unwrap_or("");
-                let role = ev["role"].as_str().unwrap_or("subagent").to_owned();
-                let model = ev["model"].as_str().map(str::to_owned);
-                let child_sid = ev["sid"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
+                let role = ev["role"].as_str().unwrap_or("subagent");
                 let id = if raw_id.is_empty() {
                     format!("{role}-{}", self.subagents.len() + 1)
                 } else {
                     raw_id.to_owned()
                 };
-                let task = ev["task"].as_str().unwrap_or("").trim().to_owned();
-                let parallel = ev["parallel"] == true;
-                self.update_status_header(format!("Subagent [{role}]"));
+                let entry = SubagentEntry::from_started(id.clone(), ev);
+                self.update_status_header(format!("Subagent [{}]", entry.role));
                 let mut child_tr = super::transcript::Transcript::new();
-                if !task.is_empty() {
-                    child_tr.push_user(task.clone());
+                if !entry.task.is_empty() {
+                    child_tr.push_user(entry.task.clone());
                 }
-                self.subagent_transcripts.insert(id.clone(), child_tr);
-                self.subagents.push(SubagentEntry {
-                    id,
-                    child_sid,
-                    role,
-                    model,
-                    task,
-                    parallel,
-                    active_turn: true,
-                    started_at: Instant::now(),
-                    elapsed_secs: None,
-                    status: SubagentStatus::Running,
-                    error: None,
-                    activity: None,
-                    turns: 0,
-                    tool_count: 0,
-                    trace: Vec::new(),
-                });
+                self.subagent_transcripts.insert(id, child_tr);
+                self.subagents.push(entry);
                 if self.subagents.len() > 16 {
                     let drop_n = self.subagents.len() - 16;
                     for dropped in self.subagents.drain(..drop_n) {
@@ -700,55 +633,14 @@ impl App {
                         }
                     }
                 }
-                if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
-                    *subagents = self.subagents.clone();
-                }
+                self.sync_tasks_overlay();
             }
             Some("subagent.progress") => {
                 let id = ev["id"].as_str().unwrap_or("");
                 let role = ev["role"].as_str().unwrap_or("subagent");
-                let child_sid = ev["sid"].as_str().filter(|s| !s.is_empty());
-                let activity = ev["activity"].as_str().unwrap_or("").trim();
-                let turns = ev["turns"].as_u64().unwrap_or(0) as u32;
-                let tool_count = ev["tool_count"].as_u64().unwrap_or(0) as u32;
-                let match_idx = (!id.is_empty())
-                    .then(|| {
-                        self.subagents
-                            .iter()
-                            .position(|s| s.status == SubagentStatus::Running && s.id == id)
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        self.subagents
-                            .iter()
-                            .position(|s| s.status == SubagentStatus::Running && s.role == role)
-                    });
-                if let Some(idx) = match_idx {
-                    let entry = &mut self.subagents[idx];
-                    if let Some(csid) = child_sid {
-                        entry.child_sid = Some(csid.to_owned());
-                    }
-                    if turns > entry.turns {
-                        entry.turns = turns;
-                    }
-                    if tool_count > entry.tool_count {
-                        entry.tool_count = tool_count;
-                    }
-                    if !activity.is_empty() {
-                        entry.activity = Some(activity.to_owned());
-                        if !activity.starts_with("thinking")
-                            && !activity.starts_with("starting")
-                            && entry.trace.last().map(String::as_str) != Some(activity)
-                        {
-                            entry.trace.push(activity.to_owned());
-                            if entry.trace.len() > 6 {
-                                entry.trace.remove(0);
-                            }
-                        }
-                    }
-                    if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
-                        *subagents = self.subagents.clone();
-                    }
+                if let Some(idx) = self.find_running_subagent(id, role) {
+                    self.subagents[idx].apply_progress(ev);
+                    self.sync_tasks_overlay();
                 }
             }
             Some("subagent.stream") => {
@@ -764,9 +656,8 @@ impl App {
                         .map(|s| s.id.clone())
                 };
                 if let Some(k) = key {
-                    let child = &ev["child"];
                     if let Some(tr) = self.subagent_transcripts.get_mut(&k) {
-                        apply_child_stream_event(tr, child);
+                        let _ = tr.apply_stream_event(&ev["child"]);
                     }
                 }
             }
@@ -787,23 +678,11 @@ impl App {
                 } else {
                     SubagentStatus::Failed
                 };
-                let match_idx = (!id.is_empty())
-                    .then(|| {
-                        self.subagents
-                            .iter()
-                            .position(|s| s.status == SubagentStatus::Running && s.id == id)
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        self.subagents
-                            .iter()
-                            .position(|s| s.status == SubagentStatus::Running && s.role == role)
-                    })
-                    .or_else(|| {
-                        self.subagents
-                            .iter()
-                            .position(|s| s.status == SubagentStatus::Running)
-                    });
+                let match_idx = self.find_running_subagent(id, role).or_else(|| {
+                    self.subagents
+                        .iter()
+                        .position(|s| s.status == SubagentStatus::Running)
+                });
                 let (done_id, resolved_sid) = if let Some(idx) = match_idx {
                     if let Some(csid) = child_sid {
                         self.subagents[idx].child_sid = Some(csid.to_owned());
@@ -825,24 +704,12 @@ impl App {
                     } else {
                         id.to_owned()
                     };
-                    let csid = child_sid.map(str::to_owned);
-                    self.subagents.push(SubagentEntry {
-                        id: fallback_id.clone(),
-                        child_sid: csid.clone(),
-                        role: role.to_owned(),
-                        model,
-                        task: String::new(),
-                        parallel: false,
-                        active_turn: true,
-                        started_at: Instant::now(),
-                        elapsed_secs: Some(secs),
-                        status: next_status,
-                        error: err_note.clone(),
-                        activity: None,
-                        turns: 0,
-                        tool_count: 0,
-                        trace: Vec::new(),
-                    });
+                    let mut entry = SubagentEntry::from_started(fallback_id.clone(), ev);
+                    entry.status = next_status;
+                    entry.elapsed_secs = Some(secs);
+                    entry.error = err_note.clone();
+                    let csid = entry.child_sid.clone();
+                    self.subagents.push(entry);
                     (fallback_id, csid)
                 };
                 if has_patch {
@@ -870,9 +737,7 @@ impl App {
                         );
                     }
                 }
-                if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
-                    *subagents = self.subagents.clone();
-                }
+                self.sync_tasks_overlay();
             }
             Some("task.started") => {
                 let id = ev["id"].as_str().unwrap_or("bg");
@@ -948,6 +813,27 @@ impl App {
                     .push_notice(NoticeKind::Info, format!("papercut filed · {comp}"));
             }
             _ => {}
+        }
+    }
+
+    fn find_running_subagent(&self, id: &str, role: &str) -> Option<usize> {
+        (!id.is_empty())
+            .then(|| {
+                self.subagents
+                    .iter()
+                    .position(|s| s.status == SubagentStatus::Running && s.id == id)
+            })
+            .flatten()
+            .or_else(|| {
+                self.subagents
+                    .iter()
+                    .position(|s| s.status == SubagentStatus::Running && s.role == role)
+            })
+    }
+
+    fn sync_tasks_overlay(&mut self) {
+        if let Some(OverlayPicker::Tasks { subagents, .. }) = &mut self.overlay_picker {
+            *subagents = self.subagents.clone();
         }
     }
 
@@ -1076,10 +962,7 @@ impl App {
                             NoticeKind::Playbook,
                             "evolve: requesting human-reviewed .twig/preferences or skill proposal…",
                         );
-                        self.running = true;
-                        self.run_started = Some(Instant::now());
-                        self.update_status_header(String::from("Reflecting"));
-                        Action::SendTurn(EVOLVE_PROMPT.to_owned())
+                        self.begin_turn(EVOLVE_PROMPT.to_owned(), "Reflecting", None, false)
                     }
                 }
                 SlashCommand::ClearImages => {
@@ -1196,12 +1079,7 @@ impl App {
             return Action::SendSteer(text);
         }
 
-        let text = trimmed.to_owned();
-        self.transcript.push_user(text.clone());
-        self.running = true;
-        self.run_started = Some(Instant::now());
-        self.update_status_header(String::from("Thinking"));
-        Action::SendTurn(text)
+        self.begin_turn(trimmed.to_owned(), "Thinking", None, true)
     }
 
     pub(super) fn handle_slash_io(
@@ -1218,18 +1096,25 @@ impl App {
                 }
             }
             SlashCommand::ForkSession => {
-                self.fork_req =
-                    self.send_rpc(client, "session.fork", json!({}), "Forking session…");
+                self.send_tracked_rpc(
+                    client,
+                    "session.fork",
+                    json!({}),
+                    "Forking session…",
+                    PendingRpc::Fork,
+                );
             }
             SlashCommand::RewindSession {
                 turns,
                 restore_code,
+                prefill,
             } => {
-                self.rewind_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "session.rewind",
                     json!({"turns": turns, "restore_code": restore_code}),
                     &format!("Rewinding {turns} turn(s)…"),
+                    PendingRpc::Rewind { prefill },
                 );
             }
             SlashCommand::RenameSession(title) => {
@@ -1266,73 +1151,77 @@ impl App {
                 workers.spawn_models();
             }
             SlashCommand::UndoEdit => {
-                self.undo_req =
-                    self.send_rpc(client, "edit.undo", json!({}), "Reverting last edit…");
+                self.send_tracked_rpc(
+                    client,
+                    "edit.undo",
+                    json!({}),
+                    "Reverting last edit…",
+                    PendingRpc::Undo,
+                );
             }
-            SlashCommand::SwitchAgent(target) => {
-                match target.as_deref() {
-                    Some("main" | "parent" | "root") => {
-                        self.viewing_subagent = None;
-                        self.flash("Returned to main session");
-                    }
-                    Some(q) => {
-                        let found = self
-                            .subagents
-                            .iter()
-                            .rev()
-                            .find(|s| {
-                                s.id == q
-                                    || s.child_sid.as_deref() == Some(q)
-                                    || s.role.eq_ignore_ascii_case(q)
-                            })
-                            .map(|s| s.id.clone());
-                        if let Some(id) = found {
-                            self.viewing_subagent = Some(id);
-                        } else {
-                            self.flash(format!("No subagent matching `{q}`"));
-                        }
-                    }
-                    None => {
-                        if self.subagents.is_empty() {
-                            self.transcript.push_notice(
-                                NoticeKind::Info,
-                                "no subagents in this session yet (press Ctrl+T for tasks)",
-                            );
-                        } else if self.subagents.len() == 1 {
-                            if self.viewing_subagent.is_some() {
-                                self.viewing_subagent = None;
-                                self.flash("Returned to main session");
-                            } else {
-                                self.viewing_subagent = Some(self.subagents[0].id.clone());
-                            }
-                        } else {
-                            self.overlay_picker = Some(OverlayPicker::tasks(
-                                self.subagents.clone(),
-                                self.cached_tasks.clone(),
-                            ));
-                        }
+            SlashCommand::SwitchAgent(target) => match target.as_deref() {
+                Some("main" | "parent" | "root") => {
+                    self.viewing_subagent = None;
+                    self.flash("Returned to main session");
+                }
+                Some(q) => {
+                    let found = self
+                        .subagents
+                        .iter()
+                        .rev()
+                        .find(|s| {
+                            s.id == q
+                                || s.child_sid.as_deref() == Some(q)
+                                || s.role.eq_ignore_ascii_case(q)
+                        })
+                        .map(|s| s.id.clone());
+                    if let Some(id) = found {
+                        self.viewing_subagent = Some(id);
+                    } else {
+                        self.flash(format!("No subagent matching `{q}`"));
                     }
                 }
-            }
-            SlashCommand::ListTasks => {
-                self.tasks_req = self.send_rpc(
+                None => {
+                    if self.subagents.is_empty() {
+                        self.transcript.push_notice(
+                            NoticeKind::Info,
+                            "no subagents in this session yet (press Ctrl+T for tasks)",
+                        );
+                    } else if self.subagents.len() == 1 {
+                        if self.viewing_subagent.is_some() {
+                            self.viewing_subagent = None;
+                            self.flash("Returned to main session");
+                        } else {
+                            self.viewing_subagent = Some(self.subagents[0].id.clone());
+                        }
+                    } else {
+                        self.overlay_picker = Some(OverlayPicker::tasks(
+                            self.subagents.clone(),
+                            self.cached_tasks.clone(),
+                        ));
+                    }
+                }
+            },
+            SlashCommand::ListTasks { open_drawer } => {
+                self.send_tracked_rpc(
                     client,
                     "tasks.list",
                     json!({}),
-                    if self.open_tasks_drawer {
+                    if open_drawer {
                         ""
                     } else {
                         "Listing background tasks…"
                     },
+                    PendingRpc::Tasks { open_drawer },
                 );
             }
             SlashCommand::CancelTask(task_id) => {
-                self.open_tasks_drawer = true;
-                self.tasks_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "tasks.cancel",
                     json!({"id": task_id}),
                     &format!("Cancelled background task {task_id}"),
+                    PendingRpc::Tasks { open_drawer: true },
                 );
             }
             SlashCommand::ManageSkills {
@@ -1340,36 +1229,45 @@ impl App {
                 name,
                 project,
             } => {
-                self.skills_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "skill.manage",
                     json!({"action": action, "name": name, "project": project}),
                     &format!("Skills: {action}…"),
+                    PendingRpc::Skills,
                 );
             }
             SlashCommand::ManageMcp { action, server } => {
                 let flash_msg = match action.as_str() {
-                    "init_rea" => "Registering `rea` MCP in .twig/mcp.json (disabled by default)…".to_owned(),
+                    "init_rea" => {
+                        "Registering `rea` MCP in .twig/mcp.json (disabled by default)…".to_owned()
+                    }
                     "enable" | "disable" => format!(
                         "{} MCP server `{}`…",
-                        if action == "enable" { "Enabling" } else { "Disabling" },
+                        if action == "enable" {
+                            "Enabling"
+                        } else {
+                            "Disabling"
+                        },
                         server.as_deref().unwrap_or("")
                     ),
                     _ => "Checking MCP servers…".to_owned(),
                 };
-                self.mcp_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "mcp.list",
                     json!({"action": action, "server": server}),
                     &flash_msg,
+                    PendingRpc::Mcp,
                 );
             }
             SlashCommand::Blackboard { action, fact } => {
-                self.blackboard_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "blackboard",
                     json!({"action": action, "fact": fact}),
                     "",
+                    PendingRpc::Blackboard,
                 );
             }
             SlashCommand::RunRci(sub) => {
@@ -1425,11 +1323,12 @@ impl App {
                 self.send_rpc(client, "session.compact", json!({}), "Compacting context…");
             }
             SlashCommand::VerifySession => {
-                self.verify_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "session.verify",
                     json!({}),
                     "Verifying session hash chain…",
+                    PendingRpc::Verify,
                 );
             }
             SlashCommand::EditMemory => match ensure_memory_file(&self.repo_raw) {
@@ -1530,11 +1429,12 @@ impl App {
                     question: q.clone(),
                     answer: None,
                 });
-                self.btw_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "session.btw",
                     json!({"question": q}),
                     "",
+                    PendingRpc::Btw,
                 );
             }
             SlashCommand::ExecutePlan(extra) => {
@@ -1562,39 +1462,25 @@ impl App {
                     NoticeKind::Playbook,
                     format!("handoff `/go` → write access enabled · executing with `{code_model}`"),
                 );
-                self.transcript.push_user(prompt.clone());
-                self.running = true;
-                self.run_started = Some(Instant::now());
-                self.update_status_header(String::from("Implementing"));
-                let (mut params, _) = super::client::build_turn_params(
-                    &self.repo_raw,
-                    prompt,
-                    std::mem::take(&mut self.pending_images),
-                    self.last_shell.as_ref(),
-                );
-                params["role"] = json!("code");
-                match client.send("turn", params) {
-                    Ok(id) => self.active_turn_req = Some(id),
-                    Err(e) => {
-                        self.running = false;
-                        self.transcript.push_notice(NoticeKind::Error, e);
-                    }
-                }
+                let act = self.begin_turn(prompt, "Implementing", Some("code"), true);
+                let _ = self.handle_action(act, terminal, client, workers)?;
             }
             SlashCommand::CommitChanges(hint) => {
-                self.commit_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "git.commit",
                     json!({"hint": hint}),
                     "Generating commit message & committing…",
+                    PendingRpc::Commit,
                 );
             }
             SlashCommand::CreatePr(arg) => {
-                self.pr_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "git.pr",
                     json!({"arg": arg}),
                     "Committing, pushing & opening Pull Request…",
+                    PendingRpc::Pr,
                 );
             }
             SlashCommand::ManageWorktree(arg) => {
@@ -1603,11 +1489,12 @@ impl App {
                     Some("back" | "main") => "Handing session back to primary checkout…".to_owned(),
                     Some(name) => format!("Live handoff to isolated worktree `{name}`…"),
                 };
-                self.worktree_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "git.worktree",
                     json!({"arg": arg}),
                     &flash,
+                    PendingRpc::Worktree,
                 );
             }
             SlashCommand::QueueFollowUp(arg) => match arg.as_deref() {
@@ -1651,11 +1538,12 @@ impl App {
                 }
             },
             SlashCommand::ApplySession(sid) => {
-                self.apply_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "session.apply",
                     json!({"sid": sid}),
                     &format!("Applying patch from {sid}…"),
+                    PendingRpc::Apply,
                 );
             }
             SlashCommand::GcSessions => {
@@ -1671,15 +1559,21 @@ impl App {
                 }
             }
             SlashCommand::ShowRoles => {
-                self.roles_req =
-                    self.send_rpc(client, "roles.get", json!({}), "Checking role routing…");
+                self.send_tracked_rpc(
+                    client,
+                    "roles.get",
+                    json!({}),
+                    "Checking role routing…",
+                    PendingRpc::Roles,
+                );
             }
             SlashCommand::ResetRoles => {
-                self.roles_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "roles.set",
                     json!({"action": "reset"}),
                     "Resetting role routing…",
+                    PendingRpc::Roles,
                 );
             }
             SlashCommand::SetRole {
@@ -1687,11 +1581,12 @@ impl App {
                 model,
                 effort,
             } => {
-                self.roles_req = self.send_rpc(
+                self.send_tracked_rpc(
                     client,
                     "roles.set",
                     json!({"role": role, "model": model, "effort": effort}),
                     &format!("Updating role `{role}`…"),
+                    PendingRpc::Roles,
                 );
             }
             SlashCommand::SetOperator(opt) => {
@@ -1734,24 +1629,8 @@ impl App {
                         NoticeKind::Playbook,
                         format!("REA Study mode ON · studying `{goal}`"),
                     );
-                    self.transcript.push_user(prompt.clone());
-                    self.running = true;
-                    self.run_started = Some(Instant::now());
-                    self.update_status_header(String::from("Studying"));
-                    let (mut params, _) = super::client::build_turn_params(
-                        &self.repo_raw,
-                        prompt,
-                        std::mem::take(&mut self.pending_images),
-                        self.last_shell.as_ref(),
-                    );
-                    params["role"] = json!(role);
-                    match client.send("turn", params) {
-                        Ok(id) => self.active_turn_req = Some(id),
-                        Err(e) => {
-                            self.running = false;
-                            self.transcript.push_notice(NoticeKind::Error, e);
-                        }
-                    }
+                    let act = self.begin_turn(prompt, "Studying", Some(role), true);
+                    let _ = self.handle_action(act, terminal, client, workers)?;
                 } else {
                     let msg = if next {
                         "REA Study mode ON (Observed/Derived/Inferred/Unknown provenance active · `/study off` disables)"
@@ -1765,207 +1644,5 @@ impl App {
             _ => {}
         }
         Ok(())
-    }
-}
-
-fn apply_child_stream_event(tr: &mut super::transcript::Transcript, ev: &Value) {
-    match ev["ev"].as_str() {
-        Some("model.reasoning") => {
-            if let Some(d) = ev["text"].as_str() {
-                tr.append_reasoning_delta(d);
-            }
-        }
-        Some("model.delta") => {
-            if let Some(d) = ev["text"].as_str() {
-                tr.append_assistant_delta(d);
-            }
-        }
-        Some("tool.started") => {
-            let id = ev["id"].as_str().unwrap_or("").to_owned();
-            let name = ev["tool"].as_str().unwrap_or("tool").to_owned();
-            let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
-            let summary = summarize_tool_args(&name, &ev["args"]);
-            tr.push_tool_started(id, name, summary, tier);
-        }
-        Some("tool.output") => {
-            tr.append_tool_output(
-                ev["id"].as_str().unwrap_or(""),
-                ev["text"].as_str().unwrap_or(""),
-            );
-        }
-        Some("tool.completed") => {
-            tr.finish_tool(
-                ev["id"].as_str().unwrap_or(""),
-                None,
-                ev["exit_code"].as_i64().map(|c| c as i32),
-                None,
-            );
-        }
-        Some("model.retry") => {
-            let attempt = ev["attempt"].as_u64().unwrap_or(1);
-            let secs = ev["backoff_secs"].as_u64().unwrap_or(1);
-            tr.push_notice(
-                NoticeKind::Warn,
-                format!("model transient error — retrying (attempt {attempt}, {secs}s)…"),
-            );
-        }
-        _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tui::theme::MotionMode;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use ratatui::backend::TestBackend;
-
-    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
-    }
-
-    fn render_text(app: &mut App, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect()
-    }
-
-    #[test]
-    fn subagent_thread_tree_interactive_chat_mouse_copy_and_todo_lifecycle_work() {
-        let mut app = App::new(".");
-        app.motion = MotionMode::Reduced;
-
-        // 1. Live subagent stream + 0-token parent isolation + interactive follow-up turn
-        let cells_before = app.transcript.len();
-        app.apply_event(&json!({
-            "ev": "subagent.started", "id": "sub-1", "role": "scout", "task": "Map tui modules", "parallel": true
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.started", "id": "sub-2", "role": "code", "task": "Fix web timeout", "parallel": true
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.progress", "id": "sub-1", "sid": "scout-sid-1", "role": "scout",
-            "activity": "Read(src/tui/mod.rs)", "turns": 2, "tool_count": 5
-        }));
-        app.apply_event(&json!({
-            "ev": "subagent.stream", "id": "sub-1", "role": "scout",
-            "child": {"ev": "model.delta", "text": "Subagent-1 live finding: TUI uses Ratatui."}
-        }));
-        assert_eq!(app.transcript.len(), cells_before);
-        assert!(render_text(&mut app, 128, 28).contains("Read(src/tui/mod.rs) · 5 tools · t2"));
-
-        app.apply_event(&json!({
-            "ev": "subagent.completed", "id": "sub-1", "sid": "scout-sid-1", "role": "scout", "ok": true, "elapsed_secs": 3
-        }));
-        app.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
-        app.handle_key(press(KeyCode::Char('v'), KeyModifiers::NONE));
-        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-1"));
-
-        // Direct interactive follow-up inside viewed subagent thread!
-        for ch in "Check line 120 too".chars() {
-            app.handle_key(press(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        assert_eq!(
-            app.handle_key(press(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::SendSubagentTurn {
-                id: "sub-1".into(),
-                child_sid: "scout-sid-1".into(),
-                role: "scout".into(),
-                model: None,
-                input: "Check line 120 too".into(),
-            }
-        );
-        app.handle_key(press(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.viewing_subagent.as_deref(), Some("sub-2"));
-        app.handle_key(press(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.viewing_subagent.is_none());
-
-        // 2. Persistent child_threads remount via `session.history`
-        app.history_req = Some(42);
-        app.apply_server_msg(ServerMsg::Reply {
-            id: 42,
-            result: json!({
-                "sid": "main-99",
-                "messages": [{"role": "user", "content": "audit"}],
-                "child_threads": [{
-                    "sid": "scout-restored",
-                    "role": "scout",
-                    "task": "Audit MCP",
-                    "turns": 1,
-                    "tool_count": 3,
-                    "messages": [
-                        {"role": "user", "content": "Audit MCP"},
-                        {"role": "assistant", "content": "MCP findings ready."}
-                    ]
-                }]
-            }),
-        });
-        assert_eq!(app.subagents.len(), 1);
-        app.viewing_subagent = Some("scout-restored".into());
-        assert!(render_text(&mut app, 110, 24).contains("MCP findings ready."));
-        app.viewing_subagent = None;
-
-        // 3. Plan progress (`todo`) idle state + `+1 more` + follow-up cleanup
-        app.running = true;
-        app.apply_event(&json!({
-            "ev": "todo.updated",
-            "items": [
-                {"content": "Step A", "status": "completed"},
-                {"content": "Step B", "status": "in_progress"},
-                {"content": "Step C", "status": "pending"},
-                {"content": "Step D", "status": "pending"},
-                {"content": "Step E", "status": "pending"}
-            ]
-        }));
-        app.running = false;
-        let idle_todo = render_text(&mut app, 110, 26);
-        assert!(idle_todo.contains("Plan progress  1/5  · idle  · +1 more") && idle_todo.contains("◐ Step B"));
-        // Follow-up turn finishing without updating todo clears stale checklist
-        app.todos_updated_in_turn = false;
-        app.active_turn_req = Some(77);
-        app.apply_server_msg(ServerMsg::Reply {
-            id: 77,
-            result: json!({"done": true, "reason": "final", "text": "All done"}),
-        });
-        assert!(app.todos.is_empty());
-
-        // 4. Native mouse drag-selection auto-copy + scroll retention
-        app.transcript.clear();
-        for i in 0..30 {
-            app.transcript.push_user(format!("Prompt line {i}"));
-            app.transcript.push_assistant(format!("Answer line {i}"));
-        }
-        let _ = render_text(&mut app, 100, 24);
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        });
-        app.handle_mouse(MouseEvent {
-            kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 18,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert!(matches!(
-            app.handle_mouse(MouseEvent {
-                kind: MouseEventKind::Up(MouseButton::Left),
-                column: 18,
-                row: 2,
-                modifiers: KeyModifiers::NONE,
-            }),
-            Action::CopyCode(_)
-        ));
-        app.handle_key(press(KeyCode::Home, KeyModifiers::NONE));
-        let _ = render_text(&mut app, 100, 24);
-        app.apply_event(&json!({"ev": "model.delta", "text": "Tail update"}));
-        assert!(render_text(&mut app, 100, 24).contains("Prompt line 0"));
     }
 }

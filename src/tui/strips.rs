@@ -169,6 +169,79 @@ pub struct SubagentEntry {
     pub trace: Vec<String>,
 }
 
+impl SubagentEntry {
+    pub fn from_history_json(child: &Value) -> Option<Self> {
+        let csid = child["sid"].as_str().filter(|s| !s.is_empty())?;
+        Some(Self {
+            id: csid.to_owned(),
+            child_sid: Some(csid.to_owned()),
+            role: child["role"].as_str().unwrap_or("scout").to_owned(),
+            model: child["model"].as_str().map(str::to_owned),
+            task: child["task"].as_str().unwrap_or("").to_owned(),
+            parallel: false,
+            active_turn: false,
+            started_at: Instant::now(),
+            elapsed_secs: Some(0),
+            status: SubagentStatus::Completed,
+            error: None,
+            activity: None,
+            turns: child["turns"].as_u64().unwrap_or(0) as u32,
+            tool_count: child["tool_count"].as_u64().unwrap_or(0) as u32,
+            trace: Vec::new(),
+        })
+    }
+
+    pub fn from_started(id: String, ev: &Value) -> Self {
+        Self {
+            id,
+            child_sid: ev["sid"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            role: ev["role"].as_str().unwrap_or("subagent").to_owned(),
+            model: ev["model"].as_str().map(str::to_owned),
+            task: ev["task"].as_str().unwrap_or("").trim().to_owned(),
+            parallel: ev["parallel"] == true,
+            active_turn: true,
+            started_at: Instant::now(),
+            elapsed_secs: None,
+            status: SubagentStatus::Running,
+            error: None,
+            activity: None,
+            turns: 0,
+            tool_count: 0,
+            trace: Vec::new(),
+        }
+    }
+
+    pub fn apply_progress(&mut self, ev: &Value) {
+        if let Some(csid) = ev["sid"].as_str().filter(|s| !s.is_empty()) {
+            self.child_sid = Some(csid.to_owned());
+        }
+        let turns = ev["turns"].as_u64().unwrap_or(0) as u32;
+        if turns > self.turns {
+            self.turns = turns;
+        }
+        let tool_count = ev["tool_count"].as_u64().unwrap_or(0) as u32;
+        if tool_count > self.tool_count {
+            self.tool_count = tool_count;
+        }
+        let activity = ev["activity"].as_str().unwrap_or("").trim();
+        if !activity.is_empty() {
+            self.activity = Some(activity.to_owned());
+            if !activity.starts_with("thinking")
+                && !activity.starts_with("starting")
+                && self.trace.last().map(String::as_str) != Some(activity)
+            {
+                self.trace.push(activity.to_owned());
+                if self.trace.len() > 6 {
+                    self.trace.remove(0);
+                }
+            }
+        }
+    }
+}
+
 fn visible_in_strip(s: &SubagentEntry) -> bool {
     s.active_turn || s.status == SubagentStatus::Running
 }

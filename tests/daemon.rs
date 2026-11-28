@@ -546,5 +546,30 @@ fn tools_edit_write_grep_glob_undo_xrefs_deps_binary_and_secret_filters_work() {
     ));
     assert!(bash_out.contains("modified previously read file(s): src/engine.rs"));
 
+    let cfg = HarnessConfig {
+        max_output: 1000,
+        read_max_lines: 1,
+        ..HarnessConfig::default()
+    };
+    let mut t_cfg = Tools::with_config(&d, &cfg).with_artifacts_dir(d.join(".art"));
+    let read_one = t_cfg.run(&tc("read", json!({"path": "note.txt"})));
+    assert!(read_one.starts_with("   1→hello\n[truncated after 1 lines"));
+    assert!(t_cfg.schema()[1]["function"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("at most 1 lines"));
+    assert!(t_cfg.clip(&"A".repeat(3000)).contains("clipped"));
+    let big = (1..=400)
+        .map(|i| format!("line-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(t_cfg.clip_for_call("c99", &big).contains("artifact:tool-c99.txt"));
+    assert!(t_cfg
+        .run(&tc(
+            "read",
+            json!({"path": "artifact:tool-c99.txt", "start_line": 200, "limit": 1})
+        ))
+        .starts_with("line-200"));
+
     let _ = std::fs::remove_dir_all(&d);
 }

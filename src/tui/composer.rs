@@ -116,6 +116,7 @@ pub enum SlashCommand {
     RewindSession {
         turns: usize,
         restore_code: bool,
+        prefill: Option<String>,
     },
     RenameSession(String),
     ArchiveSession,
@@ -125,7 +126,9 @@ pub enum SlashCommand {
     AttachImage(Option<String>),
     ClearImages,
     SwitchAgent(Option<String>),
-    ListTasks,
+    ListTasks {
+        open_drawer: bool,
+    },
     CancelTask(String),
     ManageMcp {
         action: String,
@@ -208,7 +211,7 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/image" => Some(SlashCommand::AttachImage(None)),
         "/image clear" => Some(SlashCommand::ClearImages),
         "/agent" | "/agents" => Some(SlashCommand::SwitchAgent(None)),
-        "/tasks" => Some(SlashCommand::ListTasks),
+        "/tasks" => Some(SlashCommand::ListTasks { open_drawer: false }),
         "/mcp" => Some(SlashCommand::ManageMcp {
             action: "list".into(),
             server: None,
@@ -437,6 +440,7 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         return Some(SlashCommand::RewindSession {
             turns: n,
             restore_code,
+            prefill: None,
         });
     }
     if let Some(arg) = trimmed.strip_prefix("/rename ") {
@@ -1464,6 +1468,7 @@ mod tests {
             Some(SlashCommand::RewindSession {
                 turns: 2,
                 restore_code: false,
+                prefill: None,
             })
         );
         assert_eq!(
@@ -1471,6 +1476,7 @@ mod tests {
             Some(SlashCommand::RewindSession {
                 turns: 2,
                 restore_code: true,
+                prefill: None,
             })
         );
         assert_eq!(parse_slash("/undo", false), Some(SlashCommand::UndoEdit));

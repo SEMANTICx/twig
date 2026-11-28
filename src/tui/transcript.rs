@@ -221,7 +221,7 @@ impl Transcript {
         self.cells.push(Cell::Assistant(text));
     }
 
-    pub fn append_assistant_delta(&mut self, delta: &str) {
+    fn append_assistant_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
@@ -233,7 +233,7 @@ impl Transcript {
         }
     }
 
-    pub fn append_reasoning_delta(&mut self, delta: &str) {
+    fn append_reasoning_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
@@ -251,6 +251,62 @@ impl Transcript {
                 started_at: Instant::now(),
                 elapsed: Duration::ZERO,
             });
+        }
+    }
+
+    /// Fold a live model/tool stream event (`model.reasoning`, `model.delta`,
+    /// `tool.started`, `tool.output`, `tool.completed`, `model.retry`) into cells.
+    /// Returns `Some(tool_name)` when `tool.started` begins a new tool cell.
+    pub fn apply_stream_event(&mut self, ev: &Value) -> Option<String> {
+        match ev["ev"].as_str() {
+            Some("model.reasoning") => {
+                if let Some(d) = ev["text"].as_str().filter(|s| !s.is_empty()) {
+                    self.append_reasoning_delta(d);
+                }
+                None
+            }
+            Some("model.delta") => {
+                if let Some(d) = ev["text"].as_str().filter(|s| !s.is_empty()) {
+                    self.append_assistant_delta(d);
+                }
+                None
+            }
+            Some("tool.started") => {
+                let id = ev["id"].as_str().unwrap_or("").to_owned();
+                let name = ev["tool"].as_str().unwrap_or("tool").to_owned();
+                let tier = ev["tier"].as_str().unwrap_or("auto").to_owned();
+                let summary = summarize_tool_args(&name, &ev["args"]);
+                self.push_tool_started(id, name.clone(), summary, tier);
+                Some(name)
+            }
+            Some("tool.output") => {
+                self.append_tool_output(
+                    ev["id"].as_str().unwrap_or(""),
+                    ev["text"].as_str().unwrap_or(""),
+                );
+                None
+            }
+            Some("tool.completed") => {
+                self.finish_tool(
+                    ev["id"].as_str().unwrap_or(""),
+                    None,
+                    ev["exit_code"].as_i64().map(|c| c as i32),
+                    None,
+                );
+                None
+            }
+            Some("model.retry") => {
+                let attempt = ev["attempt"].as_u64().unwrap_or(1);
+                let secs = ev["backoff_secs"].as_u64().unwrap_or(1);
+                self.push_notice(
+                    NoticeKind::Warn,
+                    format!(
+                        "model transient error — retrying (attempt {attempt}, {secs}s backoff)…"
+                    ),
+                );
+                None
+            }
+            _ => None,
         }
     }
 
@@ -291,7 +347,7 @@ impl Transcript {
         }));
     }
 
-    pub fn append_tool_output(&mut self, id: &str, chunk: &str) {
+    fn append_tool_output(&mut self, id: &str, chunk: &str) {
         if let Some(Cell::Tool(tool)) = self
             .cells
             .iter_mut()

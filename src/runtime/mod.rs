@@ -14,6 +14,7 @@ pub mod subagent;
 pub mod tasks;
 pub mod tools;
 pub mod turn;
+pub mod workflows;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
