@@ -1,12 +1,152 @@
 <!doctype html>
-<html lang="en" data-theme="midnight">
+<html lang="en" data-theme="claude-dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>twig</title>
 <style>
-/* 4 Studio Themes: Midnight (Linear/Codex default), Obsidian (T3 OLED), Daylight (bb/Apple light), Warm Paper (Claude light) */
-:root[data-theme="midnight"]{
+/* 4 Brand Design Systems × Dark/Light (Claude Organic, Codex Neutral, Twig Studio, Pure Obsidian) + Live System Sync */
+:root[data-theme="claude-dark"]{
+  color-scheme:dark;
+  --bg:#1a1917;
+  --sidebar:#141311;
+  --card:#22201d;
+  --card-hi:#2a2723;
+  --popover:#25231f;
+  --msg:#2d2a25;
+  --hover:rgba(255,248,235,.06);
+  --active:rgba(217,119,87,.15);
+  --border:rgba(255,248,235,.085);
+  --border-hi:rgba(255,248,235,.165);
+  --fg:#ece9e2;
+  --fg-dim:#b0aba0;
+  --fg-muted:#7d786e;
+  --action-bg:#d97757;
+  --action-fg:#ffffff;
+  --accent:#d97757;
+  --accent-fg:#ffffff;
+  --accent-soft:rgba(217,119,87,.16);
+  --ok:#4ade80;
+  --ok-bg:rgba(74,222,128,.12);
+  --warn:#f59e0b;
+  --warn-bg:rgba(245,158,11,.13);
+  --err:#f87171;
+  --err-bg:rgba(248,113,113,.13);
+  --add-line:rgba(74,222,128,.085);
+  --add-num:rgba(74,222,128,.16);
+  --del-line:rgba(248,113,113,.085);
+  --del-num:rgba(248,113,113,.16);
+  --code-bg:#131210;
+  --sh-kw:#f09475;--sh-str:#86efac;--sh-cm:#78716c;--sh-ty:#93c5fd;--sh-num:#fcd34d;
+  --shadow:0 18px 44px rgba(0,0,0,.58),0 1px 0 rgba(255,248,235,.045) inset;
+  --composer-shadow:0 10px 30px rgba(0,0,0,.42),0 1px 0 rgba(255,248,235,.05) inset;
+}
+:root[data-theme="claude-light"]{
+  color-scheme:light;
+  --bg:#faf9f5;
+  --sidebar:#f0eee6;
+  --card:#ffffff;
+  --card-hi:#f3f0e8;
+  --popover:#ffffff;
+  --msg:#ede9de;
+  --hover:rgba(40,32,20,.048);
+  --active:#ffffff;
+  --border:rgba(40,32,20,.095);
+  --border-hi:rgba(40,32,20,.18);
+  --fg:#1f1e1b;
+  --fg-dim:#57534c;
+  --fg-muted:#827d73;
+  --action-bg:#c96442;
+  --action-fg:#ffffff;
+  --accent:#c96442;
+  --accent-fg:#ffffff;
+  --accent-soft:rgba(201,100,66,.12);
+  --ok:#15803d;
+  --ok-bg:rgba(21,128,61,.1);
+  --warn:#b45309;
+  --warn-bg:rgba(180,83,9,.11);
+  --err:#b91c1c;
+  --err-bg:rgba(185,28,28,.1);
+  --add-line:rgba(21,128,61,.09);
+  --add-num:rgba(21,128,61,.17);
+  --del-line:rgba(185,28,28,.085);
+  --del-num:rgba(185,28,28,.16);
+  --code-bg:#f4f1ea;
+  --sh-kw:#9a3412;--sh-str:#166534;--sh-cm:#78716c;--sh-ty:#1d4ed8;--sh-num:#a16207;
+  --shadow:0 14px 36px rgba(40,30,20,.11),0 1px 2px rgba(40,30,20,.05);
+  --composer-shadow:0 6px 22px rgba(40,30,20,.06),0 1px 2px rgba(40,30,20,.04);
+}
+:root[data-theme="codex-dark"]{
+  color-scheme:dark;
+  --bg:#171717;
+  --sidebar:#0d0d0d;
+  --card:#212121;
+  --card-hi:#2a2a2a;
+  --popover:#242424;
+  --msg:#2f2f2f;
+  --hover:rgba(255,255,255,.065);
+  --active:rgba(255,255,255,.11);
+  --border:rgba(255,255,255,.09);
+  --border-hi:rgba(255,255,255,.17);
+  --fg:#ececec;
+  --fg-dim:#b4b4b4;
+  --fg-muted:#7a7a7a;
+  --action-bg:#ffffff;
+  --action-fg:#0d0d0d;
+  --accent:#10a37f;
+  --accent-fg:#ffffff;
+  --accent-soft:rgba(16,163,127,.16);
+  --ok:#10a37f;
+  --ok-bg:rgba(16,163,127,.14);
+  --warn:#f59e0b;
+  --warn-bg:rgba(245,158,11,.13);
+  --err:#ef4444;
+  --err-bg:rgba(239,68,68,.14);
+  --add-line:rgba(16,163,127,.1);
+  --add-num:rgba(16,163,127,.19);
+  --del-line:rgba(239,68,68,.09);
+  --del-num:rgba(239,68,68,.17);
+  --code-bg:#0d0d0d;
+  --sh-kw:#f472b6;--sh-str:#34d399;--sh-cm:#737373;--sh-ty:#60a5fa;--sh-num:#fbbf24;
+  --shadow:0 18px 44px rgba(0,0,0,.65),0 1px 0 rgba(255,255,255,.045) inset;
+  --composer-shadow:0 10px 30px rgba(0,0,0,.5),0 1px 0 rgba(255,255,255,.05) inset;
+}
+:root[data-theme="codex-light"]{
+  color-scheme:light;
+  --bg:#ffffff;
+  --sidebar:#f9f9f9;
+  --card:#ffffff;
+  --card-hi:#f3f3f3;
+  --popover:#ffffff;
+  --msg:#f4f4f4;
+  --hover:rgba(0,0,0,.045);
+  --active:#ffffff;
+  --border:rgba(0,0,0,.085);
+  --border-hi:rgba(0,0,0,.17);
+  --fg:#0d0d0d;
+  --fg-dim:#424242;
+  --fg-muted:#737373;
+  --action-bg:#0d0d0d;
+  --action-fg:#ffffff;
+  --accent:#10a37f;
+  --accent-fg:#ffffff;
+  --accent-soft:rgba(16,163,127,.11);
+  --ok:#0d8a6a;
+  --ok-bg:rgba(13,138,106,.1);
+  --warn:#d97706;
+  --warn-bg:rgba(217,119,6,.11);
+  --err:#dc2626;
+  --err-bg:rgba(220,38,38,.1);
+  --add-line:rgba(16,163,127,.09);
+  --add-num:rgba(16,163,127,.18);
+  --del-line:rgba(220,38,38,.085);
+  --del-num:rgba(220,38,38,.16);
+  --code-bg:#f7f7f8;
+  --sh-kw:#be185d;--sh-str:#047857;--sh-cm:#737373;--sh-ty:#0284c7;--sh-num:#b45309;
+  --shadow:0 14px 36px rgba(0,0,0,.1),0 1px 2px rgba(0,0,0,.05);
+  --composer-shadow:0 6px 24px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+}
+:root[data-theme="studio-dark"]{
   color-scheme:dark;
   --bg:#0b0c10;
   --sidebar:#0e1015;
@@ -41,42 +181,7 @@
   --shadow:0 18px 44px rgba(0,0,0,.6),0 1px 0 rgba(255,255,255,.045) inset;
   --composer-shadow:0 10px 32px rgba(0,0,0,.45),0 1px 0 rgba(255,255,255,.05) inset;
 }
-:root[data-theme="obsidian"]{
-  color-scheme:dark;
-  --bg:#000000;
-  --sidebar:#050506;
-  --card:#0d0d10;
-  --card-hi:#15151a;
-  --popover:#121216;
-  --msg:#1b1b20;
-  --hover:rgba(255,255,255,.055);
-  --active:rgba(255,255,255,.095);
-  --border:rgba(255,255,255,.08);
-  --border-hi:rgba(255,255,255,.16);
-  --fg:#f3f4f6;
-  --fg-dim:#a1a1aa;
-  --fg-muted:#71717a;
-  --action-bg:#f4f4f6;
-  --action-fg:#09090b;
-  --accent:#6366f1;
-  --accent-fg:#ffffff;
-  --accent-soft:rgba(99,102,241,.16);
-  --ok:#34d399;
-  --ok-bg:rgba(52,211,153,.12);
-  --warn:#fbbf24;
-  --warn-bg:rgba(251,191,36,.13);
-  --err:#f87171;
-  --err-bg:rgba(248,113,113,.13);
-  --add-line:rgba(52,211,153,.09);
-  --add-num:rgba(52,211,153,.17);
-  --del-line:rgba(248,113,113,.09);
-  --del-num:rgba(248,113,113,.17);
-  --code-bg:#070709;
-  --sh-kw:#f472b6;--sh-str:#6ee7b7;--sh-cm:#6b7280;--sh-ty:#93c5fd;--sh-num:#fcd34d;
-  --shadow:0 18px 44px rgba(0,0,0,.72),0 1px 0 rgba(255,255,255,.04) inset;
-  --composer-shadow:0 8px 30px rgba(0,0,0,.6),0 1px 0 rgba(255,255,255,.05) inset;
-}
-:root[data-theme="daylight"]{
+:root[data-theme="studio-light"]{
   color-scheme:light;
   --bg:#ffffff;
   --sidebar:#f6f7f9;
@@ -111,40 +216,75 @@
   --shadow:0 14px 36px rgba(15,23,42,.12),0 1px 2px rgba(15,23,42,.05);
   --composer-shadow:0 6px 24px rgba(15,23,42,.06),0 1px 2px rgba(15,23,42,.04);
 }
-:root[data-theme="paper"]{
-  color-scheme:light;
-  --bg:#faf8f5;
-  --sidebar:#f2efe9;
-  --card:#ffffff;
-  --card-hi:#efeae2;
-  --popover:#ffffff;
-  --msg:#ede8df;
-  --hover:rgba(40,30,20,.048);
-  --active:#ffffff;
-  --border:rgba(40,30,20,.09);
-  --border-hi:rgba(40,30,20,.18);
-  --fg:#1f1e1c;
-  --fg-dim:#57534e;
-  --fg-muted:#78716c;
-  --action-bg:#1f1e1c;
-  --action-fg:#faf8f5;
-  --accent:#c96442;
+:root[data-theme="obsidian-dark"]{
+  color-scheme:dark;
+  --bg:#000000;
+  --sidebar:#050506;
+  --card:#0d0d10;
+  --card-hi:#15151a;
+  --popover:#121216;
+  --msg:#1b1b20;
+  --hover:rgba(255,255,255,.055);
+  --active:rgba(255,255,255,.095);
+  --border:rgba(255,255,255,.08);
+  --border-hi:rgba(255,255,255,.16);
+  --fg:#f3f4f6;
+  --fg-dim:#a1a1aa;
+  --fg-muted:#71717a;
+  --action-bg:#f4f4f6;
+  --action-fg:#09090b;
+  --accent:#6366f1;
   --accent-fg:#ffffff;
-  --accent-soft:rgba(201,100,66,.12);
-  --ok:#15803d;
-  --ok-bg:rgba(21,128,61,.1);
-  --warn:#b45309;
-  --warn-bg:rgba(180,83,9,.11);
-  --err:#b91c1c;
-  --err-bg:rgba(185,28,28,.1);
-  --add-line:rgba(21,128,61,.09);
-  --add-num:rgba(21,128,61,.17);
-  --del-line:rgba(185,28,28,.085);
-  --del-num:rgba(185,28,28,.16);
-  --code-bg:#f4f1eb;
-  --sh-kw:#9a3412;--sh-str:#166534;--sh-cm:#78716c;--sh-ty:#1d4ed8;--sh-num:#a16207;
-  --shadow:0 14px 36px rgba(40,30,20,.12),0 1px 2px rgba(40,30,20,.05);
-  --composer-shadow:0 6px 22px rgba(40,30,20,.06),0 1px 2px rgba(40,30,20,.04);
+  --accent-soft:rgba(99,102,241,.16);
+  --ok:#34d399;
+  --ok-bg:rgba(52,211,153,.12);
+  --warn:#fbbf24;
+  --warn-bg:rgba(251,191,36,.13);
+  --err:#f87171;
+  --err-bg:rgba(248,113,113,.13);
+  --add-line:rgba(52,211,153,.09);
+  --add-num:rgba(52,211,153,.17);
+  --del-line:rgba(248,113,113,.09);
+  --del-num:rgba(248,113,113,.17);
+  --code-bg:#070709;
+  --sh-kw:#f472b6;--sh-str:#6ee7b7;--sh-cm:#6b7280;--sh-ty:#93c5fd;--sh-num:#fcd34d;
+  --shadow:0 18px 44px rgba(0,0,0,.72),0 1px 0 rgba(255,255,255,.04) inset;
+  --composer-shadow:0 8px 30px rgba(0,0,0,.6),0 1px 0 rgba(255,255,255,.05) inset;
+}
+:root[data-theme="obsidian-light"]{
+  color-scheme:light;
+  --bg:#fafafa;
+  --sidebar:#f2f2f4;
+  --card:#ffffff;
+  --card-hi:#ececef;
+  --popover:#ffffff;
+  --msg:#ededf0;
+  --hover:rgba(9,9,11,.048);
+  --active:#ffffff;
+  --border:rgba(9,9,11,.085);
+  --border-hi:rgba(9,9,11,.17);
+  --fg:#09090b;
+  --fg-dim:#3f3f46;
+  --fg-muted:#71717a;
+  --action-bg:#09090b;
+  --action-fg:#fafafa;
+  --accent:#4f46e5;
+  --accent-fg:#ffffff;
+  --accent-soft:rgba(79,70,229,.11);
+  --ok:#059669;
+  --ok-bg:rgba(5,150,105,.1);
+  --warn:#d97706;
+  --warn-bg:rgba(217,119,6,.11);
+  --err:#dc2626;
+  --err-bg:rgba(220,38,38,.1);
+  --add-line:rgba(16,185,129,.1);
+  --add-num:rgba(16,185,129,.18);
+  --del-line:rgba(239,68,68,.09);
+  --del-num:rgba(239,68,68,.17);
+  --code-bg:#f4f4f5;
+  --sh-kw:#9333ea;--sh-str:#047857;--sh-cm:#71717a;--sh-ty:#0284c7;--sh-num:#b45309;
+  --shadow:0 14px 36px rgba(9,9,11,.11),0 1px 2px rgba(9,9,11,.05);
+  --composer-shadow:0 6px 24px rgba(9,9,11,.06),0 1px 2px rgba(9,9,11,.04);
 }
 
 *{box-sizing:border-box;margin:0;padding:0}
@@ -171,6 +311,16 @@ aside.sidebar.collapsed{margin-left:-276px}
 .brand{display:inline-flex;align-items:center;gap:7px;font-size:14px;font-weight:600;letter-spacing:-0.015em;color:var(--fg)}
 .brand-gem{width:20px;height:20px;border-radius:6px;background:var(--accent-soft);color:var(--accent);display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700}
 .brand-ver{font-size:10.5px;font-weight:500;color:var(--fg-muted);padding:1px 6px;border-radius:99px;border:1px solid var(--border)}
+.sb-proj-row{padding:0 10px 7px}
+.proj-sel-btn{width:100%;height:31px;padding:0 8px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--fg);display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12.5px;font-weight:500;transition:border-color .12s,background .12s}
+.proj-sel-btn:hover,.proj-sel-btn.open{border-color:var(--border-hi);background:var(--card-hi)}
+.proj-sel-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.proj-sel-br{font:11px/1 ui-monospace,SFMono-Regular,monospace;color:var(--fg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:74px}
+.cmode-btn{height:21px;padding:0 6px;border-radius:99px;border:1px solid var(--border);background:var(--card);color:var(--fg-dim);font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:3px}
+.cmode-btn:hover{color:var(--fg);border-color:var(--border-hi)}
+.preset-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.preset-card{padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--fg);text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:4px;transition:border-color .12s,background .12s}
+.preset-card:hover{border-color:var(--accent);background:var(--hover)}
 .sb-search-row{padding:0 10px 8px;display:flex;align-items:center;gap:6px}
 .sb-search-wrap{flex:1;display:flex;align-items:center;gap:6px;height:31px;padding:0 8px;border-radius:8px;background:var(--card);border:1px solid var(--border);transition:border-color .12s}
 .sb-search-wrap:focus-within{border-color:var(--accent)}
@@ -193,7 +343,7 @@ aside.sidebar.collapsed{margin-left:-276px}
 .t-card{padding:8px 10px;border-radius:9px;cursor:pointer;margin-bottom:2px;transition:background .12s,box-shadow .12s;position:relative;border:1px solid transparent}
 .t-card:hover{background:var(--hover)}
 .t-card.active{background:var(--active);border-color:var(--border)}
-:root[data-theme="daylight"] .t-card.active,:root[data-theme="paper"] .t-card.active{box-shadow:0 2px 6px rgba(0,0,0,.05)}
+:root[data-theme$="-light"] .t-card.active{box-shadow:0 2px 6px rgba(0,0,0,.05)}
 .t-card.child{margin-left:14px;padding:6px 9px;border-left:1.5px solid var(--border-hi);border-radius:0 8px 8px 0}
 .t-row1{display:flex;align-items:center;gap:6px;height:18px;font-size:11.5px;color:var(--fg-muted)}
 .proj-fav{width:15px;height:15px;border-radius:4px;font:700 8.5px/15px ui-monospace,monospace;text-align:center;flex-shrink:0}
@@ -383,8 +533,9 @@ aside.sidebar.collapsed~.stage .sb-open-btn{display:inline-flex}
 .sub-swarm{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
 .sub-tile{padding:9px 11px;border-radius:10px;background:var(--card);border:1px solid var(--border);display:flex;flex-direction:column;gap:5px}
 .live-cursor{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:-2px;margin-left:2px;border-radius:2px;animation:shimmer .9s ease-in-out infinite}
-aside.art-dock{width:46vw;min-width:360px;max-width:600px;border-left:1px solid var(--border);background:var(--bg);display:none;flex-direction:column;flex-shrink:0;min-height:0}
+aside.art-dock{width:46vw;min-width:360px;max-width:600px;border-left:1px solid var(--border);background:var(--bg);display:none;flex-direction:column;flex-shrink:0;min-height:0;transition:width .16s ease}
 aside.art-dock.open{display:flex}
+aside.art-dock.wide{width:68vw;max-width:980px}
 .art-canvas{flex:1;min-height:0;background:var(--code-bg);display:flex;align-items:center;justify-content:center;overflow:auto;padding:12px}
 .art-iframe{width:100%;height:100%;border:1px solid var(--border);border-radius:10px;background:#fff}
 .art-iframe.mob{width:375px;max-width:100%;height:min(100%,680px);box-shadow:var(--shadow)}
@@ -518,7 +669,7 @@ aside.inspector.shut{display:none}
   .stg-nav{width:100%;border-right:0;border-bottom:1px solid var(--border);flex-direction:row;overflow-x:auto;padding:8px}
   .stg-nav-ttl{display:none}
   .stg-tab{white-space:nowrap;padding:6px 10px}
-  .pal-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .pal-grid,.preset-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 
 .toast{position:fixed;bottom:22px;right:22px;z-index:90;background:var(--popover);color:var(--fg);border:1px solid var(--border-hi);box-shadow:var(--shadow);padding:8px 14px;border-radius:9px;font-size:12.5px;opacity:0;transform:translateY(6px);pointer-events:none;transition:opacity .15s,transform .15s}
@@ -570,6 +721,15 @@ aside.inspector.shut{display:none}
       </div>
     </div>
 
+    <div class="sb-proj-row">
+      <button class="proj-sel-btn" id="proj-trig" onclick="openProjPop(this)" title="Switch active project workspace">
+        <span id="sb-proj-ico"></span>
+        <span class="proj-sel-name" id="sb-proj-name">Workspace</span>
+        <span class="proj-sel-br" id="sb-proj-br">main</span>
+        <span class="ico sm" style="margin-left:auto"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
+      </button>
+    </div>
+
     <div class="sb-search-row">
       <div class="sb-search-wrap">
         <span class="ico sm" style="color:var(--fg-muted)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
@@ -581,7 +741,7 @@ aside.inspector.shut{display:none}
     <div class="sb-mode-row">
       <div class="sb-mode">
         <button id="m-thr" class="active" onclick="setSbMode('threads')">Threads</button>
-        <button id="m-aut" onclick="setSbMode('auto')">Automations</button>
+        <button id="m-aut" onclick="setSbMode('auto')">Routines</button>
       </div>
     </div>
 
@@ -597,18 +757,19 @@ aside.inspector.shut{display:none}
     <div class="thread-list" id="slist"></div>
 
     <div class="sb-foot">
-      <div style="display:inline-flex;align-items:center;gap:6px">
+      <div style="display:inline-flex;align-items:center;gap:5px">
         <button class="icon-btn" onclick="openSettings('general')" title="Settings & Configuration (Ctrl+,)"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span></button>
         <span class="sse-dot" id="sse-dot" title="SSE event stream"></span>
         <span id="sb-count">0 threads</span>
       </div>
-      <div style="display:flex;align-items:center;gap:6px">
-        <div class="theme-dots" title="Switch Studio Palette">
-          <button class="th-dot" data-t="midnight" style="background:#181d2c" onclick="setTheme('midnight')" title="Midnight Studio"></button>
-          <button class="th-dot" data-t="obsidian" style="background:#000000" onclick="setTheme('obsidian')" title="Pure Obsidian"></button>
-          <button class="th-dot" data-t="daylight" style="background:#ffffff" onclick="setTheme('daylight')" title="Daylight Crisp"></button>
-          <button class="th-dot" data-t="paper" style="background:#f3ede2" onclick="setTheme('paper')" title="Warm Paper"></button>
+      <div style="display:flex;align-items:center;gap:4px">
+        <div class="theme-dots" title="Switch Brand Design System">
+          <button class="th-dot" data-p="claude" style="background:#d97757" onclick="setPalette('claude')" title="Claude Organic (Warm Terracotta)"></button>
+          <button class="th-dot" data-p="codex" style="background:#10a37f" onclick="setPalette('codex')" title="Codex Neutral (Monochrome + Emerald)"></button>
+          <button class="th-dot" data-p="studio" style="background:#6e7bf2" onclick="setPalette('studio')" title="Twig Studio (Linear Indigo)"></button>
+          <button class="th-dot" data-p="obsidian" style="background:#09090b" onclick="setPalette('obsidian')" title="Pure Obsidian (OLED Contrast)"></button>
         </div>
+        <button class="cmode-btn" id="cmode-btn" onclick="cycleColorMode()" title="Appearance: System (auto)">◐</button>
         <button class="icon-btn" id="notif-btn" onclick="toggleNotif()" title="Background alerts"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg></span></button>
       </div>
     </div>
@@ -758,9 +919,11 @@ aside.inspector.shut{display:none}
             <span id="art-title" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Artifact Preview</span>
           </div>
           <div style="display:flex;align-items:center;gap:4px">
+            <select class="stg-in" id="art-sel" style="height:24px;padding:0 6px;font-size:11.5px;max-width:136px;display:none" onchange="openArtByIdx(+this.value)"></select>
             <button class="f-pill active" id="av-prev" onclick="setArtTab('preview')">Preview</button>
             <button class="f-pill" id="av-src" onclick="setArtTab('source')">Source</button>
             <button class="f-pill" id="av-vp" onclick="toggleArtVp()" title="Switch Desktop / Mobile 375px">Desktop</button>
+            <button class="f-pill" id="av-wide" onclick="toggleArtWide()" title="Toggle wide canvas">⤢</button>
             <button class="icon-btn" onclick="downloadArt()" title="Download artifact"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></span></button>
             <button class="icon-btn" onclick="toggleArtDock(false)" title="Close preview"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
           </div>
@@ -878,6 +1041,8 @@ aside.inspector.shut{display:none}
   <button class="pop-opt" id="ro-plan" onclick="pickExecMode('plan')"><span>◈ Plan Only (read-only)</span><span></span></button>
 </div>
 
+<div class="pop" id="proj-pop" style="min-width:252px"></div>
+
 <div class="pop" id="ed-pop">
   <div class="pop-lbl">Open Files & Repo In</div>
   <button class="pop-opt" data-ed="cursor" onclick="pickEditor('cursor')"><span>Cursor</span><span></span></button>
@@ -904,6 +1069,7 @@ aside.inspector.shut{display:none}
     <nav class="stg-nav">
       <div class="stg-nav-ttl"><span>Settings</span><kbd>Ctrl+,</kbd></div>
       <button class="stg-tab active" data-st="general" onclick="switchStgTab('general')"><span>⚙</span><span>General & UI</span></button>
+      <button class="stg-tab" data-st="customize" onclick="switchStgTab('customize')"><span>✧</span><span>Customize & Packs</span></button>
       <button class="stg-tab" data-st="roles" onclick="switchStgTab('roles')"><span>✻</span><span>Models & Roles</span></button>
       <button class="stg-tab" data-st="runtime" onclick="switchStgTab('runtime')"><span>⛨</span><span>Runtime & Hooks</span></button>
       <button class="stg-tab" data-st="skills" onclick="switchStgTab('skills')"><span>✦</span><span>Skills & Vault</span></button>
@@ -941,15 +1107,18 @@ const tok=new URLSearchParams(location.search).get('token')||localStorage.getIte
 if(tok)localStorage.setItem('twig_tok',tok);
 
 let curSid='',curWt='',defaultWt='',defaultBranch='main',defaultDiff='',activeModel='default',selModel='',selEffort='',selRole='code',execMode='auto';
-let filter='all',sbMode='threads',allRepos=false,diffOpen=false,scOpen=false,artOpen=false,termOpen=false,diffMode='unified',artTab='preview',artVp='desktop',ccShut=false;
-let sessions=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,autoData=null,lastHtml='',lastDiffSig='',forceTail=true,stickToBottom=true,progScroll=false,draftNew=false,draftReady=false,newWt=false;
+let filter='all',sbMode='threads',allRepos=false,diffOpen=false,scOpen=false,artOpen=false,artWide=false,termOpen=false,diffMode='unified',artTab='preview',artVp='desktop',ccShut=false;
+let sessions=[],projects=[],schedules=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,autoData=null,lastHtml='',lastDiffSig='',forceTail=true,stickToBottom=true,progScroll=false,draftNew=false,draftReady=false,newWt=false;
 let notifOn=localStorage.getItem('twig_notif')==='1',editor=localStorage.getItem('twig_ed')||'cursor',sendKeyMode=localStorage.getItem('twig_send_key')||'enter';
-let theme=localStorage.getItem('twig_theme_v2')||'midnight';
+const LEGACY_TH={paper:'claude',obsidian:'obsidian',midnight:'studio',daylight:'studio'};
+let palette=localStorage.getItem('twig_palette')||LEGACY_TH[localStorage.getItem('twig_theme_v2')]||'claude';
+let colorMode=localStorage.getItem('twig_cmode')||'system';
+const sysDarkMq=window.matchMedia('(prefers-color-scheme: dark)');
 let pinned=new Set(JSON.parse(localStorage.getItem('twig_pins')||'[]'));
 let drafts={};try{drafts=JSON.parse(localStorage.getItem('twig_drafts_v1')||'{}')||{};}catch(_){drafts={};}
 let shutGroups={},images=[],reviewNotes=[],prevStates={},openLogs={},openTools={};
 let acItems=[],acIdx=0,cmdkItems=[],cmdkIdx=0,recog=null,askResolve=null,askConfirmOnly=false,busyRpc=false;
-let artStore=[],artMap=new Map(),curArt=null;
+let artStore=[],artMap=new Map(),curArt=null,curArtIdx=-1,presetScope='project';
 let sseOk=false,liveText={},liveTool={},liveSteer={},userTurnTexts=[],histIdx=-1,histDraft='';
 let searchHits=[],searchQ='',searchTm=null;
 
@@ -962,7 +1131,31 @@ const SLASH_CMDS=[
   {k:'/walkthrough',d:'Generate structured codebase architecture walkthrough'},
 ];
 
-setTheme(theme);
+function resolvedAppearance(){return colorMode==='system'?(sysDarkMq.matches?'dark':'light'):colorMode;}
+function applyAppearance(rerenderDiagrams=false){
+  if(!['claude','codex','studio','obsidian'].includes(palette))palette='claude';
+  if(!['system','dark','light'].includes(colorMode))colorMode='system';
+  const eff=resolvedAppearance();
+  document.documentElement.setAttribute('data-theme',`${palette}-${eff}`);
+  localStorage.setItem('twig_palette',palette);
+  localStorage.setItem('twig_cmode',colorMode);
+  document.querySelectorAll('.th-dot').forEach(d=>d.classList.toggle('active',d.dataset.p===palette));
+  const cb=document.getElementById('cmode-btn');
+  if(cb){
+    cb.textContent=colorMode==='system'?'◐':colorMode==='dark'?'☾':'☀';
+    cb.title=`Appearance: ${colorMode==='system'?`System (auto · ${eff})`:colorMode} — click to cycle`;
+  }
+  if(rerenderDiagrams){lastHtml='';if(detail)render();if(artOpen)renderArtDock();if(document.getElementById('stg-modal')?.classList.contains('open'))renderStgBody();}
+}
+function setPalette(p){palette=p;applyAppearance(true);}
+function setColorMode(m){colorMode=m;applyAppearance(true);}
+function cycleColorMode(){
+  const order=['system','dark','light'];
+  setColorMode(order[(order.indexOf(colorMode)+1)%order.length]);
+  toast(`Appearance: ${colorMode==='system'?`System (${resolvedAppearance()})`:colorMode}`);
+}
+sysDarkMq.addEventListener('change',()=>{if(colorMode==='system')applyAppearance(true);});
+applyAppearance(false);
 if(notifOn)document.getElementById('notif-btn').classList.add('on');
 
 const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+tok}:{'Content-Type':'application/json'};
@@ -1025,12 +1218,6 @@ function shortAge(a){return String(a||'').replace(' ago','');}
 function shortModel(m){const s=String(m||'default');return s.includes('/')?s.split('/').pop():s;}
 function ideUri(absPath,line){const clean=String(absPath||'').replace(/^file:\/\//,'');if(!clean)return '#';const p=clean.startsWith('/')?clean:'/'+clean;return line?`${editor}://file${p}:${line}:1`:`${editor}://file${p}`;}
 
-function setTheme(t){
-  theme=['midnight','obsidian','daylight','paper'].includes(t)?t:'midnight';
-  document.documentElement.setAttribute('data-theme',theme);
-  localStorage.setItem('twig_theme_v2',theme);
-  document.querySelectorAll('.th-dot').forEach(d=>d.classList.toggle('active',d.dataset.t===theme));
-}
 function togglePin(sid){
   if(pinned.has(sid))pinned.delete(sid);else pinned.add(sid);
   localStorage.setItem('twig_pins',JSON.stringify([...pinned]));
@@ -1134,21 +1321,74 @@ function setDiffMode(m){
 }
 
 /* Popovers & Pickers */
-function closeAllPops(){document.querySelectorAll('.pop.open').forEach(p=>p.classList.remove('open'));document.querySelectorAll('.pill-trig.open').forEach(b=>b.classList.remove('open'));}
+function closeAllPops(){document.querySelectorAll('.pop.open').forEach(p=>p.classList.remove('open'));document.querySelectorAll('.pill-trig.open,.proj-sel-btn.open').forEach(b=>b.classList.remove('open'));}
 function openPop(id,btn){
   const el=document.getElementById(id),was=el.classList.contains('open');
   closeAllPops();if(was)return;
   el.classList.add('open');btn.classList.add('open');
-  const r=btn.getBoundingClientRect(),pw=228;
-  const left=Math.max(8,Math.min(innerWidth-pw-8,r.right-pw));
+  const r=btn.getBoundingClientRect(),pw=Math.max(228,el.offsetWidth||228);
+  const left=Math.max(8,Math.min(innerWidth-pw-8,r.left<300?r.left:r.right-pw));
   if(r.top>280){el.style.bottom=(innerHeight-r.top+6)+'px';el.style.top='auto';}
   else{el.style.top=(r.bottom+6)+'px';el.style.bottom='auto';}
   el.style.left=left+'px';
 }
 document.addEventListener('click',e=>{
-  if(!e.target.closest('.pop')&&!e.target.closest('.pill-trig')&&!e.target.closest('.ctx-item')&&!e.target.closest('.split-ed'))closeAllPops();
+  if(!e.target.closest('.pop')&&!e.target.closest('.pill-trig')&&!e.target.closest('.proj-sel-btn')&&!e.target.closest('.ctx-item')&&!e.target.closest('.split-ed'))closeAllPops();
   if(!e.target.closest('.ac-menu')&&e.target.id!=='inp')closeAc();
 });
+
+async function loadProjects(){
+  const d=await api('/api/projects');
+  if(Array.isArray(d.projects))projects=d.projects;
+  syncProjBar();renderProjPop();
+}
+function syncProjBar(){
+  const active=defaultWt||curWt||'';
+  const found=projects.find(p=>p.path===active);
+  const nm=found?found.name:baseName(active);
+  const br=(found&&found.branch)||defaultBranch||'main';
+  document.getElementById('sb-proj-ico').innerHTML=projFav(nm);
+  document.getElementById('sb-proj-name').textContent=allRepos?'All Projects':nm;
+  document.getElementById('sb-proj-br').textContent=allRepos?`${projects.length} repos`:br;
+}
+function renderProjPop(){
+  const box=document.getElementById('proj-pop');if(!box)return;
+  const active=defaultWt||curWt||'';
+  box.innerHTML=`<div class="pop-lbl">Projects (Claude / Codex Workspaces)</div>`+
+    projects.map(p=>{
+      const on=!allRepos&&p.path===active;
+      return `<button class="pop-opt ${on?'sel':''}" data-p="${esc(p.path)}" onclick="switchProject(this.dataset.p)">
+        <span style="display:inline-flex;align-items:center;gap:7px;min-width:0">${projFav(p.name)}<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</span>${p.has_agents_md?'<span class="draft-pill">AGENTS</span>':''}</span>
+        <span style="font:11px/1 ui-monospace,monospace;color:var(--fg-muted)">${on?'✓':esc(p.branch||'')}</span>
+      </button>`;
+    }).join('')+
+    `<div class="pop-sep"></div>
+     <button class="pop-opt ${allRepos?'sel':''}" onclick="closeAllPops();if(!allRepos)toggleAllRepos()"><span>🌐 Show threads across all projects</span><span>${allRepos?'✓':''}</span></button>
+     <button class="pop-opt" style="color:var(--accent)" onclick="closeAllPops();addLocalProject()"><span>+ Add local Git project…</span><span></span></button>`;
+}
+function openProjPop(btn){loadProjects();openPop('proj-pop',btn);}
+async function switchProject(path){
+  closeAllPops();
+  if(!path)return;
+  saveCurDraft();
+  allRepos=false;
+  const sb=document.getElementById('scope-btn');
+  if(sb){sb.textContent='Repo';sb.classList.remove('active');}
+  defaultWt=path;curWt=path;curSid='';filesWt='';draftNew=false;
+  await loadMeta(path);
+  await loadProjects();
+  await loadList();
+  if(sbMode==='auto')loadAutomations();
+  toast('Project: '+baseName(path));
+}
+async function addLocalProject(){
+  const p=await openInputModal({title:'Add Local Project Workspace',sub:'Enter absolute path or ~/… path to any local repository or folder',placeholder:'~/Dev/my-repo',okText:'Add Project'});
+  if(!p||!p.trim())return;
+  const r=await api('/api/projects',{method:'POST',body:JSON.stringify({action:'add',path:p.trim()})});
+  if(r.error)return toast(r.error);
+  await loadProjects();
+  if(r.path)await switchProject(r.path);
+}
 
 function syncComposerPills(){
   const m=shortModel(selModel||activeModel);
@@ -1248,6 +1488,12 @@ function renderMermaidSvg(raw){
   const lines=String(raw||'').split('\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('%%'));
   if(!lines.length)return '';
   const hdr=lines[0];
+  const isLight=resolvedAppearance()==='light';
+  const ac=palette==='claude'?(isLight?'#c96442':'#d97757'):palette==='codex'?'#10a37f':(isLight?'#4f46e5':'#6e7bf2');
+  const nBg=isLight?'#ffffff':(palette==='claude'?'#22201d':palette==='codex'?'#212121':'#181b24');
+  const nFg=isLight?'#18181b':'#eef0f6';
+  const nSub=isLight?'#52525b':'#a1a1aa';
+  const nBd=isLight?'#d4d4d8':'#3f3f46';
   const xmlEsc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   if(/^sequenceDiagram/i.test(hdr)){
     const parts=[],msgs=[];const pSet=new Map();
@@ -1260,17 +1506,17 @@ function renderMermaidSvg(raw){
     }
     if(!parts.length)return '';
     const gap=156,w=Math.max(320,parts.length*gap+40),h=92+msgs.length*44;
-    let g=`<defs><marker id="ma" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="#6e7bf2"/></marker></defs>`;
+    let g=`<defs><marker id="ma" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="${ac}"/></marker></defs>`;
     parts.forEach((p,i)=>{
       const x=20+i*gap+gap/2,lbl=xmlEsc((pSet.get(p)||p).slice(0,22));
-      g+=`<line x1="${x}" y1="44" x2="${x}" y2="${h-16}" stroke="#33384a" stroke-dasharray="4 4"/>`;
-      g+=`<rect x="${x-62}" y="12" width="124" height="30" rx="7" fill="#181b24" stroke="#6e7bf2"/><text x="${x}" y="31" text-anchor="middle" fill="#eef0f6" font-family="system-ui,sans-serif" font-size="12" font-weight="600">${lbl}</text>`;
+      g+=`<line x1="${x}" y1="44" x2="${x}" y2="${h-16}" stroke="${nBd}" stroke-dasharray="4 4"/>`;
+      g+=`<rect x="${x-62}" y="12" width="124" height="30" rx="7" fill="${nBg}" stroke="${ac}"/><text x="${x}" y="31" text-anchor="middle" fill="${nFg}" font-family="system-ui,sans-serif" font-size="12" font-weight="600">${lbl}</text>`;
     });
     msgs.forEach((m,i)=>{
       const x1=20+parts.indexOf(m.a)*gap+gap/2,x2=20+parts.indexOf(m.b)*gap+gap/2,y=74+i*44;
       const dash=m.op.startsWith('--')?'stroke-dasharray="5 4"':'';
-      g+=`<line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="#6e7bf2" stroke-width="1.6" ${dash} marker-end="url(#ma)"/>`;
-      g+=`<text x="${(x1+x2)/2}" y="${y-6}" text-anchor="middle" fill="#9da3b4" font-family="ui-monospace,monospace" font-size="11">${xmlEsc(m.t.slice(0,38))}</text>`;
+      g+=`<line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="${ac}" stroke-width="1.6" ${dash} marker-end="url(#ma)"/>`;
+      g+=`<text x="${(x1+x2)/2}" y="${y-6}" text-anchor="middle" fill="${nSub}" font-family="ui-monospace,monospace" font-size="11">${xmlEsc(m.t.slice(0,38))}</text>`;
     });
     return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}">${g}</svg>`;
   }
@@ -1298,27 +1544,32 @@ function renderMermaidSvg(raw){
   const nw=152,nh=36,gx=lr?196:176,gy=lr?58:74;
   const w=lr?(maxR+1)*gx+32:Math.max(300,maxPer*gx+32),h=lr?Math.max(140,maxPer*gy+32):(maxR+1)*gy+28;
   const xy=k=>{const p=pos.get(k);return lr?{x:20+p.r*gx+nw/2,y:(h-(p.cnt-1)*gy)/2+p.idx*gy}:{x:(w-(p.cnt-1)*gx)/2+p.idx*gx,y:20+p.r*gy+nh/2};};
-  let g=`<defs><marker id="fa" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="#6e7bf2"/></marker></defs>`;
+  let g=`<defs><marker id="fa" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="${ac}"/></marker></defs>`;
   for(const e of edges){
     const p1=xy(e.a),p2=xy(e.b);
     const x1=lr?p1.x+nw/2:p1.x,y1=lr?p1.y:p1.y+nh/2,x2=lr?p2.x-nw/2:p2.x,y2=lr?p2.y:p2.y-nh/2;
-    g+=`<path d="M${x1},${y1} C${(x1+x2)/2},${y1} ${(x1+x2)/2},${y2} ${x2},${y2}" fill="none" stroke="#6e7bf2" stroke-width="1.6" marker-end="url(#fa)"/>`;
-    if(e.lbl)g+=`<text x="${(x1+x2)/2}" y="${(y1+y2)/2-4}" text-anchor="middle" fill="#9da3b4" font-family="system-ui,sans-serif" font-size="10.5">${xmlEsc(e.lbl.slice(0,24))}</text>`;
+    g+=`<path d="M${x1},${y1} C${(x1+x2)/2},${y1} ${(x1+x2)/2},${y2} ${x2},${y2}" fill="none" stroke="${ac}" stroke-width="1.6" marker-end="url(#fa)"/>`;
+    if(e.lbl)g+=`<text x="${(x1+x2)/2}" y="${(y1+y2)/2-4}" text-anchor="middle" fill="${nSub}" font-family="system-ui,sans-serif" font-size="10.5">${xmlEsc(e.lbl.slice(0,24))}</text>`;
   }
   for(const[k,lbl]of nodes){
     const c=xy(k);
-    g+=`<rect x="${c.x-nw/2}" y="${c.y-nh/2}" width="${nw}" height="${nh}" rx="8" fill="#181b24" stroke="#3b4259" stroke-width="1.3"/>`;
-    g+=`<text x="${c.x}" y="${c.y+4}" text-anchor="middle" fill="#eef0f6" font-family="system-ui,sans-serif" font-size="12" font-weight="500">${xmlEsc(lbl.slice(0,22))}</text>`;
+    g+=`<rect x="${c.x-nw/2}" y="${c.y-nh/2}" width="${nw}" height="${nh}" rx="8" fill="${nBg}" stroke="${nBd}" stroke-width="1.3"/>`;
+    g+=`<text x="${c.x}" y="${c.y+4}" text-anchor="middle" fill="${nFg}" font-family="system-ui,sans-serif" font-size="12" font-weight="500">${xmlEsc(lbl.slice(0,22))}</text>`;
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}">${g}</svg>`;
 }
 function openArtByIdx(id){
   const it=artStore[id];if(!it)return;
-  curArt=it;artTab='preview';
+  curArt=it;curArtIdx=id;artTab='preview';
   toggleArtDock(true);
 }
 function setArtTab(t){artTab=t;renderArtDock();}
 function toggleArtVp(){artVp=artVp==='desktop'?'mobile':'desktop';renderArtDock();}
+function toggleArtWide(){
+  artWide=!artWide;
+  document.getElementById('art-dock').classList.toggle('wide',artWide);
+  document.getElementById('av-wide')?.classList.toggle('active',artWide);
+}
 function renderArtDock(){
   if(!artOpen)return;
   document.getElementById('av-prev').classList.toggle('active',artTab==='preview');
@@ -1326,6 +1577,11 @@ function renderArtDock(){
   const vpBtn=document.getElementById('av-vp');
   vpBtn.textContent=artVp==='mobile'?'Mobile 375':'Desktop';
   vpBtn.classList.toggle('active',artVp==='mobile');
+  const selEl=document.getElementById('art-sel');
+  if(selEl){
+    selEl.style.display=artStore.length>1?'inline-block':'none';
+    if(artStore.length>1)selEl.innerHTML=artStore.map((a,i)=>`<option value="${i}" ${i===curArtIdx?'selected':''}>v${i+1}/${artStore.length} · ${esc(a.lang.toUpperCase())}</option>`).join('');
+  }
   const box=document.getElementById('art-canvas');
   if(!curArt){box.innerHTML='<div style="color:var(--fg-muted);font-size:13px">Click ▶ Preview on any HTML, SVG, or Mermaid code block to render it here.</div>';return;}
   document.getElementById('art-title').textContent=`${curArt.lang.toUpperCase()} Preview`;
@@ -1510,17 +1766,18 @@ function renderDiffDock(){
 }
 
 /* Metadata, Project-Grouped Sidebar & Dynamic Tab Title */
-async function loadMeta(){
-  const m=await api('/api/meta');
+async function loadMeta(explicitWt){
+  const qWt=explicitWt||curWt||defaultWt||'';
+  const m=await api('/api/meta'+(qWt?'?wt='+encodeURIComponent(qWt):''));
   if(m.version)document.getElementById('ver').textContent='v'+m.version;
   if(m.default_repo){defaultWt=m.default_repo;if(!curWt)curWt=defaultWt;}
-  if(m.branch)defaultBranch=m.branch;
+  if(typeof m.branch==='string')defaultBranch=m.branch||'main';
   if(typeof m.diff==='string'){defaultDiff=m.diff;if(!curSid&&detail){detail.diff=defaultDiff;lastDiffSig='';}}
   if(m.active_model)activeModel=m.active_model;
   if(m.effort&&!selEffort)selEffort=m.effort;
   if(Array.isArray(m.models))models=m.models;
   if(Array.isArray(m.skills))skills=m.skills;
-  syncComposerPills();renderModelPop();renderInspector();renderDiffDock();syncContextStrip();
+  syncProjBar();syncComposerPills();renderModelPop();renderInspector();renderDiffDock();syncContextStrip();
   ensureRepoFiles();
 }
 async function ensureRepoFiles(){
@@ -1540,6 +1797,7 @@ function toggleAllRepos(){
   const b=document.getElementById('scope-btn');
   b.textContent=allRepos?'All':'Repo';
   b.classList.toggle('active',allRepos);
+  syncProjBar();renderProjPop();
   loadList();
 }
 function updateDocTitle(){
@@ -1557,7 +1815,8 @@ function renderList(){
   if(q.length>=2&&q!==searchQ){
     searchQ=q;clearTimeout(searchTm);
     searchTm=setTimeout(async()=>{
-      const r=await api('/api/search?q='+encodeURIComponent(q)+(allRepos?'&all=1':''));
+      const rq=allRepos?'&all=1':(defaultWt?'&repo='+encodeURIComponent(defaultWt):'');
+      const r=await api('/api/search?q='+encodeURIComponent(q)+rq);
       searchHits=r.hits||[];renderList();
     },220);
   }else if(q.length<2&&searchQ){searchQ='';searchHits=[];}
@@ -1649,9 +1908,10 @@ function maybeNotify(list){
   }
 }
 async function loadList(){
-  const d=await api('/api/sessions'+(allRepos?'?all=1':''));
+  const qs=allRepos?'?all=1':(defaultWt?'?repo='+encodeURIComponent(defaultWt):'');
+  const d=await api('/api/sessions'+qs);
   if(!d.sessions)return;
-  if(!defaultWt&&d.default_repo)defaultWt=d.default_repo;
+  if(!defaultWt&&d.default_repo){defaultWt=d.default_repo;syncProjBar();}
   if(!curWt&&defaultWt)curWt=defaultWt;
   sessions=d.sessions;
   maybeNotify(sessions);
@@ -2090,13 +2350,15 @@ function closeCmdk(){document.getElementById('cmdk').classList.remove('open');}
 function renderCmdk(){
   const q=(document.getElementById('cmdk-in').value||'').trim().toLowerCase();
   const base=[
-    {t:'Open Settings & Configuration',h:'Ctrl+,',fn:()=>openSettings('general')},
+    {t:'Open Settings & Appearance',h:'Ctrl+,',fn:()=>openSettings('general')},
+    {t:'Settings · Customize Style & Workflow Packs',h:'Customize',fn:()=>openSettings('customize')},
     {t:'Settings · Per-Role Model Routing',h:'Roles',fn:()=>openSettings('roles')},
     {t:'Settings · Skills & Cold Vault Manager',h:'Skills',fn:()=>openSettings('skills')},
     {t:'Settings · MCP Servers & Memory',h:'MCP',fn:()=>openSettings('mcp')},
+    {t:'Add Local Git Project Workspace…',h:'Project',fn:()=>addLocalProject()},
     {t:'New thread',h:'Action',fn:()=>newThread(false)},
     {t:'New isolated Git worktree thread',h:'Worktree',fn:()=>newThread(true)},
-    {t:'Switch to Automations Queue',h:'Queue',fn:()=>setSbMode('auto')},
+    {t:'Scheduled Routines & GitHub Automations',h:'Routines',fn:()=>setSbMode('auto')},
     {t:'Smart Commit active worktree',h:'Git',fn:()=>smartCommit(false)},
     {t:'Ship Pull Request (zero AI trailers)',h:'PR',fn:()=>shipPr()},
     {t:'Move active thread into isolated Worktree',h:'Branch',fn:()=>moveToWorktree()},
@@ -2106,10 +2368,14 @@ function renderCmdk(){
     {t:'Toggle Quick Worktree Terminal',h:'Ctrl+`',fn:()=>toggleTerminal()},
     {t:'Fork active thread',h:'Branch',fn:()=>forkCurrent()},
     {t:'Compact session context',h:'Memory',fn:()=>compactCurrent()},
-    {t:'Theme: Midnight Studio (Indigo Dark)',h:'Palette',fn:()=>setTheme('midnight')},
-    {t:'Theme: Pure Obsidian (OLED Black)',h:'Palette',fn:()=>setTheme('obsidian')},
-    {t:'Theme: Daylight Crisp (Light)',h:'Palette',fn:()=>setTheme('daylight')},
-    {t:'Theme: Warm Paper (Parchment Light)',h:'Palette',fn:()=>setTheme('paper')},
+    {t:'Palette: Claude Organic (Warm Terracotta & Cream)',h:'Design',fn:()=>setPalette('claude')},
+    {t:'Palette: Codex Neutral (Monochrome & Emerald)',h:'Design',fn:()=>setPalette('codex')},
+    {t:'Palette: Twig Studio (Linear Indigo)',h:'Design',fn:()=>setPalette('studio')},
+    {t:'Palette: Pure Obsidian (OLED Contrast)',h:'Design',fn:()=>setPalette('obsidian')},
+    {t:'Appearance: Follow System Dark/Light',h:'Auto',fn:()=>setColorMode('system')},
+    {t:'Appearance: Force Dark Mode',h:'Dark',fn:()=>setColorMode('dark')},
+    {t:'Appearance: Force Light Mode',h:'Light',fn:()=>setColorMode('light')},
+    ...projects.map(p=>({t:`Project · ${p.name} (${p.branch||'repo'})`,h:'Switch',fn:()=>switchProject(p.path)})),
     ...sessions.slice(0,20).map(s=>({t:`Thread · ${s.label}`,h:shortAge(s.age),fn:()=>openSid(s.sid)})),
   ];
   cmdkItems=base.filter(x=>!q||x.t.toLowerCase().includes(q));
@@ -2148,9 +2414,15 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='/'&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName||'')){e.preventDefault();document.getElementById('inp')?.focus();}
 });
 
-/* Studio Settings Modal (5 Tabs: General, Roles, Runtime & Hooks, Skills & Vault, MCP & Memory) */
+/* Studio Settings Modal (6 Tabs: General, Customize & Packs, Roles, Runtime & Hooks, Skills & Vault, MCP & Memory) */
 let stgTab='general',stgData=null,stgSkillQ='';
-const STG_TITLES={general:'General & Appearance',roles:'Models & Per-Role Routing',runtime:'Runtime Guardrails & Project Hooks',skills:'3-Tier Skills & Cold Vault',mcp:'MCP Servers & Persistent Memory'};
+const STG_TITLES={general:'General & System Appearance',customize:'Customize Style & Workflow Packs',roles:'Models & Per-Role Routing',runtime:'Runtime Guardrails & Project Hooks',skills:'3-Tier Skills & Cold Vault',mcp:'MCP Servers & Persistent Memory'};
+const STYLE_PRESETS=[
+  {id:'ponytail',t:'Ponytail Minimal',d:'Shortest working solution, stdlib before dependencies, zero speculative abstractions (YAGNI).',txt:'- Favor the simplest, shortest working implementation (YAGNI).\n- Reach for standard library primitives before adding dependencies.\n- Keep answers concise with clickable file:line references.'},
+  {id:'architect',t:'Architect Walkthrough',d:'Lead with module boundaries, invariants, dataflow tradeoffs, and explicit verification plans.',txt:'- Explain root causes, invariants, and module boundary tradeoffs clearly.\n- Cite exact file:line locations and verify edge cases before concluding.'},
+  {id:'tdd',t:'Strict Test-First (TDD)',d:'Reproduce bugs or specify behavior with a failing test first, then write minimal code to pass.',txt:'- Always add or update a targeted test reproducing the requirement/bug before changing implementation.\n- Run the test suite to confirm green status before finishing.'},
+  {id:'security',t:'Security & Boundary Audit',d:'Scrutinize auth, CSRF/Origin checks, path confinement, injection surfaces, and error handling.',txt:'- Audit every change for path confinement, auth/token leaks, injection surfaces, and resource bounds.\n- Never weaken sandbox, permission, or verification gates.'},
+];
 
 async function openSettings(tab='general'){
   stgTab=tab;
@@ -2167,23 +2439,52 @@ function syncStgNav(){
   document.querySelectorAll('.stg-tab').forEach(b=>b.classList.toggle('active',b.dataset.st===stgTab));
 }
 function setSendKey(m){sendKeyMode=m;localStorage.setItem('twig_send_key',m);renderStgBody();syncActionBtn();}
+async function applyStylePreset(id){
+  const p=STYLE_PRESETS.find(x=>x.id===id);if(!p||!stgData)return;
+  const mem=stgData.memory||{};
+  const cur=(presetScope==='project'?mem.project:mem.global)||'';
+  const next=(cur.trim()?cur.trim()+'\n\n':'')+`## Style Preset: ${p.t}\n${p.txt}\n`;
+  const body={section:'memory',worktree:curWt||defaultWt};
+  if(presetScope==='project')body.project=next;else body.global=next;
+  const r=await api('/api/settings',{method:'POST',body:JSON.stringify(body)});
+  if(r.error)return toast(r.error);
+  toast(`Applied "${p.t}" to ${presetScope} preferences`);refreshStg();
+}
+async function activateWorkflowPack(pack){
+  const r=await api('/api/settings',{method:'POST',body:JSON.stringify({section:'bundle',worktree:curWt||defaultWt,pack})});
+  if(r.error)return toast(r.error);
+  toast(r.summary||'Activated workflow pack');refreshStg();
+}
 function renderStgBody(){
   const box=document.getElementById('stg-body');
   if(!stgData)return;
   if(stgTab==='general'){
     const pals=[
-      {id:'midnight',n:'Midnight Studio',c:'#0b0c10',a:'#6e7bf2'},
-      {id:'obsidian',n:'Pure Obsidian',c:'#000000',a:'#6366f1'},
-      {id:'daylight',n:'Daylight Crisp',c:'#ffffff',a:'#4f46e5'},
-      {id:'paper',n:'Warm Paper',c:'#faf8f5',a:'#c96442'},
+      {id:'claude',n:'Claude Organic',sub:'Pampas Cream & Terracotta',dk:'#1a1917',lt:'#faf9f5',a:'#d97757'},
+      {id:'codex',n:'Codex Neutral',sub:'Graphite Monochrome & Emerald',dk:'#171717',lt:'#ffffff',a:'#10a37f'},
+      {id:'studio',n:'Twig Studio',sub:'Linear Slate & Indigo',dk:'#0b0c10',lt:'#f6f7f9',a:'#6e7bf2'},
+      {id:'obsidian',n:'Pure Obsidian',sub:'True OLED Black & Alabaster',dk:'#000000',lt:'#fafafa',a:'#6366f1'},
     ];
+    const eff=resolvedAppearance();
     const pairUrl=location.origin+(tok?'/?token='+encodeURIComponent(tok):'');
     box.innerHTML=`
       <div class="stg-card">
-        <div class="stg-lbl">Color Palette</div>
-        <div class="pal-grid">${pals.map(p=>`<button class="pal-card ${theme===p.id?'active':''}" onclick="setTheme('${p.id}');renderStgBody()">
-          <span style="display:flex;align-items:center;gap:6px"><span style="width:16px;height:16px;border-radius:5px;background:${p.c};border:1px solid var(--border-hi)"></span><span style="width:10px;height:10px;border-radius:99px;background:${p.a}"></span></span>
+        <div class="stg-row">
+          <div><div class="stg-lbl">Appearance Mode</div><div class="stg-sub">Follows OS \`prefers-color-scheme\` live (currently resolved to <strong>${eff}</strong>)</div></div>
+          <div style="display:flex;gap:4px">
+            <button class="f-pill ${colorMode==='system'?'active':''}" onclick="setColorMode('system')">◐ System</button>
+            <button class="f-pill ${colorMode==='dark'?'active':''}" onclick="setColorMode('dark')">☾ Dark</button>
+            <button class="f-pill ${colorMode==='light'?'active':''}" onclick="setColorMode('light')">☀ Light</button>
+          </div>
+        </div>
+        <div class="stg-lbl" style="margin-top:2px">Brand Design System</div>
+        <div class="pal-grid">${pals.map(p=>`<button class="pal-card ${palette===p.id?'active':''}" onclick="setPalette('${p.id}')">
+          <span style="display:flex;align-items:center;gap:6px">
+            <span style="width:24px;height:16px;border-radius:5px;border:1px solid var(--border-hi);background:linear-gradient(135deg,${p.dk} 50%,${p.lt} 50%)"></span>
+            <span style="width:10px;height:10px;border-radius:99px;background:${p.a}"></span>
+          </span>
           <span style="font-size:12px;font-weight:600">${p.n}</span>
+          <span style="font-size:10.5px;color:var(--fg-muted);line-height:1.25">${p.sub}</span>
         </button>`).join('')}</div>
       </div>
       <div class="stg-card">
@@ -2218,6 +2519,47 @@ function renderStgBody(){
         <div class="stg-row"><span class="stg-sub">Contextual Side Chat (/btw)</span><kbd>Ctrl+;</kbd></div>
         <div class="stg-row"><span class="stg-sub">Worktree Quick Terminal</span><kbd>Ctrl+\`</kbd></div>
         <div class="stg-row"><span class="stg-sub">Diff Review Dock</span><kbd>Ctrl+D</kbd></div>
+      </div>`;
+    return;
+  }
+  if(stgTab==='customize'){
+    const mem=stgData.memory||{};
+    const agDoc=(mem.agents_md||'').trim();
+    box.innerHTML=`
+      <div class="stg-card">
+        <div class="stg-row">
+          <div><div class="stg-lbl">Coding & Response Style Presets</div><div class="stg-sub">1-click Claude-style behavioral profiles written cleanly to \`preferences.md\`</div></div>
+          <div style="display:flex;gap:4px">
+            <button class="f-pill ${presetScope==='project'?'active':''}" onclick="presetScope='project';renderStgBody()">Project</button>
+            <button class="f-pill ${presetScope==='global'?'active':''}" onclick="presetScope='global';renderStgBody()">Global</button>
+          </div>
+        </div>
+        <div class="preset-grid">${STYLE_PRESETS.map(p=>`<button class="preset-card" onclick="applyStylePreset('${p.id}')">
+          <strong style="font-size:12.5px;color:var(--fg)">✧ ${esc(p.t)}</strong>
+          <span class="stg-sub">${esc(p.d)}</span>
+        </button>`).join('')}</div>
+      </div>
+      <div class="stg-card">
+        <div><div class="stg-lbl">Curated Workflow & Plugin Packs</div><div class="stg-sub">Zero-token-bloat capability bundles combining hooks, multi-model routing, and MCP</div></div>
+        <div class="stg-row" style="padding:8px 10px;border-radius:9px;background:var(--bg);border:1px solid var(--border)">
+          <div style="flex:1"><strong style="font-size:12.5px">⛨ Auto Verification Gate</strong><div class="stg-sub">Auto-detect Cargo / npm / pytest / Go checks and bind \`.twig/project.json\` turn hooks</div></div>
+          <button class="btn-xs" onclick="activateWorkflowPack('verify_hooks')">Activate</button>
+        </div>
+        <div class="stg-row" style="padding:8px 10px;border-radius:9px;background:var(--bg);border:1px solid var(--border)">
+          <div style="flex:1"><strong style="font-size:12.5px">✻ Cross-Model Adversarial Reviewer</strong><div class="stg-sub">Route \`reviewer\` role to independent local \`cli:codex\` / \`cli:claude\` at high reasoning effort</div></div>
+          <button class="btn-xs" onclick="activateWorkflowPack('cross_review')">Activate</button>
+        </div>
+        <div class="stg-row" style="padding:8px 10px;border-radius:9px;background:var(--bg);border:1px solid var(--border)">
+          <div style="flex:1"><strong style="font-size:12.5px">◈ REA Architecture MCP Scaffold</strong><div class="stg-sub">Wire lazy stdio Repository Entropy & Architecture server in \`.twig/mcp.json\`</div></div>
+          <button class="btn-xs" onclick="activateWorkflowPack('rea_pack')">Activate</button>
+        </div>
+      </div>
+      <div class="stg-card">
+        <div class="stg-row">
+          <div><div class="stg-lbl">Project Instructions (\`AGENTS.md\` / \`CLAUDE.md\`)</div><div class="stg-sub">${agDoc?`Loaded automatically (${agDoc.length} chars)`:'No AGENTS.md or CLAUDE.md found in project root'}</div></div>
+          <button class="btn-xs" onclick="switchStgTab('mcp')">Edit Memory →</button>
+        </div>
+        ${agDoc?`<pre style="max-height:120px;overflow:auto;padding:8px 10px;border-radius:8px;background:var(--code-bg);border:1px solid var(--border);font:11.5px/1.45 ui-monospace,monospace;color:var(--fg-dim);white-space:pre-wrap">${esc(agDoc.slice(0,900))}${agDoc.length>900?'\n…':''}</pre>`:''}
       </div>`;
     return;
   }
@@ -2604,7 +2946,7 @@ async function runQuickCmd(cmd){
   if(curSid)openSid(curSid);
 }
 
-/* Automations Queue Mode (Threads | Automations) */
+/* Scheduled Routines & GitHub Automations Mode (Threads | Routines) */
 async function setSbMode(m){
   sbMode=m;
   document.getElementById('m-thr').classList.toggle('active',m==='threads');
@@ -2614,29 +2956,118 @@ async function setSbMode(m){
   else{document.querySelector('.composer-dock').style.display='';renderList();lastHtml='';render();}
 }
 async function loadAutomations(){
-  autoData=await api('/api/automations?wt='+encodeURIComponent(curWt||defaultWt||''));
+  const[ad,sd]=await Promise.all([
+    api('/api/automations?wt='+encodeURIComponent(curWt||defaultWt||'')),
+    api('/api/schedules'),
+  ]);
+  autoData=ad;
+  schedules=Array.isArray(sd.schedules)?sd.schedules:[];
   if(sbMode==='auto'){renderAutoSidebar();renderAutoStage();}
 }
 function renderAutoSidebar(){
   const items=(autoData&&autoData.items)||[];
   const q=(document.getElementById('q').value||'').trim().toLowerCase();
-  const filt=items.filter(it=>!q||`${it.title} #${it.number} ${it.state}`.toLowerCase().includes(q));
-  document.getElementById('sb-count').textContent=`${items.length} queued`;
-  document.getElementById('slist').innerHTML=filt.length?filt.map(it=>{
-    const col=it.state==='done'?'var(--ok)':it.state==='failed'?'var(--err)':it.state==='needs_attention'?'var(--warn)':'var(--accent)';
-    return `<div class="t-card" onclick="renderAutoStage()">
-      <div class="t-row1"><span class="proj-name">#${it.number} · ${esc(it.kind)}</span><span class="t-status" style="color:${col}">${esc(it.state)}</span></div>
-      <div class="t-title">${esc(it.title)}</div>
-      <div class="t-row3"><span class="t-branch">${esc(it.repository||'')}</span></div>
-    </div>`;
-  }).join(''):'<div style="padding:18px 12px;font-size:12.5px;color:var(--fg-muted)">Queue is empty. Configure or enqueue tasks on the right.</div>';
+  const filtSch=schedules.filter(s=>!q||`${s.name} ${s.prompt} ${s.worktree}`.toLowerCase().includes(q));
+  const filtIt=items.filter(it=>!q||`${it.title} #${it.number} ${it.state}`.toLowerCase().includes(q));
+  document.getElementById('sb-count').textContent=`${schedules.length} routine${schedules.length===1?'':'s'} · ${items.length} queued`;
+  let html='';
+  if(filtSch.length){
+    html+=`<div class="grp-hdr"><span>⟳ Scheduled</span><span>${filtSch.length}</span></div>`;
+    html+=filtSch.map(s=>`<div class="t-card" data-sid="${esc(s.last_sid||'')}" onclick="if(this.dataset.sid)openSid(this.dataset.sid);else renderAutoStage()">
+      <div class="t-row1"><span class="proj-name">${esc(baseName(s.worktree))}</span><span class="t-status" style="color:${s.enabled?'var(--ok)':'var(--fg-muted)'}">${s.enabled?`every ${s.interval_mins}m`:'paused'}</span></div>
+      <div class="t-title">${esc(s.name)}</div>
+      <div class="t-row3"><span class="t-branch">${esc(s.role)}</span><span class="t-stat">${s.last_sid?'last run →':'ready'}</span></div>
+    </div>`).join('');
+  }
+  if(filtIt.length){
+    html+=`<div class="grp-hdr"><span>⇪ GitHub Queue</span><span>${filtIt.length}</span></div>`;
+    html+=filtIt.map(it=>{
+      const col=it.state==='done'?'var(--ok)':it.state==='failed'?'var(--err)':it.state==='needs_attention'?'var(--warn)':'var(--accent)';
+      return `<div class="t-card" onclick="renderAutoStage()">
+        <div class="t-row1"><span class="proj-name">#${it.number} · ${esc(it.kind)}</span><span class="t-status" style="color:${col}">${esc(it.state)}</span></div>
+        <div class="t-title">${esc(it.title)}</div>
+        <div class="t-row3"><span class="t-branch">${esc(it.repository||'')}</span></div>
+      </div>`;
+    }).join('');
+  }
+  document.getElementById('slist').innerHTML=html||'<div style="padding:18px 12px;font-size:12.5px;color:var(--fg-muted)">No active routines or queued tasks yet. Create one on the right.</div>';
+}
+function prefillSchedule(name,mins,role,prompt){
+  const nEl=document.getElementById('sch-name'),mEl=document.getElementById('sch-mins'),rEl=document.getElementById('sch-role'),pEl=document.getElementById('sch-prompt');
+  if(nEl)nEl.value=name;if(mEl)mEl.value=String(mins);if(rEl)rEl.value=role;if(pEl){pEl.value=prompt;pEl.focus();}
+}
+async function addScheduleRoutine(){
+  const name=document.getElementById('sch-name')?.value.trim();
+  const interval_mins=+(document.getElementById('sch-mins')?.value||60);
+  const role=document.getElementById('sch-role')?.value||'plan';
+  const prompt=document.getElementById('sch-prompt')?.value.trim();
+  if(!name||!prompt)return toast('Routine name and prompt required');
+  const r=await api('/api/schedules',{method:'POST',body:JSON.stringify({action:'add',name,interval_mins,role,prompt,worktree:curWt||defaultWt})});
+  if(r.error)return toast(r.error);
+  toast(`Scheduled "${name}" every ${interval_mins}m`);loadAutomations();
+}
+async function toggleSchedule(id){
+  const r=await api('/api/schedules',{method:'POST',body:JSON.stringify({action:'toggle',id})});
+  if(r.error)return toast(r.error);
+  loadAutomations();
+}
+async function runScheduleNow(id){
+  const r=await api('/api/schedules',{method:'POST',body:JSON.stringify({action:'run_now',id})});
+  if(r.error)return toast(r.error);
+  toast('Dispatched routine turn');
+  await loadList();
+  if(r.sid)openSid(r.sid,true);else loadAutomations();
+}
+async function removeSchedule(id){
+  const r=await api('/api/schedules',{method:'POST',body:JSON.stringify({action:'remove',id})});
+  if(r.error)return toast(r.error);
+  toast('Removed routine');loadAutomations();
 }
 function renderAutoStage(){
   document.querySelector('.composer-dock').style.display='none';
-  document.getElementById('stitle').textContent='Automations Queue';
+  document.getElementById('stitle').textContent='Scheduled Routines & Automations';
   const d=autoData||{items:[]},cfg=d.config||{},items=d.items||[];
   const repo=cfg.repository||d.suggested_repo||'owner/repo';
   const html=`<div class="auto-wrap">
+    <div class="stg-card">
+      <div class="stg-row">
+        <div><div class="stg-lbl">Scheduled Recurring Routines (\`~/.config/twig/schedules.json\`)</div><div class="stg-sub">Local background routines (Claude Scheduled + Codex Automations) dispatched automatically in \`${esc(baseName(curWt||defaultWt))}\`.</div></div>
+        <div style="display:flex;gap:5px;flex-wrap:wrap">
+          <button class="td-chip" onclick="prefillSchedule('Hourly Test & Lint Sweep',60,'plan','Run tests and static checks, and report any regressions or flaky failures.')">+ Test Sweep</button>
+          <button class="td-chip" onclick="prefillSchedule('Daily Security & Debt Audit',1440,'plan','Audit recent commits and dependencies for security risks, dead code, or boundary violations.')">+ Daily Audit</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.3fr .8fr .8fr;gap:8px">
+        <input class="stg-in" id="sch-name" placeholder="Routine name (e.g. Nightly CI Health)">
+        <select class="stg-in" id="sch-mins">
+          <option value="15">Every 15 min</option>
+          <option value="30">Every 30 min</option>
+          <option value="60" selected>Hourly (60m)</option>
+          <option value="360">Every 6 hours</option>
+          <option value="1440">Daily (24h)</option>
+        </select>
+        <select class="stg-in" id="sch-role">
+          <option value="plan" selected>◈ Plan / Audit (RO)</option>
+          <option value="code">⚡ Full Auto (Code)</option>
+        </select>
+      </div>
+      <div style="display:flex;gap:8px">
+        <input class="stg-in" id="sch-prompt" placeholder="Prompt or $skill instruction to run on schedule…" style="flex:1">
+        <button class="btn-pri" onclick="addScheduleRoutine()">+ Schedule</button>
+      </div>
+      ${schedules.length?`<div style="display:flex;flex-direction:column;gap:6px;padding-top:4px">${schedules.map(s=>`<div class="stg-row" style="padding:8px 10px;border-radius:9px;background:var(--bg);border:1px solid var(--border)">
+        <div style="min-width:0;flex:1">
+          <div style="display:flex;align-items:center;gap:7px"><strong style="font-size:13px">${esc(s.name)}</strong><span class="f-pill" style="height:20px">every ${s.interval_mins}m · ${esc(s.role)}</span><span class="stg-sub">${esc(baseName(s.worktree))}</span></div>
+          <div class="stg-sub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(s.prompt)}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${s.last_sid?`<button class="btn-xs" data-sid="${esc(s.last_sid)}" onclick="openSid(this.dataset.sid,true)">Last thread →</button>`:''}
+          <button class="btn-xs" data-id="${esc(s.id)}" onclick="runScheduleNow(this.dataset.id)">▶ Run now</button>
+          <button class="sw-btn ${s.enabled?'on':''}" data-id="${esc(s.id)}" onclick="toggleSchedule(this.dataset.id)" title="Enable / pause schedule"></button>
+          <button class="icon-btn" data-id="${esc(s.id)}" onclick="removeSchedule(this.dataset.id)" title="Delete routine">×</button>
+        </div>
+      </div>`).join('')}</div>`:'<div class="stg-sub">No recurring schedules configured yet.</div>'}
+    </div>
     <div class="stg-card">
       <div class="stg-row">
         <div><div class="stg-lbl">Durable GitHub & Worktree Automation (\`.twig/automation.json\`)</div><div class="stg-sub">Isolates each queued Issue/PR in its own worktree, runs acceptance checks + reviewer gate, and pauses before shipping.</div></div>
@@ -2728,6 +3159,7 @@ function connectSse(){
       let d;try{d=JSON.parse(e.data);}catch(_){return;}
       const sid=d.sid||'';
       if(d.ev==='automation.updated'){if(sbMode==='auto')loadAutomations();if(d.error)toast('Automation: '+d.error);return;}
+      if(d.ev==='schedule.updated'){if(sbMode==='auto')loadAutomations();loadList();return;}
       if(d.ev==='session.started'){loadList();if(sid===curSid&&detail){detail.running=true;scheduleLiveRender();}return;}
       if(d.ev==='model.delta'&&sid){
         liveText[sid]=(liveText[sid]||'')+(d.text||'');
@@ -2795,7 +3227,7 @@ document.body.addEventListener('dragover',e=>{e.preventDefault();compCard?.class
 document.body.addEventListener('dragleave',e=>{if(!e.relatedTarget)compCard?.classList.remove('drop-active');});
 document.body.addEventListener('drop',e=>{e.preventDefault();compCard?.classList.remove('drop-active');for(const f of(e.dataTransfer?.files||[]))addImageFile(f);});
 
-loadMeta();loadList();connectSse();
+loadMeta().then(()=>loadProjects());loadList();connectSse();
 setInterval(()=>{
   if(sbMode==='auto')return;
   loadList();

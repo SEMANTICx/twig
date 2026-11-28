@@ -1,47 +1,46 @@
 //! Built-in zero-dependency Web & Mobile Cockpit (`twig web`) synthesizing the strongest
-//! workflows from T3 Code, `bb` (`getbb.app`), Orca, Happy Coder, and Vibe Kanban:
-//! - 3-pane quantitative `4px`-grid UI (`Inbox` + `Thread / File-Indexed Diff` + `Environment Inspector`)
-//! - Isolated Git worktree creation on new threads, model/effort/role selectors, image paste/drop,
-//!   live `Stop` (`/api/cancel`), subagent thread tree navigation, and opt-in browser notifications
-//! - Hardened against localhost cross-origin CSRF (`Content-Type: application/json` + `Origin` check),
-//!   SVG XSS (`<img src="data:image/svg+xml;base64,...">`), and non-loopback unauthorized access (`Bearer`).
+//! workflows from Codex Desktop, Claude Desktop, T3 Code, `bb`, Zed, Cline, and Linear:
+//! - 3-pane quantitative `4px`-grid UI (`Projects & Threads` + `Timeline / Artifacts / Diff` + `Workspace Inspector`)
+//! - Brand-authentic `Claude` & `Codex` + `Studio` & `Obsidian` palettes with live `System` dark/light auto-sync
+//! - Multi-project switcher, recurring `Scheduled` routines, GitHub `Automations`, live SSE + mid-turn `Steer`,
+//!   `GIT_INDEX_FILE` checkpoints, intraline diffs, and curated `Customize` / Plugin workflow packs.
+
+mod hub;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::automation::{Automation, AutomationConfig, ShippingPermissions, SourceKind, WorkItem};
 use crate::config::{paths, HarnessConfig};
 use crate::exec::{run_process, shell_command};
-use crate::llm::{cli, ConfigOp, Llm, Provider};
+use crate::llm::{cli, Llm, Provider};
 use crate::runtime::guidance::SkillStore;
-use crate::runtime::mcp::McpRegistry;
 use crate::runtime::policy::{Policy, Tier};
 use crate::runtime::session::{archive_session, scan_sessions, search_sessions};
 use crate::runtime::workflows::build_goal_prompt;
 use crate::runtime::Daemon;
 
-const COCKPIT_HTML: &str = include_str!("web_ui.html");
+const COCKPIT_HTML: &str = include_str!("../web_ui.html");
 
-struct ActiveRun {
-    pid: u32,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
+pub(super) struct ActiveRun {
+    pub(super) pid: u32,
+    pub(super) stdin: Arc<Mutex<Option<ChildStdin>>>,
 }
 
-struct WebState {
-    default_repo: PathBuf,
-    token: Option<String>,
-    runs: Mutex<HashMap<String, ActiveRun>>,
-    sse_clients: Mutex<Vec<SyncSender<String>>>,
-    automation_running: AtomicBool,
+pub(super) struct WebState {
+    pub(super) default_repo: PathBuf,
+    pub(super) token: Option<String>,
+    pub(super) runs: Mutex<HashMap<String, ActiveRun>>,
+    pub(super) sse_clients: Mutex<Vec<SyncSender<String>>>,
+    pub(super) automation_running: AtomicBool,
 }
 
 /// Start the `twig web` HTTP cockpit server (`twig web [--port 3426] [--bind 127.0.0.1] [--repo .] [--token T]`).
@@ -119,6 +118,7 @@ pub fn serve_web(args: &[String]) -> Result<(), String> {
         sse_clients: Mutex::new(Vec::new()),
         automation_running: AtomicBool::new(false),
     });
+    hub::spawn_scheduler_loop(state.clone());
 
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
@@ -130,7 +130,7 @@ pub fn serve_web(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn broadcast_sse(state: &WebState, ev: &Value) {
+pub(super) fn broadcast_sse(state: &WebState, ev: &Value) {
     let Ok(mut clients) = state.sse_clients.lock() else {
         return;
     };
@@ -254,7 +254,6 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         return serve_sse_stream(stream, state);
     }
 
-    // Block cross-origin browser CSRF against loopback `POST` endpoints (e.g. `<form enctype="text/plain">`).
     if method == "POST" {
         if !content_type.starts_with("application/json") {
             let err = json!({"error": "Content-Type: application/json required"}).to_string();
@@ -267,8 +266,10 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
     }
 
     let resp_json: Result<Value, String> = match (method, path) {
-        ("GET", "/api/meta") => Ok(collect_meta(state)),
+        ("GET", "/api/meta") => Ok(collect_meta(query, state)),
         ("GET", "/api/files") => Ok(list_worktree_files(query, &state.default_repo)),
+        ("GET", "/api/projects") => Ok(hub::collect_projects(state)),
+        ("GET", "/api/schedules") => Ok(hub::collect_schedules(state)),
         ("GET", "/api/search") => {
             let q = query
                 .split('&')
@@ -276,30 +277,41 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
                 .map(url_decode_simple)
                 .unwrap_or_default();
             let all = query.split('&').any(|kv| kv == "all=1");
-            let filter = (!all).then_some(state.default_repo.as_path());
+            let repo_q = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("repo="))
+                .map(url_decode_simple)
+                .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+                .map(PathBuf::from);
+            let target = repo_q.as_deref().unwrap_or(state.default_repo.as_path());
+            let filter = (!all).then_some(target);
             Ok(json!({ "hits": search_sessions(&q, filter, 20) }))
         }
-        ("GET", "/api/settings") => collect_settings(query, &state.default_repo),
-        ("GET", "/api/automations") => Ok(collect_automations(query, state)),
+        ("GET", "/api/settings") => hub::collect_settings(query, &state.default_repo),
+        ("GET", "/api/automations") => Ok(hub::collect_automations(query, state)),
         ("GET", "/api/sessions") => {
             let all = query.split('&').any(|kv| kv == "all=1");
+            let repo_q = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("repo="))
+                .map(url_decode_simple)
+                .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+                .map(PathBuf::from);
+            let active_repo = repo_q.unwrap_or_else(|| state.default_repo.clone());
             let running: std::collections::HashSet<String> = state
                 .runs
                 .lock()
                 .map(|g| g.keys().cloned().collect())
                 .unwrap_or_default();
-            let filter = (!all).then_some(state.default_repo.as_path());
+            let filter = (!all).then_some(active_repo.as_path());
             let mut items = scan_sessions(filter, 50);
-            if items.is_empty() && !all {
-                items = scan_sessions(None, 50);
-            }
             for s in &mut items {
                 if running.contains(&s.sid) {
                     s.status = "running".to_owned();
                 }
             }
             Ok(json!({
-                "default_repo": state.default_repo.display().to_string(),
+                "default_repo": active_repo.display().to_string(),
                 "sessions": items,
             }))
         }
@@ -337,13 +349,19 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
             .and_then(|req| run_quick_shell(&req, &state.default_repo)),
         ("POST", "/api/settings") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
-            .and_then(|req| apply_settings(&req, &state.default_repo)),
+            .and_then(|req| hub::apply_settings(&req, &state.default_repo)),
+        ("POST", "/api/projects") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| hub::apply_projects(&req, state)),
+        ("POST", "/api/schedules") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| hub::apply_schedules(&req, state)),
         ("POST", "/api/discard") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| discard_worktree_file(&req, &state.default_repo)),
         ("POST", "/api/automations") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
-            .and_then(|req| apply_automations(&req, state)),
+            .and_then(|req| hub::apply_automations(&req, state)),
         _ => Err(format!("not found: {method} {path}")),
     };
 
@@ -385,7 +403,14 @@ fn write_http(
     stream.flush()
 }
 
-fn collect_meta(state: &Arc<WebState>) -> Value {
+fn collect_meta(query: &str, state: &Arc<WebState>) -> Value {
+    let repo_dir = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("wt="))
+        .map(url_decode_simple)
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.default_repo.clone());
     let provider = Provider::new();
     let active_model = provider.roles().get("code").to_owned();
     let mut models = cli::detected_runners();
@@ -401,7 +426,7 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
     }
     let branch = Command::new("git")
         .arg("-C")
-        .arg(&state.default_repo)
+        .arg(&repo_dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()
@@ -410,14 +435,14 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         .unwrap_or_default();
     let diff = Command::new("git")
         .arg("-C")
-        .arg(&state.default_repo)
+        .arg(&repo_dir)
         .args(["diff", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(64_000).collect::<String>())
         .unwrap_or_default();
-    let skills: Vec<Value> = SkillStore::default_for(Some(&state.default_repo))
+    let skills: Vec<Value> = SkillStore::default_for(Some(&repo_dir))
         .catalog_for_autocomplete()
         .into_iter()
         .take(80)
@@ -425,7 +450,7 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         .collect();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "default_repo": state.default_repo.display().to_string(),
+        "default_repo": repo_dir.display().to_string(),
         "branch": branch,
         "diff": diff,
         "active_model": active_model,
@@ -435,7 +460,7 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
     })
 }
 
-fn url_decode_simple(raw: &str) -> String {
+pub(super) fn url_decode_simple(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -607,7 +632,7 @@ fn stage_data_images(sid: &str, imgs: &[Value]) -> Vec<String> {
     refs
 }
 
-fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
+pub(super) fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
     let raw_prompt = req["prompt"].as_str().map(str::trim).unwrap_or("");
     let imgs = req["images"]
         .as_array()
@@ -986,477 +1011,6 @@ fn run_quick_shell(req: &Value, default_repo: &Path) -> Result<Value, String> {
     }))
 }
 
-fn read_mcp_entries(wt: &Path) -> Vec<Value> {
-    let mut merged: std::collections::BTreeMap<String, (Value, &'static str)> =
-        std::collections::BTreeMap::new();
-    for (p, scope) in [
-        (paths::config_dir().join("mcp.json"), "global"),
-        (wt.join(".twig/mcp.json"), "project"),
-    ] {
-        let Ok(raw) = std::fs::read_to_string(p) else { continue };
-        let Ok(val) = serde_json::from_str::<Value>(&raw) else { continue };
-        if let Some(obj) = val.get("mcpServers").and_then(Value::as_object) {
-            for (k, v) in obj {
-                merged.insert(k.clone(), (v.clone(), scope));
-            }
-        }
-    }
-    merged
-        .into_iter()
-        .map(|(name, (v, scope))| {
-            let args: Vec<String> = v
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                .unwrap_or_default();
-            json!({
-                "name": name,
-                "command": v.get("command").and_then(Value::as_str).unwrap_or(""),
-                "args": args,
-                "disabled": v.get("disabled").and_then(Value::as_bool).unwrap_or(false),
-                "scope": scope,
-            })
-        })
-        .collect()
-}
-
-fn collect_settings(query: &str, default_repo: &Path) -> Result<Value, String> {
-    let wt = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("wt="))
-        .map(url_decode_simple)
-        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_repo.to_path_buf());
-    let provider = Provider::new();
-    let roles_rep = Provider::apply_config(ConfigOp::RolesReport)?;
-    let (harness, harness_src) = HarnessConfig::resolve()?;
-    let store = SkillStore::default_for(Some(&wt));
-    let (active_cnt, vault_cnt) = store.counts();
-    let (skills_ok, _) = store.doctor_report();
-    let skills: Vec<Value> = store
-        .catalog_for_autocomplete()
-        .into_iter()
-        .map(|(name, scope, desc)| json!({"name": name, "scope": scope, "desc": desc}))
-        .collect();
-
-    let proj_cfg_raw = std::fs::read_to_string(wt.join(".twig/project.json")).unwrap_or_default();
-    let proj_cfg: Value = serde_json::from_str(&proj_cfg_raw).unwrap_or_else(|_| json!({}));
-    let check_cmd = proj_cfg
-        .get("check")
-        .and_then(|c| c.as_str().or_else(|| c.get("command").and_then(Value::as_str)))
-        .unwrap_or("")
-        .to_owned();
-    let post_edit_cmd = proj_cfg
-        .get("post_edit_check")
-        .and_then(|c| c.as_str().or_else(|| c.get("command").and_then(Value::as_str)))
-        .unwrap_or("")
-        .to_owned();
-
-    let global_mem =
-        std::fs::read_to_string(paths::config_dir().join("preferences.md")).unwrap_or_default();
-    let proj_mem = std::fs::read_to_string(wt.join(".twig/preferences.md")).unwrap_or_default();
-
-    Ok(json!({
-        "gateway_base": provider.base(),
-        "cli_runners": cli::detected_runners(),
-        "roles": roles_rep.get("roles").cloned().unwrap_or_else(|| json!([])),
-        "harness": harness,
-        "harness_source": harness_src,
-        "hooks": {
-            "check": check_cmd,
-            "post_edit_check": post_edit_cmd,
-        },
-        "skills": {
-            "active_count": active_cnt,
-            "vault_count": vault_cnt,
-            "healthy": skills_ok,
-            "items": skills,
-        },
-        "mcp": read_mcp_entries(&wt),
-        "memory": {
-            "global": global_mem,
-            "project": proj_mem,
-        }
-    }))
-}
-
-fn apply_settings(req: &Value, default_repo: &Path) -> Result<Value, String> {
-    let section = req["section"].as_str().ok_or("section required")?;
-    let wt = req["worktree"]
-        .as_str()
-        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_repo.to_path_buf());
-
-    match section {
-        "roles" => {
-            if req["action"].as_str() == Some("reset") {
-                return Provider::apply_config(ConfigOp::ResetRoles);
-            }
-            if let Some(items) = req["items"].as_array() {
-                for it in items {
-                    let Some(role) = it["role"].as_str() else { continue };
-                    Provider::apply_config(ConfigOp::SetRole {
-                        role,
-                        model: it["model"].as_str(),
-                        effort: it["effort"].as_str(),
-                    })?;
-                }
-                return Provider::apply_config(ConfigOp::RolesReport);
-            }
-            let role = req["role"].as_str().ok_or("role required")?;
-            Provider::apply_config(ConfigOp::SetRole {
-                role,
-                model: req.get("model").and_then(Value::as_str),
-                effort: req.get("effort").and_then(Value::as_str),
-            })
-        }
-        "harness" => {
-            let (cur, _) = HarnessConfig::resolve()?;
-            let next = cur.merged(req.get("patch").unwrap_or(&json!({})))?;
-            let cfg_path = paths::config_path();
-            if let Some(p) = cfg_path.parent() {
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-            }
-            next.save(&cfg_path).map_err(|e| e.to_string())?;
-
-            if let Some(hooks) = req.get("hooks").and_then(Value::as_object) {
-                let pj_path = wt.join(".twig/project.json");
-                let mut pj: Value = std::fs::read_to_string(&pj_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| json!({}));
-                if let Some(obj) = pj.as_object_mut() {
-                    for k in ["check", "post_edit_check"] {
-                        if let Some(v) = hooks.get(k).and_then(Value::as_str) {
-                            let t = v.trim();
-                            if t.is_empty() {
-                                obj.remove(k);
-                            } else {
-                                obj.insert(k.to_owned(), Value::String(t.to_owned()));
-                            }
-                        }
-                    }
-                }
-                if let Some(parent) = pj_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                }
-                let body = serde_json::to_string_pretty(&pj).map_err(|e| e.to_string())?;
-                std::fs::write(&pj_path, format!("{body}\n")).map_err(|e| e.to_string())?;
-            }
-            Ok(json!({"saved": true}))
-        }
-        "skill" => {
-            let name = req["name"].as_str().ok_or("skill name required")?;
-            let enable = req["enable"].as_bool().unwrap_or(true);
-            let project = req["project"].as_bool().unwrap_or(false);
-            let store = SkillStore::default_for(Some(&wt));
-            let msg = if enable {
-                store.enable(name, project)?
-            } else {
-                store.disable(name, project)?
-            };
-            Ok(json!({"ok": true, "summary": msg}))
-        }
-        "mcp" => {
-            let action = req["action"].as_str().unwrap_or("enable");
-            if matches!(action, "enable" | "disable" | "init_rea") {
-                let msg = McpRegistry::configure_project_file(&wt, req)?;
-                return Ok(json!({"ok": true, "summary": msg}));
-            }
-            let path = wt.join(".twig/mcp.json");
-            let mut root: Value = std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| json!({"mcpServers": {}}));
-            if !root.get("mcpServers").is_some_and(Value::is_object) {
-                root["mcpServers"] = json!({});
-            }
-            let servers = root["mcpServers"].as_object_mut().ok_or("invalid mcp.json")?;
-            if action == "add" {
-                let name = req["server"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("server name required")?;
-                let cmd = req["command"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("command required")?;
-                let args: Vec<String> = req["args"]
-                    .as_str()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect();
-                servers.insert(name.to_owned(), json!({"command": cmd, "args": args}));
-            } else if action == "remove" {
-                let name = req["server"].as_str().ok_or("server name required")?;
-                servers.remove(name);
-            } else {
-                return Err(format!("unknown mcp action {action:?}"));
-            }
-            if let Some(p) = path.parent() {
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-            }
-            std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?))
-                .map_err(|e| e.to_string())?;
-            Ok(json!({"ok": true, "summary": "Saved .twig/mcp.json"}))
-        }
-        "memory" => {
-            if let Some(g) = req.get("global").and_then(Value::as_str) {
-                let gp = paths::config_dir().join("preferences.md");
-                if let Some(p) = gp.parent() {
-                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&gp, g).map_err(|e| e.to_string())?;
-            }
-            if let Some(pr) = req.get("project").and_then(Value::as_str) {
-                let pp = wt.join(".twig/preferences.md");
-                if let Some(p) = pp.parent() {
-                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                }
-                std::fs::write(&pp, pr).map_err(|e| e.to_string())?;
-            }
-            Ok(json!({"saved": true}))
-        }
-        other => Err(format!("unknown settings section {other:?}")),
-    }
-}
-
-fn infer_github_repo(wt: &Path) -> String {
-    let raw = Command::new("git")
-        .arg("-C")
-        .arg(wt)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_default();
-    let tail = raw
-        .split("github.com")
-        .nth(1)
-        .unwrap_or("")
-        .trim_start_matches([':', '/'])
-        .trim_end_matches(".git");
-    if tail.split('/').filter(|s| !s.is_empty()).count() == 2 {
-        tail.to_owned()
-    } else {
-        String::new()
-    }
-}
-
-fn resolve_automation_cfg_path(wt: &Path) -> PathBuf {
-    let dot_path = wt.join(".twig/automation.json");
-    if dot_path.exists() {
-        dot_path
-    } else {
-        let root_path = wt.join("automation.json");
-        if root_path.exists() {
-            root_path
-        } else {
-            dot_path
-        }
-    }
-}
-
-fn collect_automations(query: &str, state: &Arc<WebState>) -> Value {
-    let wt = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("wt="))
-        .map(url_decode_simple)
-        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.default_repo.clone());
-    let cfg_path = resolve_automation_cfg_path(&wt);
-    let suggested_repo = infer_github_repo(&wt);
-    let running = state.automation_running.load(Ordering::Relaxed);
-    let Ok(raw) = std::fs::read_to_string(&cfg_path) else {
-        return json!({
-            "configured": false,
-            "suggested_repo": suggested_repo,
-            "running": running,
-            "config_path": cfg_path.display().to_string(),
-            "items": [],
-        });
-    };
-    let mut cfg: AutomationConfig = match serde_json::from_str(&raw) {
-        Ok(c) => c,
-        Err(e) => {
-            return json!({
-                "configured": false,
-                "suggested_repo": suggested_repo,
-                "running": running,
-                "error": e.to_string(),
-                "items": [],
-            });
-        }
-    };
-    if cfg.repository_path == Path::new(".") {
-        cfg.repository_path = wt.clone();
-    }
-    if cfg.state_dir.is_relative() {
-        cfg.state_dir = wt.join(&cfg.state_dir);
-    }
-    let items = Automation::open(cfg.clone())
-        .and_then(|a| a.queue_snapshot())
-        .unwrap_or_default();
-    json!({
-        "configured": true,
-        "suggested_repo": suggested_repo,
-        "running": running,
-        "config_path": cfg_path.display().to_string(),
-        "config": cfg,
-        "items": items,
-    })
-}
-
-fn apply_automations(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
-    let action = req["action"].as_str().ok_or("action required")?;
-    let wt = req["worktree"]
-        .as_str()
-        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| state.default_repo.clone());
-    let cfg_path = resolve_automation_cfg_path(&wt);
-
-    match action {
-        "save_config" => {
-            let create_pr = req["create_pr"].as_bool().unwrap_or(false);
-            let cfg = AutomationConfig {
-                repository: req["repository"]
-                    .as_str()
-                    .map(str::trim)
-                    .unwrap_or("")
-                    .to_owned(),
-                repository_path: wt.clone(),
-                label: req["label"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("twig")
-                    .to_owned(),
-                state_dir: paths::state_dir().join("automation-queue"),
-                poll_interval_secs: req["poll_interval_secs"].as_u64().unwrap_or(300).max(30),
-                include_pull_requests: req["include_pull_requests"].as_bool().unwrap_or(false),
-                check_command: req["check_command"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("cargo test --quiet")
-                    .to_owned(),
-                check_timeout_secs: 600,
-                lease_secs: 3600,
-                permissions: ShippingPermissions {
-                    replies: false,
-                    push: create_pr,
-                    create_pr,
-                    merge: false,
-                    release: false,
-                },
-                reply: None,
-                create_pr,
-                merge: false,
-                release_tag: None,
-                ..AutomationConfig::default()
-            };
-            cfg.validate()?;
-            let _ = Automation::open(cfg.clone())?;
-            if let Some(p) = cfg_path.parent() {
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
-            }
-            let body = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
-            std::fs::write(&cfg_path, format!("{body}\n")).map_err(|e| e.to_string())?;
-            Ok(json!({"saved": true}))
-        }
-        "enqueue" => {
-            let raw = std::fs::read_to_string(&cfg_path)
-                .map_err(|_| "configure automation first".to_owned())?;
-            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            let number = req["number"].as_u64().filter(|&n| n > 0).unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    % 100_000
-            });
-            let title = req["title"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or("task title required")?;
-            let body = req["body"].as_str().unwrap_or("");
-            let kind = if req["kind"].as_str() == Some("pr") {
-                SourceKind::PullRequest
-            } else {
-                SourceKind::Issue
-            };
-            let url = req["url"]
-                .as_str()
-                .filter(|s| !s.trim().is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("https://github.com/{}/issues/{number}", cfg.repository));
-            let item = WorkItem::new(&cfg.repository, kind, number, title, body, url);
-            let mut auto = Automation::open(cfg)?;
-            let added = auto.ingest(vec![item])?;
-            broadcast_sse(state, &json!({"ev": "automation.updated"}));
-            Ok(json!({"added": added}))
-        }
-        "poll_once" | "run_local" => {
-            if state
-                .automation_running
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Err("automation poll/run is already active".into());
-            }
-            let raw = std::fs::read_to_string(&cfg_path)
-                .map_err(|_| {
-                    state.automation_running.store(false, Ordering::SeqCst);
-                    "configure automation first".to_owned()
-                })?;
-            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| {
-                state.automation_running.store(false, Ordering::SeqCst);
-                e.to_string()
-            })?;
-            let exe = std::env::current_exe().map_err(|e| {
-                state.automation_running.store(false, Ordering::SeqCst);
-                e.to_string()
-            })?;
-            let local_only = action == "run_local";
-            let st = state.clone();
-            std::thread::spawn(move || {
-                let runs = paths::state_dir().join("automation-sessions");
-                let timeout = Duration::from_secs(cfg.check_timeout_secs.min(3600));
-                let mut exec = crate::automation::TwigExecutor::new(
-                    exe,
-                    runs,
-                    cfg.check_command.clone(),
-                    timeout,
-                    timeout,
-                );
-                let res = Automation::open(cfg).and_then(|mut a| {
-                    if local_only {
-                        a.run_once(&mut exec)
-                    } else {
-                        a.poll_once(&mut exec)
-                    }
-                });
-                st.automation_running.store(false, Ordering::SeqCst);
-                let err = res.err();
-                broadcast_sse(&st, &json!({"ev": "automation.updated", "error": err}));
-            });
-            Ok(json!({"started": true}))
-        }
-        "resolve_shipping" => {
-            let id = req["id"].as_str().ok_or("item id required")?;
-            let ship_act = req["shipping_action"].as_str().unwrap_or("create_pr");
-            let completed = req["completed"].as_bool().unwrap_or(true);
-            let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
-            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            Automation::open(cfg)?.resolve_shipping(id, ship_act, completed)?;
-            broadcast_sse(state, &json!({"ev": "automation.updated"}));
-            Ok(json!({"resolved": true}))
-        }
-        other => Err(format!("unknown automation action {other:?}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1481,7 +1035,6 @@ mod tests {
             }
         });
 
-        // 1. GET / serves cockpit HTML with CSP and 3-pane features
         let mut c1 = TcpStream::connect(addr).unwrap();
         write!(c1, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let mut r1 = String::new();
@@ -1493,14 +1046,12 @@ mod tests {
         assert!(COCKPIT_HTML.contains("data:image/svg+xml;base64,"));
         assert!(COCKPIT_HTML.contains("Open in ") && COCKPIT_HTML.contains("What should we build"));
 
-        // 2. GET /api/sessions without token is rejected with 401
         let mut c2 = TcpStream::connect(addr).unwrap();
         write!(c2, "GET /api/sessions HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let mut r2 = String::new();
         c2.read_to_string(&mut r2).unwrap();
         assert!(r2.contains("401 Unauthorized"));
 
-        // 3. GET /api/sessions with valid Bearer token succeeds with 200
         let mut c3 = TcpStream::connect(addr).unwrap();
         write!(
             c3,
@@ -1511,7 +1062,6 @@ mod tests {
         c3.read_to_string(&mut r3).unwrap();
         assert!(r3.contains("200 OK") && r3.contains("\"sessions\""));
 
-        // 4. POST with text/plain (form CSRF) is rejected with 400
         let mut c4 = TcpStream::connect(addr).unwrap();
         c4.write_all(
             b"POST /api/cancel HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer secret-tok\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{}",
@@ -1521,7 +1071,6 @@ mod tests {
         c4.read_to_string(&mut r4).unwrap();
         assert!(r4.contains("400 Bad Request"));
 
-        // 5. POST from foreign Origin is rejected with 403 Forbidden
         let mut c5 = TcpStream::connect(addr).unwrap();
         c5.write_all(
             b"POST /api/cancel HTTP/1.1\r\nHost: 127.0.0.1:3426\r\nOrigin: https://evil.example\r\nAuthorization: Bearer secret-tok\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"sid\":\"s1\"}",
@@ -1531,7 +1080,6 @@ mod tests {
         c5.read_to_string(&mut r5).unwrap();
         assert!(r5.contains("403 Forbidden"));
 
-        // 6. GET /api/events without token is rejected with 401
         let mut c6 = TcpStream::connect(addr).unwrap();
         write!(c6, "GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let mut r6 = String::new();
