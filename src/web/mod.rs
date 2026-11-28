@@ -28,7 +28,18 @@ use crate::runtime::session::{archive_session, scan_sessions, search_sessions};
 use crate::runtime::workflows::build_goal_prompt;
 use crate::runtime::Daemon;
 
-const COCKPIT_HTML: &str = include_str!("../web_ui.html");
+const COCKPIT_HTML: &str = concat!(
+    "<!doctype html>\n<html lang=\"en\" data-theme=\"claude-dark\">\n<head>\n\
+     <meta charset=\"utf-8\">\n\
+     <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\n\
+     <title>twig</title>\n<style>\n",
+    include_str!("styles.css"),
+    "\n</style>\n</head>\n",
+    include_str!("shell.html"),
+    "\n<script>\n",
+    include_str!("app.js"),
+    "\n</script>\n</body>\n</html>\n"
+);
 
 pub(super) struct ActiveRun {
     pub(super) pid: u32,
@@ -306,7 +317,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
             let filter = (!all).then_some(active_repo.as_path());
             let mut items = scan_sessions(filter, 50);
             for s in &mut items {
-                if running.contains(&s.sid) {
+                if running.contains(&s.sid) && s.status != "approval" {
                     s.status = "running".to_owned();
                 }
             }
@@ -337,7 +348,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
             }),
         ("POST", "/api/approve") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
-            .and_then(|req| resolve_session_approval(&req, &state.default_repo)),
+            .and_then(|req| resolve_session_approval(&req, state)),
         ("POST", "/api/commit") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| commit_session_worktree(&req, &state.default_repo)),
@@ -862,26 +873,58 @@ fn cancel_running_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, Stri
     Ok(json!({"stopped": true, "pid": pid}))
 }
 
-fn resolve_session_approval(req: &Value, default_repo: &Path) -> Result<Value, String> {
+fn resolve_session_approval(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
     let sid = req["sid"].as_str().ok_or("sid required")?;
     let call_id = req["id"].as_str().ok_or("approval id required")?;
     let allow = req["allow"].as_bool().unwrap_or(false);
     let remember = req["remember"].as_bool().unwrap_or(false);
     let note = req.get("note").and_then(Value::as_str);
+
+    // Hot path: if `twig serve` is currently parked on `control.wait_approval(call_id)`,
+    // deliver `approval.resolve` directly over its stdio pipe so the active turn resumes
+    // in-place with zero extra user message bubble.
+    let live_stdin = state
+        .runs
+        .lock()
+        .ok()
+        .and_then(|g| g.get(sid).map(|r| r.stdin.clone()));
+    if let Some(stdin_arc) = live_stdin {
+        if let Ok(mut guard) = stdin_arc.lock() {
+            if let Some(ref mut pipe) = *guard {
+                let rpc = json!({
+                    "id": "ap-res",
+                    "method": "approval.resolve",
+                    "params": {"id": call_id, "allow": allow, "remember": remember, "note": note}
+                });
+                if writeln!(pipe, "{rpc}").is_ok() && pipe.flush().is_ok() {
+                    return Ok(json!({
+                        "id": call_id,
+                        "allow": allow,
+                        "resumed_live": true,
+                    }));
+                }
+            }
+        }
+    }
+
     let wt = req["worktree"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_repo.to_path_buf());
+        .unwrap_or_else(|| state.default_repo.clone());
     let (cfg, _) = HarnessConfig::resolve()?;
     let provider = Provider::new();
     let runs = paths::state_dir().join("sessions");
     let mut daemon = Daemon::new(&provider, &wt, &runs, sid, &cfg)?;
-    daemon.dispatch(
+    let mut out = daemon.dispatch(
         "approval.resolve",
         &json!({"id": call_id, "allow": allow, "remember": remember, "note": note}),
         &mut |_| {},
-    )
+    )?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("resumed_live".into(), json!(false));
+    }
+    Ok(out)
 }
 
 fn discard_worktree_file(req: &Value, default_repo: &Path) -> Result<Value, String> {
@@ -1087,5 +1130,48 @@ mod tests {
         assert!(r6.contains("401 Unauthorized"));
 
         let _ = server.join();
+    }
+
+    #[test]
+    fn live_approval_resolve_forwards_json_rpc_to_hot_serve_pipe() {
+        let mut reader_child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = reader_child.stdin.take().unwrap();
+        let mut stdout = reader_child.stdout.take().unwrap();
+        let stdin_arc = Arc::new(Mutex::new(Some(stdin)));
+
+        let state = Arc::new(WebState {
+            default_repo: PathBuf::from("."),
+            token: None,
+            runs: Mutex::new(HashMap::from([(
+                "s-live".to_owned(),
+                ActiveRun {
+                    pid: reader_child.id(),
+                    stdin: stdin_arc.clone(),
+                },
+            )])),
+            sse_clients: Mutex::new(Vec::new()),
+            automation_running: AtomicBool::new(false),
+        });
+
+        let out = resolve_session_approval(
+            &json!({"sid": "s-live", "id": "call-7", "allow": true, "remember": true, "note": "ok"}),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(out["resumed_live"], true);
+        *stdin_arc.lock().unwrap() = None;
+
+        let mut forwarded = String::new();
+        stdout.read_to_string(&mut forwarded).unwrap();
+        let _ = reader_child.wait();
+        let msg: Value = serde_json::from_str(forwarded.trim()).unwrap();
+        assert_eq!(msg["method"], "approval.resolve");
+        assert_eq!(msg["params"]["id"], "call-7");
+        assert_eq!(msg["params"]["allow"], true);
+        assert_eq!(msg["params"]["remember"], true);
     }
 }

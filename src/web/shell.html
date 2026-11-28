@@ -1,0 +1,403 @@
+<body>
+<div class="app">
+  <div class="mob-mask" id="mob-mask" onclick="closeMobilePanels()"></div>
+
+  <!-- Left Sidebar -->
+  <aside class="sidebar mob-shut" id="sidebar">
+    <div class="sb-top">
+      <span class="brand">
+        <button class="icon-btn" onclick="toggleSidebar()" title="Collapse sidebar"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 3v18"/></svg></span></button>
+        <span class="brand-gem">✻</span>twig
+        <span class="brand-ver" id="ver"></span>
+      </span>
+      <div style="display:flex;gap:2px">
+        <button class="icon-btn" onclick="newThread(true)" title="New isolated worktree thread"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M6 8.5v7M14 9h6M17 6v6"/></svg></span></button>
+        <button class="icon-btn" onclick="newThread(false)" title="New thread"><span class="ico"><svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></span></button>
+      </div>
+    </div>
+
+    <div class="sb-proj-row">
+      <button class="proj-sel-btn" id="proj-trig" onclick="openProjPop(this)" title="Switch active project workspace">
+        <span id="sb-proj-ico"></span>
+        <span class="proj-sel-name" id="sb-proj-name">Workspace</span>
+        <span class="proj-sel-br" id="sb-proj-br">main</span>
+        <span class="ico sm" style="margin-left:auto"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
+      </button>
+    </div>
+
+    <div class="sb-search-row">
+      <div class="sb-search-wrap">
+        <span class="ico sm" style="color:var(--fg-muted)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+        <input id="q" placeholder="Filter threads…" oninput="renderList()">
+        <button class="cmdk-btn" onclick="openCmdk()" title="Command Palette (Ctrl+K)">⌘K</button>
+      </div>
+    </div>
+
+    <div class="sb-mode-row">
+      <div class="sb-mode">
+        <button id="m-thr" class="active" onclick="setSbMode('threads')">Threads</button>
+        <button id="m-aut" onclick="setSbMode('auto')">Routines</button>
+      </div>
+    </div>
+
+    <div class="sb-seg-row" id="sb-thr-filters">
+      <div class="sb-seg">
+        <button id="f-all" class="active" onclick="setFilter('all')">All</button>
+        <button id="f-act" onclick="setFilter('active')">Active</button>
+        <button id="f-dif" onclick="setFilter('diff')">Diff</button>
+      </div>
+      <button class="f-pill" id="scope-btn" onclick="toggleAllRepos()">Repo</button>
+    </div>
+
+    <div class="thread-list" id="slist"></div>
+
+    <div class="sb-foot">
+      <div style="display:inline-flex;align-items:center;gap:5px">
+        <button class="icon-btn" onclick="openSettings('general')" title="Settings & Configuration (Ctrl+,)"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span></button>
+        <span class="sse-dot" id="sse-dot" title="SSE event stream"></span>
+        <span id="sb-count">0 threads</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px">
+        <div class="theme-dots" title="Switch Brand Design System">
+          <button class="th-dot" data-p="claude" style="background:#d97757" onclick="setPalette('claude')" title="Claude Organic (Warm Terracotta)"></button>
+          <button class="th-dot" data-p="codex" style="background:#10a37f" onclick="setPalette('codex')" title="Codex Neutral (Monochrome + Emerald)"></button>
+          <button class="th-dot" data-p="studio" style="background:#6e7bf2" onclick="setPalette('studio')" title="Twig Studio (Linear Indigo)"></button>
+          <button class="th-dot" data-p="obsidian" style="background:#09090b" onclick="setPalette('obsidian')" title="Pure Obsidian (OLED Contrast)"></button>
+        </div>
+        <button class="cmode-btn" id="cmode-btn" onclick="cycleColorMode()" title="Appearance: System (auto)">◐</button>
+        <button class="icon-btn" id="notif-btn" onclick="toggleNotif()" title="Background alerts"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg></span></button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main Stage -->
+  <div class="stage">
+    <header class="topbar">
+      <button class="icon-btn sb-open-btn" id="sb-open-btn" onclick="toggleSidebar()" title="Show sidebar"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 3v18"/></svg></span></button>
+      <button class="btn-xs" id="parent-btn" style="display:none" onclick="openParent()">← Parent</button>
+      <div class="crumbs">
+        <span class="crumb-proj" id="crumb-proj"></span>
+        <span class="crumb-sep">/</span>
+        <span class="crumb-title" id="stitle" onclick="renameCurrent()" title="Click to rename thread">New thread</span>
+      </div>
+      <div class="top-actions">
+        <button class="top-pill" id="art-btn" style="display:none" onclick="toggleArtDock()" title="Artifacts & Diagram Preview">
+          <span class="ico sm"><svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg></span>
+          <span class="top-lbl-hide" id="art-lbl">Preview</span>
+        </button>
+        <button class="top-pill" id="sc-btn" onclick="toggleSideChat()" title="Contextual Side Chat (Ctrl+;)">
+          <span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
+          <span class="top-lbl-hide">Side chat</span>
+        </button>
+        <button class="top-pill" id="term-btn" onclick="toggleTerminal()" title="Quick Terminal (Ctrl+`)">
+          <span class="ico sm"><svg viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></span>
+          <span class="top-lbl-hide">Terminal</span>
+        </button>
+        <button class="top-pill" id="diff-toggle-btn" onclick="toggleDiffPanel()" title="Diff Review Panel (Ctrl+D)">
+          <span class="ico sm"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 15h6M12 12v6"/></svg></span>
+          <span id="top-diff-stat">Diff</span>
+        </button>
+        <button class="icon-btn on" id="insp-btn" onclick="toggleInspector()" title="Toggle Workspace Details"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M15 3v18"/></svg></span></button>
+      </div>
+    </header>
+
+    <div class="body-split">
+      <!-- Center Conversation + Terminal + Floating Composer -->
+      <div class="conv-col">
+        <div class="timeline" id="pane">
+          <div class="tl-inner" id="tl-inner"></div>
+        </div>
+        <button class="jump-pill" id="jump-latest" onclick="jumpToBottom()">↓ Jump to bottom</button>
+
+        <div class="term-drawer" id="term-drawer">
+          <div class="td-bar">
+            <div class="td-chips">
+              <strong style="font-size:11.5px;color:var(--fg);margin-right:4px">>_ Worktree Shell</strong>
+              <button class="td-chip" onclick="runQuickCmd('git status -sb')">git status</button>
+              <button class="td-chip" onclick="runQuickCmd('git diff --stat')">git diff --stat</button>
+              <button class="td-chip" onclick="runQuickCmd('git log -n 5 --oneline')">git log -5</button>
+              <button class="td-chip" onclick="runQuickCmd('cargo test --quiet')">cargo test</button>
+            </div>
+            <button class="icon-btn" onclick="toggleTerminal()" title="Close terminal"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+          </div>
+          <div class="td-out" id="td-out">Ready. Policy-guarded commands run inside the active thread worktree.</div>
+          <div class="td-in-row">
+            <span style="color:var(--accent);font-family:ui-monospace,monospace">$</span>
+            <input id="td-in" placeholder="Run command in worktree (Enter)…" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229){runQuickCmd(this.value);this.value='';}">
+          </div>
+        </div>
+
+        <div class="composer-dock">
+          <div class="composer-wrap">
+            <div class="ac-menu" id="ac-menu"></div>
+            <div class="composer-card">
+              <div class="att-strip" id="att-row"></div>
+              <textarea class="composer-ta" id="inp" rows="2" placeholder="Ask anything…  Type / for commands, @ for files, $ for skills"></textarea>
+              <div class="composer-bar">
+                <div class="cb-left">
+                  <input type="file" id="file-in" accept="image/*" multiple hidden onchange="for(const f of this.files)addImageFile(f);this.value=''">
+                  <button class="icon-btn" onclick="document.getElementById('file-in').click()" title="Attach image"><span class="ico"><svg viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></span></button>
+                  <button class="icon-btn mob-tok-btn" onclick="triggerToken('@')" title="Mention file (@)"><span style="font:600 13px/1 ui-monospace,monospace">@</span></button>
+                  <button class="icon-btn mob-tok-btn" onclick="triggerToken('/')" title="Slash commands (/)"><span style="font:600 13px/1 ui-monospace,monospace">/</span></button>
+                  <button class="icon-btn mob-tok-btn" onclick="triggerToken('$')" title="Invoke skill ($)"><span style="font:600 13px/1 ui-monospace,monospace">$</span></button>
+                </div>
+                <div class="cb-right">
+                  <button class="pill-trig" id="model-trig" onclick="openPop('model-pop',this)">
+                    <span style="color:var(--accent)">✻</span>
+                    <span id="model-lbl">Model</span>
+                    <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
+                  </button>
+                  <button class="icon-btn mic-btn" id="mic-btn" onclick="toggleDictation()" title="Voice dictation"><span class="ico"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></span></button>
+                  <button class="steer-stop-btn" id="stop-pill-btn" onclick="cancelRun()" title="Stop active turn">■ Stop</button>
+                  <button class="send-circle" id="act-btn" onclick="primaryAction()" title="Send (Enter)">
+                    <span class="ico" id="act-ico"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div class="ctx-strip">
+              <div class="ctx-left">
+                <span class="ctx-item" style="cursor:default"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M3 7v11a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-6l-2-2H5a2 2 0 0 0-2 2Z"/></svg></span><span id="ctx-repo">repo</span></span>
+                <button class="ctx-item" id="wt-toggle" onclick="toggleNewWt()" title="Isolate new thread in a dedicated Git worktree"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="9" r="2.5"/><path d="M6 8.5v7M6 8.5c0 4 12 1 12 3"/></svg></span><span id="wt-lbl">Worktree</span></button>
+                <input class="wt-slug-in" id="wt-slug" placeholder="branch-slug (auto)">
+                <span class="ctx-item" style="cursor:default"><span class="ico sm"><svg viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span><span id="ctx-branch">main</span></span>
+              </div>
+              <div class="ctx-right">
+                <button class="ctx-item" id="role-trig" onclick="openPop('role-pop',this)">
+                  <span id="role-lbl">Full Access</span>
+                  <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Contextual Side Chat (Claude Desktop Ctrl+;) -->
+      <aside class="sidechat" id="sidechat">
+        <div class="dd-top">
+          <strong style="font-size:12.5px">Side chat (/btw · zero history pollution)</strong>
+          <button class="icon-btn" onclick="toggleSideChat()"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+        </div>
+        <div class="sc-body" id="sc-body">
+          <div style="color:var(--fg-muted);font-size:12.5px">Ask contextual questions about the active thread without interrupting or polluting its conversation ledger.</div>
+        </div>
+        <div class="sc-foot">
+          <input id="sc-in" placeholder="Ask side question…" onkeydown="if(event.key==='Enter'&&!event.isComposing&&event.keyCode!==229)askSideChat()">
+          <button class="btn-xs" onclick="askSideChat()">Ask</button>
+        </div>
+      </aside>
+
+      <!-- Diff Review Dock with Per-Line Review Comments (Codex + REX) -->
+      <aside class="diff-dock" id="diff-dock">
+        <div class="dd-top">
+          <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600">
+            <span>Review changes</span>
+            <span id="dd-stat" style="font-family:ui-monospace,monospace;font-size:11.5px"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:4px">
+            <button class="f-pill active" id="dm-uni" onclick="setDiffMode('unified')">Unified</button>
+            <button class="f-pill" id="dm-spl" onclick="setDiffMode('split')">Split</button>
+            <button class="icon-btn" onclick="toggleDiffPanel()" title="Close diff"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+          </div>
+        </div>
+        <div class="dd-files" id="dd-files"></div>
+        <div class="dd-body" id="dd-body"></div>
+      </aside>
+
+      <!-- Artifact & Diagram Preview Dock (Claude Artifacts + Sandboxed Null-Origin Iframe) -->
+      <aside class="art-dock" id="art-dock">
+        <div class="dd-top">
+          <div style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;min-width:0">
+            <span style="color:var(--accent)">◈</span>
+            <span id="art-title" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Artifact Preview</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:4px">
+            <select class="stg-in" id="art-sel" style="height:24px;padding:0 6px;font-size:11.5px;max-width:136px;display:none" onchange="openArtByIdx(+this.value)"></select>
+            <button class="f-pill active" id="av-prev" onclick="setArtTab('preview')">Preview</button>
+            <button class="f-pill" id="av-src" onclick="setArtTab('source')">Source</button>
+            <button class="f-pill" id="av-vp" onclick="toggleArtVp()" title="Switch Desktop / Mobile 375px">Desktop</button>
+            <button class="f-pill" id="av-wide" onclick="toggleArtWide()" title="Toggle wide canvas">⤢</button>
+            <button class="icon-btn" onclick="downloadArt()" title="Download artifact"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></span></button>
+            <button class="icon-btn" onclick="toggleArtDock(false)" title="Close preview"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+          </div>
+        </div>
+        <div class="art-canvas" id="art-canvas">
+          <div style="color:var(--fg-muted);font-size:13px">Click ▶ Preview on any HTML, SVG, or Mermaid block to inspect it here.</div>
+        </div>
+      </aside>
+
+      <!-- Right Environment Inspector -->
+      <aside class="inspector" id="insp">
+        <div class="env-card">
+          <div class="ec-sec">
+            <div class="ec-row">
+              <span style="display:inline-flex;align-items:center;gap:7px;font-weight:600;color:var(--fg)">
+                <span class="ico"><svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+                <span id="env-proj">Workspace</span>
+              </span>
+              <div style="display:inline-flex;gap:2px">
+                <button class="icon-btn" onclick="copyText(curWt||defaultWt,'Copied worktree path')" title="Copy path"><span class="ico sm"><svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span></button>
+                <button class="icon-btn insp-close" onclick="closeMobilePanels()" title="Close details"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+              </div>
+            </div>
+            <div style="font:11px/1.4 ui-monospace,SFMono-Regular,monospace;color:var(--fg-muted);word-break:break-all" id="env-wt">—</div>
+            <div class="split-ed">
+              <a id="open-ed" href="#">
+                <span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/></svg></span>
+                <span id="open-ed-lbl">Open in Cursor</span>
+              </a>
+              <button onclick="openPop('ed-pop',this)" title="Choose IDE"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span></button>
+            </div>
+          </div>
+
+          <div class="ec-sec">
+            <div class="ec-row">
+              <span style="display:inline-flex;align-items:center;gap:7px;min-width:0"><span class="ico sm"><svg viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span><span id="env-branch" style="font-family:ui-monospace,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis">main</span></span>
+              <span id="env-pr-slot"></span>
+            </div>
+            <div class="ec-row btn-row" onclick="smartCommit(false)">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span style="color:var(--accent)">✦</span>Smart commit</span>
+              <button class="icon-btn" style="width:22px;height:22px" onclick="event.stopPropagation();smartCommit(true)" title="Commit with custom message hint">✎</button>
+            </div>
+            <div class="ec-row btn-row" onclick="shipPr()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span style="color:var(--ok)">⇪</span>Ship pull request</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="moveToWorktree()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span>⑂</span>Move to worktree</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="forkCurrent()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9M12 12v3"/></svg></span>Fork thread</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="compactCurrent()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg></span>Compact context</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="exportThreadMd()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></span>Export Markdown</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="toggleDiffPanel(true)">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></span>Changes vs HEAD</span>
+              <span id="env-diff-stat" style="font-family:ui-monospace,monospace;font-size:11.5px;color:var(--fg-muted)">clean</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="env-card" id="todo-card" style="display:none">
+          <div class="ec-sec">
+            <div class="ec-ttl" id="todo-ttl">Plan progress</div>
+            <div id="todo-list" style="display:flex;flex-direction:column;gap:5px;margin-top:2px"></div>
+          </div>
+        </div>
+
+        <div class="env-card" id="sub-card" style="display:none">
+          <div class="ec-sec">
+            <div class="ec-ttl">Subagent threads</div>
+            <div id="sub-list" style="display:flex;flex-direction:column;gap:4px;margin-top:2px"></div>
+          </div>
+        </div>
+
+        <div class="env-card">
+          <div class="ec-sec">
+            <div class="ec-ttl">Telemetry & Context</div>
+            <div style="font:11.5px/1.4 ui-monospace,monospace;color:var(--fg-dim)" id="usage-kv">0 in · 0 out · cache 0%</div>
+            <div class="meter"><div id="cache-bar" style="width:0%"></div></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;font:11px/1.3 ui-monospace,monospace;color:var(--fg-muted)">
+              <span id="ctx-kv">Context: 0 KB / 180 KB</span>
+              <button class="meta-lnk" style="color:var(--accent);font-size:11px" onclick="compactCurrent()">Compact</button>
+            </div>
+            <div class="meter"><div id="ctx-bar" style="width:0%;background:var(--ok)"></div></div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<!-- Popovers -->
+<div class="pop" id="model-pop">
+  <div class="pop-lbl">Reasoning Effort</div>
+  <div class="eff-seg" id="eff-seg">
+    <button data-e="" class="sel" onclick="pickEffort('')">Auto</button>
+    <button data-e="low" onclick="pickEffort('low')">Low</button>
+    <button data-e="medium" onclick="pickEffort('medium')">Med</button>
+    <button data-e="high" onclick="pickEffort('high')">High</button>
+  </div>
+  <div class="pop-sep"></div>
+  <div class="pop-lbl">Model / CLI Runner</div>
+  <div id="model-opts" style="max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:2px"></div>
+</div>
+
+<div class="pop" id="role-pop">
+  <div class="pop-lbl">Execution Mode (Shift+Tab)</div>
+  <button class="pop-opt sel" id="ro-auto" onclick="pickExecMode('auto')"><span>⚡ Full Auto (code)</span><span>✓</span></button>
+  <button class="pop-opt" id="ro-review" onclick="pickExecMode('review')"><span>⛨ Review Edits (gate writes)</span><span></span></button>
+  <button class="pop-opt" id="ro-plan" onclick="pickExecMode('plan')"><span>◈ Plan Only (read-only)</span><span></span></button>
+</div>
+
+<div class="pop" id="proj-pop" style="min-width:252px"></div>
+
+<div class="pop" id="ed-pop">
+  <div class="pop-lbl">Open Files & Repo In</div>
+  <button class="pop-opt" data-ed="cursor" onclick="pickEditor('cursor')"><span>Cursor</span><span></span></button>
+  <button class="pop-opt" data-ed="vscode" onclick="pickEditor('vscode')"><span>VS Code</span><span></span></button>
+  <button class="pop-opt" data-ed="windsurf" onclick="pickEditor('windsurf')"><span>Windsurf</span><span></span></button>
+  <button class="pop-opt" data-ed="zed" onclick="pickEditor('zed')"><span>Zed</span><span></span></button>
+</div>
+
+<!-- Global Command Palette (Ctrl+K / Cmd+K) -->
+<div class="cmdk-backdrop" id="cmdk" onclick="if(event.target===this)closeCmdk()">
+  <div class="cmdk-modal">
+    <div class="cmdk-in-row">
+      <span class="ico" style="color:var(--accent)"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></span>
+      <input id="cmdk-in" placeholder="Type a command or jump to thread…" oninput="renderCmdk()" onkeydown="onCmdkKey(event)">
+      <kbd>Esc</kbd>
+    </div>
+    <div class="cmdk-list" id="cmdk-list"></div>
+  </div>
+</div>
+
+<!-- 2-Column Studio Settings Modal (Ctrl+, / Gear Icon) -->
+<div class="stg-backdrop" id="stg-modal" onclick="if(event.target===this)closeSettings()">
+  <div class="stg-modal">
+    <nav class="stg-nav">
+      <div class="stg-nav-ttl"><span>Settings</span><kbd>Ctrl+,</kbd></div>
+      <button class="stg-tab active" data-st="general" onclick="switchStgTab('general')"><span>⚙</span><span>General & UI</span></button>
+      <button class="stg-tab" data-st="customize" onclick="switchStgTab('customize')"><span>✧</span><span>Customize & Packs</span></button>
+      <button class="stg-tab" data-st="roles" onclick="switchStgTab('roles')"><span>✻</span><span>Models & Roles</span></button>
+      <button class="stg-tab" data-st="runtime" onclick="switchStgTab('runtime')"><span>⛨</span><span>Runtime & Hooks</span></button>
+      <button class="stg-tab" data-st="skills" onclick="switchStgTab('skills')"><span>✦</span><span>Skills & Vault</span></button>
+      <button class="stg-tab" data-st="mcp" onclick="switchStgTab('mcp')"><span>◈</span><span>MCP & Memory</span></button>
+    </nav>
+    <div class="stg-pane">
+      <div class="stg-hdr">
+        <strong style="font-size:14px" id="stg-title">General & Appearance</strong>
+        <button class="icon-btn" onclick="closeSettings()" title="Close (Esc)"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+      </div>
+      <div class="stg-body" id="stg-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Studio Non-Blocking Input / Confirm Modal (Replaces native window.prompt) -->
+<div class="ask-backdrop" id="ask-modal" onclick="if(event.target===this)resolveAskModal(null)">
+  <div class="ask-modal">
+    <div>
+      <div style="font-size:14px;font-weight:600;color:var(--fg)" id="ask-ttl">Input</div>
+      <div class="stg-sub" id="ask-sub" style="margin-top:2px"></div>
+    </div>
+    <input class="stg-in" id="ask-in" style="width:100%" onkeydown="onAskModalKey(event)">
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:2px">
+      <button class="btn-xs" onclick="resolveAskModal(null)">Cancel</button>
+      <button class="btn-pri" id="ask-ok" onclick="submitAskModal()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+

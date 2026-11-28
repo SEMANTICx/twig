@@ -671,9 +671,22 @@ pub(super) fn collect_automations(query: &str, state: &Arc<WebState>) -> Value {
     if cfg.state_dir.is_relative() {
         cfg.state_dir = wt.join(&cfg.state_dir);
     }
-    let items = Automation::open(cfg.clone())
+    let mut items = Automation::open(cfg.clone())
         .and_then(|a| a.queue_snapshot())
         .unwrap_or_default();
+    let all_sessions = scan_sessions(None, 60);
+    for it in &mut items {
+        if let Some(wt_str) = it.get("worktree").and_then(Value::as_str) {
+            if let Some(matched) = all_sessions
+                .iter()
+                .find(|s| s.worktree.as_deref() == Some(wt_str))
+            {
+                if let Some(obj) = it.as_object_mut() {
+                    obj.insert("last_sid".into(), json!(matched.sid));
+                }
+            }
+        }
+    }
     json!({
         "configured": true,
         "suggested_repo": suggested_repo,

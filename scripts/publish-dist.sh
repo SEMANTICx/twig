@@ -119,6 +119,10 @@ tar -C "$OUT_DIR" -czf "$OUT_DIR/${PKG}.tar.gz" "$PKG"
 
 echo "==> Publishing ${TAG} artifacts to public repo ${DIST_REPO}..."
 if gh release view "$TAG" --repo "$DIST_REPO" >/dev/null 2>&1; then
+  EXISTING_SUMS="$(gh release download "$TAG" --repo "$DIST_REPO" -p "SHA256SUMS.txt" -O - 2>/dev/null || true)"
+  if [ -n "$EXISTING_SUMS" ]; then
+    { printf '%s\n' "$EXISTING_SUMS" | grep -v "${PKG}.tar.gz" || true; cat "$OUT_DIR/${PKG}.tar.gz.sha256"; } > "$OUT_DIR/SHA256SUMS.txt"
+  fi
   gh release upload "$TAG" "$OUT_DIR/${PKG}.tar.gz" "$OUT_DIR/${PKG}.tar.gz.sha256" "$OUT_DIR/SHA256SUMS.txt" --clobber --repo "$DIST_REPO"
 else
   gh release create "$TAG" "$OUT_DIR/${PKG}.tar.gz" "$OUT_DIR/${PKG}.tar.gz.sha256" "$OUT_DIR/SHA256SUMS.txt" \

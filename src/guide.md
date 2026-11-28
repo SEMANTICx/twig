@@ -41,14 +41,13 @@ twig verify [record] ...                       # Clean-room 64-bit-exact black-b
 
 twig subagent [repo] <role> "<task>"           # Run an isolated role subagent (scout/advisor/reviewer/code/test)
 twig review [repo] <diff_file> [evidence]      # Fresh read-only two-tier diff review ({approved, blockers, suggestions})
-twig ladder <solo.jsonl> <team.jsonl> [--json] # RCI Equal-Budget Ladder grader (Levels 0..3, V(n_B), pass@n_B)
-twig rci <status|harvest|distill [--online]|gate> # Label-free role-card recursion (.twig/notes/<role>.md)
-twig eval [dir] [reps] [only]                  # Isolated worktree benchmark suite runner
-twig improve [dir] [rounds]                    # Deletion-ablation gated HarnessConfig optimizer
 twig skill <list|enable|disable|add|doctor>    # 3-tier skills (.twig/skills > global > zero-token cold vault)
 twig update [--check] [--force]                # Self-update binary from SEMANTICx/twig-dist with SHA-256 verification
+twig doctor [--selfcheck | --record <f.jsonl>] # Environment diagnostics, offline checks, or BLAKE3 ledger verification
+twig eval [run|ladder|rci|classify] ...        # Isolated worktree benchmark suite & RCI collective grading
+twig improve [dir] [rounds]                    # Deletion-ablation gated HarnessConfig optimizer
+twig subagent [repo] <role> "<task>"           # Isolated role subagent · `twig review [repo] <diff_file>`
 twig guide                                     # Print this version-matched reference guide
-twig doctor / twig selfcheck / twig record <session.jsonl> / twig config [init]
 ```
 
 ## 2. Built-in Agent Tools (Inside `twig`)

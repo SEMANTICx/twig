@@ -467,11 +467,19 @@ pub struct SessionInfo {
     pub diff_del: usize,
 }
 
-/// Scan `<state_dir>/sessions/*.jsonl` (and optional `subagents/*-runs/*.jsonl`) newest-first.
+/// Scan `<state_dir>/sessions/*.jsonl` and `automation-sessions/*/*.jsonl` newest-first.
 pub fn scan_sessions(repo_filter: Option<&Path>, limit: usize) -> Vec<SessionInfo> {
     let filter_canon = repo_filter.and_then(|p| p.canonicalize().ok());
+    let mut dirs = vec![paths::state_dir().join("sessions")];
+    if let Ok(auto_dirs) = std::fs::read_dir(paths::state_dir().join("automation-sessions")) {
+        for e in auto_dirs.flatten() {
+            if e.path().is_dir() && e.file_name() != "reviewers" {
+                dirs.push(e.path());
+            }
+        }
+    }
     let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
-    for dir in [paths::state_dir().join("sessions")] {
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -881,11 +889,15 @@ fn locate_session_jsonl(sid: &str) -> Option<PathBuf> {
     if primary.exists() {
         return Some(primary);
     }
-    let sub_root = paths::state_dir().join("subagents");
-    for entry in std::fs::read_dir(sub_root).ok()?.flatten() {
-        let p = entry.path().join(format!("{sid}.jsonl"));
-        if p.exists() {
-            return Some(p);
+    for root_name in ["subagents", "automation-sessions"] {
+        let sub_root = paths::state_dir().join(root_name);
+        if let Ok(entries) = std::fs::read_dir(sub_root) {
+            for entry in entries.flatten() {
+                let p = entry.path().join(format!("{sid}.jsonl"));
+                if p.exists() {
+                    return Some(p);
+                }
+            }
         }
     }
     None

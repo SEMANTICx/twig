@@ -335,8 +335,23 @@ fn main() {
             }
         }
         "doctor" => {
-            if !twig::cli::run_doctor() {
-                std::process::exit(1);
+            match args.get(1).map(String::as_str) {
+                Some("selfcheck" | "--selfcheck") => selfcheck(),
+                Some("record" | "--record") => {
+                    let path = args.get(2).cloned().unwrap_or_else(|| "runs".to_string());
+                    match Record::verify_chain(Path::new(&path)) {
+                        Ok(entries) => println!("{}", json!({"ok": true, "entries": entries})),
+                        Err((index, why)) => {
+                            println!("{}", json!({"ok": false, "bad_index": index, "why": why}));
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                _ => {
+                    if !twig::cli::run_doctor() {
+                        std::process::exit(1);
+                    }
+                }
             }
         }
         "config" => {
@@ -395,9 +410,42 @@ fn main() {
         }
 
         "eval" => {
-            let root = PathBuf::from(args.get(1).cloned().unwrap_or_else(|| "evals".into()));
-            let reps: u32 = args.get(2).and_then(|r| r.parse().ok()).unwrap_or(1);
-            let only = args.get(3).map(String::as_str);
+            if let Some(sub @ ("ladder" | "rci")) = args.get(1).map(String::as_str) {
+                match twig::eval::rci::run_cli(sub, &args[2..]) {
+                    Ok(out) => print!("{out}"),
+                    Err(e) => {
+                        eprintln!("twig eval {sub}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            if args.get(1).map(String::as_str) == Some("classify") {
+                let path = args.get(2).cloned().unwrap_or_else(|| "runs".to_string());
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let mut by_sid: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(row) = serde_json::from_str::<Value>(line) {
+                        let sid = row.get("sid").and_then(Value::as_str).unwrap_or("?").to_string();
+                        by_sid.entry(sid).or_default().push(row);
+                    }
+                }
+                let breakdown = classify::summarize(by_sid.into_values());
+                println!(
+                    "{}",
+                    json!({
+                        "process": breakdown.process,
+                        "content": breakdown.content,
+                        "process_share": (breakdown.process_share() * 100.0).round() / 100.0,
+                        "lever": breakdown.lever()
+                    })
+                );
+                return;
+            }
+            let offset = usize::from(args.get(1).map(String::as_str) == Some("run"));
+            let root = PathBuf::from(args.get(1 + offset).cloned().unwrap_or_else(|| "evals".into()));
+            let reps: u32 = args.get(2 + offset).and_then(|r| r.parse().ok()).unwrap_or(1);
+            let only = args.get(3 + offset).map(String::as_str);
             let tasks = twig::eval::load_tasks(&root, only);
             if tasks.is_empty() {
                 eprintln!("twig: no tasks under {}", root.display());
@@ -763,34 +811,22 @@ fn main() {
 
         _ => {
             println!(
-                "twig {} — a thin agent harness\n\n\
-                 usage:\n  \
-                 twig chat [repo] [sid] [--plain] interactive TUI (/cmd, @file, $skill, !shell)\n  \
-                 twig web [--port 3426] [--bind H] browser/mobile thread & diff cockpit\n  \
-                 twig exec [flags] \"<prompt>\"   headless single-shot run (--role/--model/--resume/--json/--events)\n  \
-                 twig session <list|search|show|spawn|send|diff|apply|archive|gc>  session CLI\n  \
-                 twig verify <journal.jsonl> <program> [args...]  clean-room differential replay gate\n  \
-                 twig update [--check] [--force] self-update binary from SEMANTICx/twig-dist (SHA-256 verified)\n  \
-                 twig guide                     print complete version-matched reference for humans & agents\n  \
-                 twig serve [worktree] [runs]   JSON-RPC over stdio\n  \
-                 twig selfcheck                 offline checks (no network)\n  \
-                 twig doctor                    check config/state paths and dependencies\n  \
-                 twig config [init]             print or initialize harness.json\n  \
-                 twig record <file.jsonl>       verify the hash chain\n  \
-                 twig classify <file.jsonl>     process vs content failures\n  \
-                 twig playbooks <goal>          route a goal to a playbook\n  \
-                 twig skill <list|enable|disable|add|doctor>  manage curated global/project skills\n  \
-                 twig decisions [file.tsv]      read the decision trail\n  \
-                 twig eval [dir] [reps] [only]  scoring set: fresh repo, external judge\n  \
-                 twig ladder <solo> <team>      RCI equal-budget ladder grader (Levels 0..3, pass@n_B)\n  \
-                 twig rci <status|harvest|distill|gate>  label-free role-card recursion & release gate\n  \
-                 twig improve [dir] [rounds]    tune harness.json against the scoring set\n  \
-                 twig automate [cfg] [--once]   unattended GitHub maintenance queue\n  \
-                 twig subagent [repo] [role]    isolated role subagent\n  \
-                 twig review [repo] <diff>      fresh read-only independent reviewer\n\n\
+                "twig {} — single-binary coding-agent harness\n\n\
+                 core commands:\n  \
+                 twig chat [repo] [sid] [--plain]     interactive TUI (/cmd, @file, $skill, !shell)\n  \
+                 twig web [--port 3426] [--bind H]    3-pane browser & mobile cockpit\n  \
+                 twig exec [flags] \"<prompt>\"         headless single-shot turn (--role/--model/--resume/--json/--events)\n  \
+                 twig session <list|search|show|spawn|send|diff|apply|archive|gc>  manage threads & worktrees\n  \
+                 twig verify [record] <journal> <bin> clean-room 64-bit differential replay gate\n  \
+                 twig skill <list|enable|disable|add|doctor>  3-tier skills & zero-token cold vault\n  \
+                 twig update [--check] [--force]      SHA-256 verified self-update from SEMANTICx/twig-dist\n\n\
+                 diagnostics & evaluation:\n  \
+                 twig doctor [--selfcheck | --record <f>]  verify environment, offline invariants, or ledger chain\n  \
+                 twig eval [run|ladder|rci|classify] ...   isolated benchmark suite & RCI collective grading\n  \
+                 twig automate [cfg] [--once]              durable GitHub Issue/PR worktree queue\n  \
+                 twig guide                                print complete version-matched reference\n\n\
                  env: TWIG_BASE_URL (default http://127.0.0.1:3425/v1), TWIG_API_KEY, TWIG_MODEL,\n       \
-                 TWIG_ROLES, TWIG_FILE_OPENER (cursor|vscode|zed|system), TWIG_CONFIG,\n       \
-                 TWIG_SKILLS_DIR, TWIG_SKILLS_VAULT, TWIG_WORKERS (4), TWIG_WALL_SECS (300)",
+                 TWIG_ROLES, TWIG_FILE_OPENER (cursor|vscode|zed|system), TWIG_CONFIG",
                 env!("CARGO_PKG_VERSION")
             );
         }
