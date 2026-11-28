@@ -93,3 +93,10 @@ Configure persistently with `/roles <role> <model> [effort]` or `TWIG_ROLES='{"r
   - `/review [--fix]`: fresh read-only review; `--fix` repairs concrete `blockers` (max 2 rounds) and ignores non-blocking `suggestions`
   - `/plan` (`Shift+Tab` cycles `Auto` ⇄ `Plan` ⇄ `Review Edits`) → `/go` · `/dual-plan <goal>` · `/study <target>` · `/evolve`
 - **Navigation & Links**: Click or `Ctrl+Click` any URL, `[n]` link, or `path/to/file.rs:42` to open in browser or jump to exact line in `Cursor`/`VS Code`/`Zed` (`TWIG_FILE_OPENER=cursor|vscode|zed|system`), or run `/open [n|target]`. Drag to highlight & copy CJK/ASCII text.
+
+## 6. Studio Web & Mobile Cockpit (`twig web`)
+
+- **3-Pane Studio Workspace** (`127.0.0.1:3426` by default; auto-generates a Bearer token on non-loopback `--bind`):
+  - **Live SSE Streaming & Mid-Turn Steer**: Powered by `twig serve` stdio JSON-RPC (`/api/events` + `/api/steer`), supporting token-by-token streaming, live tool indicators, and typing while running (`↳ Steer`) without interrupting active turns.
+  - **Checkpoint Time-Travel & Git Shipping**: Per-turn `↺ Restore` (`GIT_INDEX_FILE` worktree + chat rewind), `Smart commit`, zero-trailer `Ship pull request` (`git.pr`), live `Move to worktree` (`git.worktree`), and 1-click subagent patch apply.
+  - **Artifacts, Settings & Automations**: Sandboxed null-origin `HTML`/`SVG`/built-in `Mermaid` Preview Dock, global `Ctrl+V` image paste, `⌘K` Command Palette, `Ctrl+,` 5-tab Studio Settings Modal (`roles.json`, `harness.json`, Skills Vault, MCP, Memory), and `Threads | Automations` queue control center.

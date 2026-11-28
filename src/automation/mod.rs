@@ -164,6 +164,78 @@ fn append(path: &Path, row: &Value) -> std::io::Result<()> {
     append_row(path, row)
 }
 
+fn shipping_action_for_id(intents: &HashSet<String>, id: &str) -> Option<String> {
+    let prefix = format!("{id}/");
+    intents
+        .iter()
+        .find_map(|s| s.strip_prefix(&prefix).map(str::to_owned))
+}
+
+fn build_queue_snapshot(rows: &[Value], worktrees: &Path) -> Vec<Value> {
+    let mut items: BTreeMap<String, (WorkItem, String, u64)> = BTreeMap::new();
+    let mut intents = HashSet::new();
+    let mut shipped = HashSet::new();
+    for row in rows {
+        let at = row["at"].as_u64().unwrap_or(0);
+        match row["event"].as_str().unwrap_or("") {
+            "queued" => {
+                if let Ok(i) = serde_json::from_value::<WorkItem>(row["item"].clone()) {
+                    items.entry(i.id.clone()).or_insert((i, "queued".into(), at));
+                }
+            }
+            "state" => {
+                if let (Some(id), Some(s)) = (row["id"].as_str(), row["state"].as_str()) {
+                    if let Some(entry) = items.get_mut(id) {
+                        entry.1 = s.to_owned();
+                        entry.2 = at;
+                    }
+                }
+            }
+            "shipping_intent" => {
+                if let (Some(id), Some(a)) = (row["id"].as_str(), row["action"].as_str()) {
+                    intents.insert(format!("{id}/{a}"));
+                }
+            }
+            "shipping_result" => {
+                if let (Some(id), Some(a), Some(r)) = (
+                    row["id"].as_str(),
+                    row["action"].as_str(),
+                    row["result"].as_str(),
+                ) {
+                    intents.remove(&format!("{id}/{a}"));
+                    if r == "confirmed" {
+                        shipped.insert(id.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<Value> = items
+        .into_values()
+        .map(|(item, state, updated_at)| {
+            let key = blake3::hash(item.id.as_bytes()).to_hex().to_string();
+            let wt = worktrees.join(&key);
+            let pending_action = shipping_action_for_id(&intents, &item.id);
+            json!({
+                "id": item.id,
+                "repository": item.repository,
+                "kind": item.kind,
+                "number": item.number,
+                "title": item.title,
+                "url": item.url,
+                "state": if pending_action.is_some() && state != "done" { "needs_attention" } else { state.as_str() },
+                "shipped": shipped.contains(&item.id),
+                "pending_action": pending_action,
+                "updated_at": updated_at,
+                "worktree": wt.is_dir().then(|| wt.display().to_string()),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b["updated_at"].as_u64().cmp(&a["updated_at"].as_u64()));
+    out
+}
+
 fn default_git() -> PathBuf {
     "git".into()
 }
@@ -660,6 +732,12 @@ impl Automation {
             }),
         )
         .map_err(|e| e.to_string())
+    }
+
+    pub fn queue_snapshot(&self) -> Result<Vec<Value>, String> {
+        let _g = lock(&self.queue).map_err(|e| e.to_string())?;
+        let verified = rows(&self.queue).map_err(|e| e.to_string())?;
+        Ok(build_queue_snapshot(&verified, &self.worktrees))
     }
 
     fn state(&self, id: &str, s: &str) -> Result<(), String> {

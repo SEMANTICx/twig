@@ -10,12 +10,15 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::automation::{Automation, AutomationConfig, ShippingPermissions, SourceKind, WorkItem};
 use crate::config::{paths, HarnessConfig};
 use crate::exec::{run_process, shell_command};
 use crate::llm::{cli, ConfigOp, Llm, Provider};
@@ -28,10 +31,17 @@ use crate::runtime::Daemon;
 
 const COCKPIT_HTML: &str = include_str!("web_ui.html");
 
+struct ActiveRun {
+    pid: u32,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+}
+
 struct WebState {
     default_repo: PathBuf,
     token: Option<String>,
-    running_pids: Mutex<HashMap<String, u32>>,
+    runs: Mutex<HashMap<String, ActiveRun>>,
+    sse_clients: Mutex<Vec<SyncSender<String>>>,
+    automation_running: AtomicBool,
 }
 
 /// Start the `twig web` HTTP cockpit server (`twig web [--port 3426] [--bind 127.0.0.1] [--repo .] [--token T]`).
@@ -105,7 +115,9 @@ pub fn serve_web(args: &[String]) -> Result<(), String> {
     let state = Arc::new(WebState {
         default_repo,
         token,
-        running_pids: Mutex::new(HashMap::new()),
+        runs: Mutex::new(HashMap::new()),
+        sse_clients: Mutex::new(Vec::new()),
+        automation_running: AtomicBool::new(false),
     });
 
     for incoming in listener.incoming() {
@@ -114,6 +126,47 @@ pub fn serve_web(args: &[String]) -> Result<(), String> {
         std::thread::spawn(move || {
             let _ = handle_conn(stream, &st);
         });
+    }
+    Ok(())
+}
+
+fn broadcast_sse(state: &WebState, ev: &Value) {
+    let Ok(mut clients) = state.sse_clients.lock() else {
+        return;
+    };
+    if clients.is_empty() {
+        return;
+    }
+    let payload = ev.to_string();
+    clients.retain(|tx| !matches!(tx.try_send(payload.clone()), Err(TrySendError::Disconnected(_))));
+}
+
+fn serve_sse_stream(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<()> {
+    let _ = stream.set_read_timeout(None);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n: connected\n\n"
+    )?;
+    stream.flush()?;
+    let (tx, rx) = mpsc::sync_channel::<String>(256);
+    if let Ok(mut clients) = state.sse_clients.lock() {
+        clients.push(tx);
+    }
+    loop {
+        match rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(msg) => {
+                if write!(stream, "data: {msg}\n\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if write!(stream, ": ping\n\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
     Ok(())
 }
@@ -183,10 +236,22 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
 
     if let Some(ref expected) = state.token {
         let want = format!("Bearer {expected}");
-        if auth_header != want {
+        let query_ok = method == "GET"
+            && path == "/api/events"
+            && query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("token="))
+                .map(url_decode_simple)
+                .as_deref()
+                == Some(expected.as_str());
+        if auth_header != want && !query_ok {
             let err = json!({"error": "unauthorized — pass Bearer token"}).to_string();
             return write_http(&mut stream, 401, "application/json", err.as_bytes());
         }
+    }
+
+    if method == "GET" && path == "/api/events" {
+        return serve_sse_stream(stream, state);
     }
 
     // Block cross-origin browser CSRF against loopback `POST` endpoints (e.g. `<form enctype="text/plain">`).
@@ -205,10 +270,11 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("GET", "/api/meta") => Ok(collect_meta(state)),
         ("GET", "/api/files") => Ok(list_worktree_files(query, &state.default_repo)),
         ("GET", "/api/settings") => collect_settings(query, &state.default_repo),
+        ("GET", "/api/automations") => Ok(collect_automations(query, state)),
         ("GET", "/api/sessions") => {
             let all = query.split('&').any(|kv| kv == "all=1");
             let running: std::collections::HashSet<String> = state
-                .running_pids
+                .runs
                 .lock()
                 .map(|g| g.keys().cloned().collect())
                 .unwrap_or_default();
@@ -234,6 +300,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("POST", "/api/send") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| dispatch_background_turn(&req, state)),
+        ("POST", "/api/steer") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| steer_running_turn(&req, state)),
         ("POST", "/api/cancel") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| cancel_running_turn(&req, state)),
@@ -259,6 +328,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("POST", "/api/settings") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| apply_settings(&req, &state.default_repo)),
+        ("POST", "/api/automations") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| apply_automations(&req, state)),
         _ => Err(format!("not found: {method} {path}")),
     };
 
@@ -287,7 +359,7 @@ fn write_http(
         _ => "404 Not Found",
     };
     let csp = if content_type.starts_with("text/html") {
-        "Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'\r\n"
+        "Content-Security-Policy: default-src 'self'; img-src 'self' data:; frame-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'\r\n"
     } else {
         ""
     };
@@ -393,7 +465,7 @@ fn list_worktree_files(query: &str, default_repo: &Path) -> Value {
 
 fn inspect_session_detail(sid: &str, state: &Arc<WebState>) -> Result<Value, String> {
     let in_flight = state
-        .running_pids
+        .runs
         .lock()
         .map(|g| g.contains_key(sid))
         .unwrap_or(false);
@@ -513,12 +585,12 @@ fn stage_data_images(sid: &str, imgs: &[Value]) -> Vec<String> {
 }
 
 fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
-    let raw_prompt = req["prompt"]
-        .as_str()
-        .map(str::trim)
-        .unwrap_or("");
-    let has_images = req["images"].as_array().is_some_and(|a| !a.is_empty());
-    if raw_prompt.is_empty() && !has_images {
+    let raw_prompt = req["prompt"].as_str().map(str::trim).unwrap_or("");
+    let imgs = req["images"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if raw_prompt.is_empty() && imgs.is_empty() {
         return Err("prompt required".into());
     }
     let sid = req["sid"]
@@ -537,8 +609,13 @@ fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value,
     } else {
         raw_prompt.to_owned()
     };
-    if let Some(imgs) = req["images"].as_array() {
-        let staged = stage_data_images(&sid, imgs);
+    let model = req["model"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    let effective_cli = model
+        .as_deref()
+        .is_some_and(|m| m.starts_with("cli:"))
+        || (model.is_none() && Provider::new().roles().get("code").starts_with("cli:"));
+    if !imgs.is_empty() && effective_cli {
+        let staged = stage_data_images(&sid, &imgs);
         if !staged.is_empty() {
             prompt = format!("{} {prompt}", staged.join(" "));
         }
@@ -553,65 +630,172 @@ fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value,
         repo = wt.display().to_string();
     }
     let role = req["role"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
-    let model = req["model"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let effort = req["effort"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
 
     {
-        let g = state.running_pids.lock().map_err(|e| e.to_string())?;
+        let g = state.runs.lock().map_err(|e| e.to_string())?;
         if g.contains_key(&sid) {
             return Err("session is already running a turn".into());
         }
     }
 
+    let runs_dir = paths::state_dir().join("sessions");
     let mut cmd = Command::new(exe);
-    cmd.args(["exec", "--repo", &repo, "--resume", &sid, "--json"]);
-    if let Some(r) = role.as_deref() {
-        cmd.args(["--role", r]);
-    }
-    if let Some(m) = model.as_deref() {
-        cmd.args(["--model", m]);
-    }
-    if let Some(e) = effort.as_deref() {
-        cmd.args(["--effort", e]);
-    }
-    cmd.args(["--", &prompt])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args([
+        "serve",
+        &repo,
+        &runs_dir.display().to_string(),
+        &sid,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd.spawn().map_err(|e| format!("spawn twig exec: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn twig serve: {e}"))?;
     let pid = child.id();
-    if let Ok(mut g) = state.running_pids.lock() {
-        g.insert(sid.clone(), pid);
+    let mut stdin_pipe = child.stdin.take().ok_or("missing child stdin")?;
+    let stdout_pipe = child.stdout.take().ok_or("missing child stdout")?;
+
+    if let Some(ref m) = model {
+        let _ = writeln!(
+            stdin_pipe,
+            "{}",
+            json!({"id": "cfg-m", "method": "model.set", "params": {"model": m}})
+        );
     }
+    if let Some(ref e) = effort {
+        let _ = writeln!(
+            stdin_pipe,
+            "{}",
+            json!({"id": "cfg-e", "method": "effort.set", "params": {"effort": e}})
+        );
+    }
+    if let Some(ref r) = role {
+        let is_ro = matches!(r.as_str(), "plan" | "advisor" | "scout" | "reviewer");
+        let _ = writeln!(
+            stdin_pipe,
+            "{}",
+            json!({"id": "cfg-p", "method": "mode.set", "params": {"plan": is_ro}})
+        );
+    }
+    let turn_req = json!({
+        "id": "turn-1",
+        "method": "turn",
+        "params": {
+            "input": prompt,
+            "role": role.as_deref().unwrap_or("code"),
+            "images": imgs,
+        }
+    });
+    writeln!(stdin_pipe, "{turn_req}").map_err(|e| format!("write turn rpc: {e}"))?;
+    let _ = stdin_pipe.flush();
+
+    let stdin_arc = Arc::new(Mutex::new(Some(stdin_pipe)));
+    if let Ok(mut g) = state.runs.lock() {
+        g.insert(
+            sid.clone(),
+            ActiveRun {
+                pid,
+                stdin: stdin_arc.clone(),
+            },
+        );
+    }
+    broadcast_sse(state, &json!({"ev": "session.started", "sid": sid}));
 
     let st = state.clone();
     let sid_bg = sid.clone();
     std::thread::spawn(move || {
+        for line in BufReader::new(stdout_pipe).lines().map_while(Result::ok) {
+            let Ok(mut v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if v.get("ev").is_some() {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("sid".into(), json!(sid_bg));
+                }
+                broadcast_sse(&st, &v);
+            }
+            if v.get("id") == Some(&json!("turn-1")) {
+                if let Ok(mut guard) = stdin_arc.lock() {
+                    *guard = None;
+                }
+                broadcast_sse(
+                    &st,
+                    &json!({
+                        "ev": "session.idle",
+                        "sid": sid_bg,
+                        "error": v.get("error").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+                break;
+            }
+        }
+        if let Ok(mut guard) = stdin_arc.lock() {
+            *guard = None;
+        }
         let _ = child.wait();
-        if let Ok(mut g) = st.running_pids.lock() {
+        if let Ok(mut g) = st.runs.lock() {
             g.remove(&sid_bg);
         }
+        broadcast_sse(&st, &json!({"ev": "session.settled", "sid": sid_bg}));
     });
 
     Ok(json!({"sid": sid, "worktree": repo, "queued": true}))
 }
 
+fn steer_running_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
+    let sid = req["sid"].as_str().ok_or("sid required")?;
+    let text = req["input"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("steer input required")?;
+    let stdin_arc = {
+        let g = state.runs.lock().map_err(|e| e.to_string())?;
+        g.get(sid).map(|r| r.stdin.clone())
+    };
+    let Some(stdin_arc) = stdin_arc else {
+        return Ok(json!({"queued": false, "idle": true}));
+    };
+    let mut guard = stdin_arc.lock().map_err(|e| e.to_string())?;
+    let Some(ref mut pipe) = *guard else {
+        return Ok(json!({"queued": false, "idle": true}));
+    };
+    writeln!(
+        pipe,
+        "{}",
+        json!({"id": "steer", "method": "steer", "params": {"input": text}})
+    )
+    .map_err(|e| format!("steer write: {e}"))?;
+    let _ = pipe.flush();
+    drop(guard);
+    broadcast_sse(state, &json!({"ev": "steering.queued", "sid": sid, "text": text}));
+    Ok(json!({"queued": true}))
+}
+
 fn cancel_running_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
     let sid = req["sid"].as_str().ok_or("sid required")?;
-    let pid_opt = state
-        .running_pids
+    let run_opt = state
+        .runs
         .lock()
         .map_err(|e| e.to_string())?
         .remove(sid);
-    let Some(pid) = pid_opt else {
+    let Some(run) = run_opt else {
         return Ok(json!({"stopped": false}));
     };
+    if let Ok(mut guard) = run.stdin.lock() {
+        if let Some(ref mut pipe) = *guard {
+            let _ = writeln!(pipe, "{}", json!({"id": "cancel", "method": "cancel", "params": {}}));
+            let _ = pipe.flush();
+        }
+        *guard = None;
+    }
+    let pid = run.pid;
     #[cfg(unix)]
     unsafe {
         let _ = libc::kill(-(pid as i32), libc::SIGINT);
@@ -623,6 +807,7 @@ fn cancel_running_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, Stri
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .output();
     }
+    broadcast_sse(state, &json!({"ev": "session.settled", "sid": sid}));
     Ok(json!({"stopped": true, "pid": pid}))
 }
 
@@ -665,7 +850,14 @@ fn dispatch_session_rpc(req: &Value, default_repo: &Path) -> Result<Value, Strin
     let method = req["method"].as_str().ok_or("method required")?;
     if !matches!(
         method,
-        "session.rename" | "session.btw" | "session.fork" | "session.compact"
+        "session.rename"
+            | "session.btw"
+            | "session.fork"
+            | "session.compact"
+            | "session.rewind"
+            | "session.apply"
+            | "git.pr"
+            | "git.worktree"
     ) {
         return Err(format!("unsupported web rpc method {method:?}"));
     }
@@ -946,6 +1138,245 @@ fn apply_settings(req: &Value, default_repo: &Path) -> Result<Value, String> {
     }
 }
 
+fn infer_github_repo(wt: &Path) -> String {
+    let raw = Command::new("git")
+        .arg("-C")
+        .arg(wt)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_default();
+    let tail = raw
+        .split("github.com")
+        .nth(1)
+        .unwrap_or("")
+        .trim_start_matches([':', '/'])
+        .trim_end_matches(".git");
+    if tail.split('/').filter(|s| !s.is_empty()).count() == 2 {
+        tail.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+fn resolve_automation_cfg_path(wt: &Path) -> PathBuf {
+    let dot_path = wt.join(".twig/automation.json");
+    if dot_path.exists() {
+        dot_path
+    } else {
+        let root_path = wt.join("automation.json");
+        if root_path.exists() {
+            root_path
+        } else {
+            dot_path
+        }
+    }
+}
+
+fn collect_automations(query: &str, state: &Arc<WebState>) -> Value {
+    let wt = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("wt="))
+        .map(url_decode_simple)
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.default_repo.clone());
+    let cfg_path = resolve_automation_cfg_path(&wt);
+    let suggested_repo = infer_github_repo(&wt);
+    let running = state.automation_running.load(Ordering::Relaxed);
+    let Ok(raw) = std::fs::read_to_string(&cfg_path) else {
+        return json!({
+            "configured": false,
+            "suggested_repo": suggested_repo,
+            "running": running,
+            "config_path": cfg_path.display().to_string(),
+            "items": [],
+        });
+    };
+    let mut cfg: AutomationConfig = match serde_json::from_str(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({
+                "configured": false,
+                "suggested_repo": suggested_repo,
+                "running": running,
+                "error": e.to_string(),
+                "items": [],
+            });
+        }
+    };
+    if cfg.repository_path == Path::new(".") {
+        cfg.repository_path = wt.clone();
+    }
+    if cfg.state_dir.is_relative() {
+        cfg.state_dir = wt.join(&cfg.state_dir);
+    }
+    let items = Automation::open(cfg.clone())
+        .and_then(|a| a.queue_snapshot())
+        .unwrap_or_default();
+    json!({
+        "configured": true,
+        "suggested_repo": suggested_repo,
+        "running": running,
+        "config_path": cfg_path.display().to_string(),
+        "config": cfg,
+        "items": items,
+    })
+}
+
+fn apply_automations(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
+    let action = req["action"].as_str().ok_or("action required")?;
+    let wt = req["worktree"]
+        .as_str()
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.default_repo.clone());
+    let cfg_path = resolve_automation_cfg_path(&wt);
+
+    match action {
+        "save_config" => {
+            let create_pr = req["create_pr"].as_bool().unwrap_or(false);
+            let cfg = AutomationConfig {
+                repository: req["repository"]
+                    .as_str()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_owned(),
+                repository_path: wt.clone(),
+                label: req["label"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("twig")
+                    .to_owned(),
+                state_dir: paths::state_dir().join("automation-queue"),
+                poll_interval_secs: req["poll_interval_secs"].as_u64().unwrap_or(300).max(30),
+                include_pull_requests: req["include_pull_requests"].as_bool().unwrap_or(false),
+                check_command: req["check_command"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("cargo test --quiet")
+                    .to_owned(),
+                check_timeout_secs: 600,
+                lease_secs: 3600,
+                permissions: ShippingPermissions {
+                    replies: false,
+                    push: create_pr,
+                    create_pr,
+                    merge: false,
+                    release: false,
+                },
+                reply: None,
+                create_pr,
+                merge: false,
+                release_tag: None,
+                ..AutomationConfig::default()
+            };
+            cfg.validate()?;
+            let _ = Automation::open(cfg.clone())?;
+            if let Some(p) = cfg_path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            let body = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+            std::fs::write(&cfg_path, format!("{body}\n")).map_err(|e| e.to_string())?;
+            Ok(json!({"saved": true}))
+        }
+        "enqueue" => {
+            let raw = std::fs::read_to_string(&cfg_path)
+                .map_err(|_| "configure automation first".to_owned())?;
+            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            let number = req["number"].as_u64().filter(|&n| n > 0).unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    % 100_000
+            });
+            let title = req["title"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("task title required")?;
+            let body = req["body"].as_str().unwrap_or("");
+            let kind = if req["kind"].as_str() == Some("pr") {
+                SourceKind::PullRequest
+            } else {
+                SourceKind::Issue
+            };
+            let url = req["url"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("https://github.com/{}/issues/{number}", cfg.repository));
+            let item = WorkItem::new(&cfg.repository, kind, number, title, body, url);
+            let mut auto = Automation::open(cfg)?;
+            let added = auto.ingest(vec![item])?;
+            broadcast_sse(state, &json!({"ev": "automation.updated"}));
+            Ok(json!({"added": added}))
+        }
+        "poll_once" | "run_local" => {
+            if state
+                .automation_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Err("automation poll/run is already active".into());
+            }
+            let raw = std::fs::read_to_string(&cfg_path)
+                .map_err(|_| {
+                    state.automation_running.store(false, Ordering::SeqCst);
+                    "configure automation first".to_owned()
+                })?;
+            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| {
+                state.automation_running.store(false, Ordering::SeqCst);
+                e.to_string()
+            })?;
+            let exe = std::env::current_exe().map_err(|e| {
+                state.automation_running.store(false, Ordering::SeqCst);
+                e.to_string()
+            })?;
+            let local_only = action == "run_local";
+            let st = state.clone();
+            std::thread::spawn(move || {
+                let runs = paths::state_dir().join("automation-sessions");
+                let timeout = Duration::from_secs(cfg.check_timeout_secs.min(3600));
+                let mut exec = crate::automation::TwigExecutor::new(
+                    exe,
+                    runs,
+                    cfg.check_command.clone(),
+                    timeout,
+                    timeout,
+                );
+                let res = Automation::open(cfg).and_then(|mut a| {
+                    if local_only {
+                        a.run_once(&mut exec)
+                    } else {
+                        a.poll_once(&mut exec)
+                    }
+                });
+                st.automation_running.store(false, Ordering::SeqCst);
+                let err = res.err();
+                broadcast_sse(&st, &json!({"ev": "automation.updated", "error": err}));
+            });
+            Ok(json!({"started": true}))
+        }
+        "resolve_shipping" => {
+            let id = req["id"].as_str().ok_or("item id required")?;
+            let ship_act = req["shipping_action"].as_str().unwrap_or("create_pr");
+            let completed = req["completed"].as_bool().unwrap_or(true);
+            let raw = std::fs::read_to_string(&cfg_path).map_err(|e| e.to_string())?;
+            let cfg: AutomationConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            Automation::open(cfg)?.resolve_shipping(id, ship_act, completed)?;
+            broadcast_sse(state, &json!({"ev": "automation.updated"}));
+            Ok(json!({"resolved": true}))
+        }
+        other => Err(format!("unknown automation action {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,11 +1388,13 @@ mod tests {
         let state = Arc::new(WebState {
             default_repo: PathBuf::from("."),
             token: Some("secret-tok".into()),
-            running_pids: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            sse_clients: Mutex::new(Vec::new()),
+            automation_running: AtomicBool::new(false),
         });
 
         let server = std::thread::spawn(move || {
-            for _ in 0..5 {
+            for _ in 0..6 {
                 if let Ok((stream, _)) = listener.accept() {
                     let _ = handle_conn(stream, &state);
                 }
@@ -1017,6 +1450,13 @@ mod tests {
         let mut r5 = String::new();
         c5.read_to_string(&mut r5).unwrap();
         assert!(r5.contains("403 Forbidden"));
+
+        // 6. GET /api/events without token is rejected with 401
+        let mut c6 = TcpStream::connect(addr).unwrap();
+        write!(c6, "GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        let mut r6 = String::new();
+        c6.read_to_string(&mut r6).unwrap();
+        assert!(r6.contains("401 Unauthorized"));
 
         let _ = server.join();
     }

@@ -342,8 +342,30 @@ aside.sidebar.collapsed~.stage .sb-open-btn{display:inline-flex}
 .ac-key{font:500 12px/1.3 ui-monospace,SFMono-Regular,monospace;color:var(--fg)}
 .ac-desc{font-size:11.5px;color:var(--fg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px}
 
-.composer-card{background:var(--card);border:1px solid var(--border-hi);border-radius:16px;box-shadow:var(--composer-shadow);padding:11px 12px 9px 14px;display:flex;flex-direction:column;gap:8px;transition:border-color .15s}
+.composer-card{background:var(--card);border:1px solid var(--border-hi);border-radius:16px;box-shadow:var(--composer-shadow);padding:11px 12px 9px 14px;display:flex;flex-direction:column;gap:8px;transition:border-color .15s,box-shadow .15s}
 .composer-card:focus-within{border-color:var(--accent)}
+.composer-card.drop-active{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft),var(--composer-shadow)}
+.u-imgs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.u-imgs img{width:76px;height:76px;object-fit:cover;border-radius:9px;border:1px solid var(--border-hi);cursor:zoom-in}
+.steer-stop-btn{height:28px;padding:0 9px;border-radius:99px;border:1px solid rgba(251,113,133,.35);background:var(--err-bg);color:var(--err);font-size:11.5px;font-weight:600;cursor:pointer;display:none;align-items:center;gap:4px}
+.steer-stop-btn.show{display:inline-flex}
+.send-circle.steer{background:var(--accent);color:var(--accent-fg)}
+.sse-dot{width:7px;height:7px;border-radius:99px;background:var(--fg-muted);display:inline-block;flex-shrink:0}
+.sse-dot.live{background:var(--ok);box-shadow:0 0 6px rgba(52,211,153,.55)}
+.sb-mode-row{padding:0 10px 6px}
+.sb-mode{display:grid;grid-template-columns:1fr 1fr;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:2px;gap:2px}
+.sb-mode button{height:25px;border:0;border-radius:6px;background:transparent;color:var(--fg-muted);font-size:11.5px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:5px}
+.sb-mode button.active{background:var(--active);color:var(--fg)}
+.pr-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:99px;background:var(--ok-bg);color:var(--ok);font:600 11px/1.3 ui-monospace,monospace;text-decoration:none}
+.sub-swarm{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.sub-tile{padding:9px 11px;border-radius:10px;background:var(--card);border:1px solid var(--border);display:flex;flex-direction:column;gap:5px}
+.live-cursor{display:inline-block;width:7px;height:14px;background:var(--accent);vertical-align:-2px;margin-left:2px;border-radius:2px;animation:shimmer .9s ease-in-out infinite}
+aside.art-dock{width:46vw;min-width:360px;max-width:600px;border-left:1px solid var(--border);background:var(--bg);display:none;flex-direction:column;flex-shrink:0;min-height:0}
+aside.art-dock.open{display:flex}
+.art-canvas{flex:1;min-height:0;background:var(--code-bg);display:flex;align-items:center;justify-content:center;overflow:auto;padding:12px}
+.art-iframe{width:100%;height:100%;border:1px solid var(--border);border-radius:10px;background:#fff}
+.art-iframe.mob{width:375px;max-width:100%;height:min(100%,680px);box-shadow:var(--shadow)}
+.auto-wrap{width:100%;max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
 .att-strip{display:none;flex-wrap:wrap;gap:6px}
 .att-strip.has{display:flex}
 .att-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px 3px 6px;border-radius:8px;background:var(--hover);border:1px solid var(--border);font-size:11.5px;color:var(--fg)}
@@ -486,7 +508,7 @@ aside.inspector.shut{display:none}
   aside.inspector.mob-open{display:flex}
   .insp-close{display:inline-flex}
   .mob-mask.show{display:block}
-  aside.diff-dock,aside.sidechat{position:fixed;top:0;right:0;bottom:0;width:min(94vw,560px);min-width:0;z-index:46;box-shadow:var(--shadow)}
+  aside.diff-dock,aside.sidechat,aside.art-dock{position:fixed;top:0;right:0;bottom:0;width:min(94vw,560px);min-width:0;z-index:46;box-shadow:var(--shadow)}
   aside.sidechat{width:min(92vw,360px)}
 }
 @media(max-width:760px){
@@ -533,7 +555,14 @@ aside.inspector.shut{display:none}
       </div>
     </div>
 
-    <div class="sb-seg-row">
+    <div class="sb-mode-row">
+      <div class="sb-mode">
+        <button id="m-thr" class="active" onclick="setSbMode('threads')">Threads</button>
+        <button id="m-aut" onclick="setSbMode('auto')">Automations</button>
+      </div>
+    </div>
+
+    <div class="sb-seg-row" id="sb-thr-filters">
       <div class="sb-seg">
         <button id="f-all" class="active" onclick="setFilter('all')">All</button>
         <button id="f-act" onclick="setFilter('active')">Active</button>
@@ -547,6 +576,7 @@ aside.inspector.shut{display:none}
     <div class="sb-foot">
       <div style="display:inline-flex;align-items:center;gap:6px">
         <button class="icon-btn" onclick="openSettings('general')" title="Settings & Configuration (Ctrl+,)"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.08a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.08a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg></span></button>
+        <span class="sse-dot" id="sse-dot" title="SSE event stream"></span>
         <span id="sb-count">0 threads</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px">
@@ -572,6 +602,10 @@ aside.inspector.shut{display:none}
         <span class="crumb-title" id="stitle" onclick="renameCurrent()" title="Click to rename thread">New thread</span>
       </div>
       <div class="top-actions">
+        <button class="top-pill" id="art-btn" onclick="toggleArtDock()" title="Artifacts & Diagram Preview">
+          <span class="ico sm"><svg viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></svg></span>
+          <span class="top-lbl-hide">Preview</span>
+        </button>
         <button class="top-pill" id="sc-btn" onclick="toggleSideChat()" title="Contextual Side Chat (Ctrl+;)">
           <span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
           <span class="top-lbl-hide">Side chat</span>
@@ -634,6 +668,7 @@ aside.inspector.shut{display:none}
                     <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
                   </button>
                   <button class="icon-btn mic-btn" id="mic-btn" onclick="toggleDictation()" title="Voice dictation"><span class="ico"><svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></span></button>
+                  <button class="steer-stop-btn" id="stop-pill-btn" onclick="cancelRun()" title="Stop active turn">■ Stop</button>
                   <button class="send-circle" id="act-btn" onclick="primaryAction()" title="Send (Enter)">
                     <span class="ico" id="act-ico"><svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg></span>
                   </button>
@@ -691,6 +726,26 @@ aside.inspector.shut{display:none}
         <div class="dd-body" id="dd-body"></div>
       </aside>
 
+      <!-- Artifact & Diagram Preview Dock (Claude Artifacts + Sandboxed Null-Origin Iframe) -->
+      <aside class="art-dock" id="art-dock">
+        <div class="dd-top">
+          <div style="display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;min-width:0">
+            <span style="color:var(--accent)">◈</span>
+            <span id="art-title" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Artifact Preview</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:4px">
+            <button class="f-pill active" id="av-prev" onclick="setArtTab('preview')">Preview</button>
+            <button class="f-pill" id="av-src" onclick="setArtTab('source')">Source</button>
+            <button class="f-pill" id="av-vp" onclick="toggleArtVp()" title="Switch Desktop / Mobile 375px">Desktop</button>
+            <button class="icon-btn" onclick="downloadArt()" title="Download artifact"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg></span></button>
+            <button class="icon-btn" onclick="toggleArtDock(false)" title="Close preview"><span class="ico sm"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></span></button>
+          </div>
+        </div>
+        <div class="art-canvas" id="art-canvas">
+          <div style="color:var(--fg-muted);font-size:13px">Click ▶ Preview on any HTML, SVG, or Mermaid block to inspect it here.</div>
+        </div>
+      </aside>
+
       <!-- Right Environment Inspector -->
       <aside class="inspector" id="insp">
         <div class="env-card">
@@ -717,10 +772,19 @@ aside.inspector.shut{display:none}
 
           <div class="ec-sec">
             <div class="ec-row">
-              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span><span id="env-branch" style="font-family:ui-monospace,monospace;font-size:12px">main</span></span>
+              <span style="display:inline-flex;align-items:center;gap:7px;min-width:0"><span class="ico sm"><svg viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg></span><span id="env-branch" style="font-family:ui-monospace,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis">main</span></span>
+              <span id="env-pr-slot"></span>
             </div>
-            <div class="ec-row btn-row" onclick="commitNow()">
-              <span style="display:inline-flex;align-items:center;gap:7px"><span class="ico sm"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h6m6 0h6"/></svg></span>Commit changes</span>
+            <div class="ec-row btn-row" onclick="smartCommit(false)">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span style="color:var(--accent)">✦</span>Smart commit</span>
+              <button class="icon-btn" style="width:22px;height:22px" onclick="event.stopPropagation();smartCommit(true)" title="Commit with custom message hint">✎</button>
+            </div>
+            <div class="ec-row btn-row" onclick="shipPr()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span style="color:var(--ok)">⇪</span>Ship pull request</span>
+              <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
+            </div>
+            <div class="ec-row btn-row" onclick="moveToWorktree()">
+              <span style="display:inline-flex;align-items:center;gap:7px"><span>⑂</span>Move to worktree</span>
               <span class="ico sm"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></span>
             </div>
             <div class="ec-row btn-row" onclick="forkCurrent()">
@@ -832,13 +896,15 @@ const tok=new URLSearchParams(location.search).get('token')||localStorage.getIte
 if(tok)localStorage.setItem('twig_tok',tok);
 
 let curSid='',curWt='',defaultWt='',defaultBranch='main',activeModel='default',selModel='',selEffort='',selRole='code';
-let filter='all',allRepos=false,diffOpen=false,scOpen=false,termOpen=false,diffMode='unified',ccShut=false;
-let sessions=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,lastHtml='',lastDiffSig='',forceTail=true,draftNew=false,newWt=false;
+let filter='all',sbMode='threads',allRepos=false,diffOpen=false,scOpen=false,artOpen=false,termOpen=false,diffMode='unified',artTab='preview',artVp='desktop',ccShut=false;
+let sessions=[],models=[],skills=[],repoFiles=[],filesWt='',detail=null,autoData=null,lastHtml='',lastDiffSig='',forceTail=true,draftNew=false,newWt=false;
 let notifOn=localStorage.getItem('twig_notif')==='1',editor=localStorage.getItem('twig_ed')||'cursor';
 let theme=localStorage.getItem('twig_theme_v2')||'midnight';
 let pinned=new Set(JSON.parse(localStorage.getItem('twig_pins')||'[]'));
 let shutGroups={},images=[],reviewNotes=[],prevStates={},openLogs={},openTools={};
 let acItems=[],acIdx=0,cmdkItems=[],cmdkIdx=0,recog=null;
+let artStore=[],artMap=new Map(),curArt=null;
+let sseOk=false,liveText={},liveTool={},liveSteer={},userTurnTexts=[];
 
 const ED_NAMES={cursor:'Cursor',vscode:'VS Code',windsurf:'Windsurf',zed:'Zed'};
 const FAV_PAL=[['#122b26','#34d399'],['#17213a','#818cf8'],['#2a1b38','#c084fc'],['#332214','#fb923c'],['#311824','#f472b6']];
@@ -890,13 +956,20 @@ function closeMobilePanels(){
   document.getElementById('sidebar').classList.add('mob-shut');
   document.getElementById('insp').classList.remove('mob-open');
   if(innerWidth<=1080){
-    diffOpen=false;scOpen=false;
+    diffOpen=false;scOpen=false;artOpen=false;
     document.getElementById('diff-dock').classList.remove('open');
     document.getElementById('sidechat').classList.remove('open');
+    document.getElementById('art-dock').classList.remove('open');
     document.getElementById('diff-toggle-btn').classList.remove('on');
     document.getElementById('sc-btn').classList.remove('on');
+    document.getElementById('art-btn').classList.remove('on');
   }
   document.getElementById('mob-mask').classList.remove('show');
+}
+function closeSideDocks(except){
+  if(except!=='diff'){diffOpen=false;document.getElementById('diff-dock').classList.remove('open');document.getElementById('diff-toggle-btn').classList.remove('on');}
+  if(except!=='sc'){scOpen=false;document.getElementById('sidechat').classList.remove('open');document.getElementById('sc-btn').classList.remove('on');}
+  if(except!=='art'){artOpen=false;document.getElementById('art-dock').classList.remove('open');document.getElementById('art-btn').classList.remove('on');}
 }
 function toggleInspector(){
   const el=document.getElementById('insp'),b=document.getElementById('insp-btn');
@@ -906,12 +979,8 @@ function toggleInspector(){
     document.getElementById('mob-mask').classList.toggle('show',open);
     return;
   }
-  if((diffOpen||scOpen)&&innerWidth<1640){
-    diffOpen=false;scOpen=false;
-    document.getElementById('diff-dock').classList.remove('open');
-    document.getElementById('sidechat').classList.remove('open');
-    document.getElementById('diff-toggle-btn').classList.remove('on');
-    document.getElementById('sc-btn').classList.remove('on');
+  if((diffOpen||scOpen||artOpen)&&innerWidth<1640){
+    closeSideDocks('');
     el.classList.remove('shut');b.classList.add('on');
     return;
   }
@@ -921,7 +990,7 @@ function toggleInspector(){
 function toggleDiffPanel(forceOpen){
   const dock=document.getElementById('diff-dock'),b=document.getElementById('diff-toggle-btn'),insp=document.getElementById('insp'),ib=document.getElementById('insp-btn');
   diffOpen=typeof forceOpen==='boolean'?forceOpen:!diffOpen;
-  if(diffOpen&&scOpen){scOpen=false;document.getElementById('sidechat').classList.remove('open');document.getElementById('sc-btn').classList.remove('on');}
+  if(diffOpen)closeSideDocks('diff');
   dock.classList.toggle('open',diffOpen);
   b.classList.toggle('on',diffOpen);
   if(diffOpen){
@@ -935,7 +1004,7 @@ function toggleDiffPanel(forceOpen){
 function toggleSideChat(prefill){
   const sc=document.getElementById('sidechat'),b=document.getElementById('sc-btn'),insp=document.getElementById('insp'),ib=document.getElementById('insp-btn');
   scOpen=prefill?true:!scOpen;
-  if(scOpen&&diffOpen){diffOpen=false;document.getElementById('diff-dock').classList.remove('open');document.getElementById('diff-toggle-btn').classList.remove('on');}
+  if(scOpen)closeSideDocks('sc');
   sc.classList.toggle('open',scOpen);
   b.classList.toggle('on',scOpen);
   if(scOpen){
@@ -943,6 +1012,19 @@ function toggleSideChat(prefill){
     const inp=document.getElementById('sc-in');
     if(typeof prefill==='string'&&prefill)inp.value=prefill;
     setTimeout(()=>inp.focus(),40);
+  }else if(innerWidth>1080&&insp.classList.contains('shut')){
+    insp.classList.remove('shut');ib.classList.add('on');
+  }
+}
+function toggleArtDock(forceOpen){
+  const dock=document.getElementById('art-dock'),b=document.getElementById('art-btn'),insp=document.getElementById('insp'),ib=document.getElementById('insp-btn');
+  artOpen=typeof forceOpen==='boolean'?forceOpen:!artOpen;
+  if(artOpen)closeSideDocks('art');
+  dock.classList.toggle('open',artOpen);
+  b.classList.toggle('on',artOpen);
+  if(artOpen){
+    if(innerWidth<1640&&innerWidth>1080){insp.classList.add('shut');ib.classList.remove('on');}
+    renderArtDock();
   }else if(innerWidth>1080&&insp.classList.contains('shut')){
     insp.classList.remove('shut');ib.classList.add('on');
   }
@@ -1047,6 +1129,128 @@ function fmtIn(s){
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,(_,l,u)=>`<a href="${u}" target="_blank" rel="noopener noreferrer">${l}</a>`);
   return o.replace(/\x00C(\d+)\x00/g,(_,i)=>codes[+i]);
 }
+function registerArt(lang,raw){
+  const key=lang+'::'+raw;
+  if(artMap.has(key))return artMap.get(key);
+  const id=artStore.length;
+  artStore.push({lang,raw});
+  if(artStore.length<500)artMap.set(key,id);
+  return id;
+}
+function renderMermaidSvg(raw){
+  const lines=String(raw||'').split('\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('%%'));
+  if(!lines.length)return '';
+  const hdr=lines[0];
+  const xmlEsc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  if(/^sequenceDiagram/i.test(hdr)){
+    const parts=[],msgs=[];const pSet=new Map();
+    const ensure=id=>{if(!pSet.has(id)){pSet.set(id,id);parts.push(id);}};
+    for(const l of lines.slice(1)){
+      const pm=l.match(/^participant\s+([^\s]+)(?:\s+as\s+(.+))?$/i);
+      if(pm){pSet.set(pm[1],pm[2]||pm[1]);if(!parts.includes(pm[1]))parts.push(pm[1]);continue;}
+      const mm=l.match(/^([^\s-]+?)\s*(->>|-->>|->|-->)\s*([^\s:]+)\s*:\s*(.+)$/);
+      if(mm){ensure(mm[1]);ensure(mm[3]);msgs.push({a:mm[1],op:mm[2],b:mm[3],t:mm[4]});}
+    }
+    if(!parts.length)return '';
+    const gap=156,w=Math.max(320,parts.length*gap+40),h=92+msgs.length*44;
+    let g=`<defs><marker id="ma" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="#6e7bf2"/></marker></defs>`;
+    parts.forEach((p,i)=>{
+      const x=20+i*gap+gap/2,lbl=xmlEsc((pSet.get(p)||p).slice(0,22));
+      g+=`<line x1="${x}" y1="44" x2="${x}" y2="${h-16}" stroke="#33384a" stroke-dasharray="4 4"/>`;
+      g+=`<rect x="${x-62}" y="12" width="124" height="30" rx="7" fill="#181b24" stroke="#6e7bf2"/><text x="${x}" y="31" text-anchor="middle" fill="#eef0f6" font-family="system-ui,sans-serif" font-size="12" font-weight="600">${lbl}</text>`;
+    });
+    msgs.forEach((m,i)=>{
+      const x1=20+parts.indexOf(m.a)*gap+gap/2,x2=20+parts.indexOf(m.b)*gap+gap/2,y=74+i*44;
+      const dash=m.op.startsWith('--')?'stroke-dasharray="5 4"':'';
+      g+=`<line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="#6e7bf2" stroke-width="1.6" ${dash} marker-end="url(#ma)"/>`;
+      g+=`<text x="${(x1+x2)/2}" y="${y-6}" text-anchor="middle" fill="#9da3b4" font-family="ui-monospace,monospace" font-size="11">${xmlEsc(m.t.slice(0,38))}</text>`;
+    });
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}">${g}</svg>`;
+  }
+  const lr=/\bLR\b/i.test(hdr);
+  const nodes=new Map(),edges=[];
+  const parseNode=rawTok=>{
+    const m=rawTok.trim().match(/^([A-Za-z0-9_.-]+)(?:\s*[\[\(\{]+"?([^\]\)\}]+?)"?[\]\)\}]+)?$/);
+    if(!m)return null;
+    const id=m[1];if(!nodes.has(id))nodes.set(id,m[2]||id);else if(m[2])nodes.set(id,m[2]);
+    return id;
+  };
+  for(const l of lines.slice(1)){
+    if(/^(subgraph|end|style|classDef|class)\b/i.test(l))continue;
+    const em=l.match(/^(.+?)\s*(?:-->|-\.->|==>|---)\s*(?:\|([^|]+)\|\s*)?(.+)$/);
+    if(em){const a=parseNode(em[1]),b=parseNode(em[3]);if(a&&b)edges.push({a,b,lbl:em[2]||''});}
+    else parseNode(l);
+  }
+  if(!nodes.size)return '';
+  const rank=new Map();for(const k of nodes.keys())rank.set(k,0);
+  for(let it=0;it<nodes.size;it++)for(const e of edges)rank.set(e.b,Math.max(rank.get(e.b)||0,Math.min(nodes.size,(rank.get(e.a)||0)+1)));
+  const cols=new Map();
+  for(const[k,r]of rank){if(!cols.has(r))cols.set(r,[]);cols.get(r).push(k);}
+  const pos=new Map();let maxR=0,maxPer=1;
+  for(const[r,arr]of cols){maxR=Math.max(maxR,r);maxPer=Math.max(maxPer,arr.length);arr.forEach((k,idx)=>pos.set(k,{r,idx,cnt:arr.length}));}
+  const nw=152,nh=36,gx=lr?196:176,gy=lr?58:74;
+  const w=lr?(maxR+1)*gx+32:Math.max(300,maxPer*gx+32),h=lr?Math.max(140,maxPer*gy+32):(maxR+1)*gy+28;
+  const xy=k=>{const p=pos.get(k);return lr?{x:20+p.r*gx+nw/2,y:(h-(p.cnt-1)*gy)/2+p.idx*gy}:{x:(w-(p.cnt-1)*gx)/2+p.idx*gx,y:20+p.r*gy+nh/2};};
+  let g=`<defs><marker id="fa" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,1 L8,4 L0,7 z" fill="#6e7bf2"/></marker></defs>`;
+  for(const e of edges){
+    const p1=xy(e.a),p2=xy(e.b);
+    const x1=lr?p1.x+nw/2:p1.x,y1=lr?p1.y:p1.y+nh/2,x2=lr?p2.x-nw/2:p2.x,y2=lr?p2.y:p2.y-nh/2;
+    g+=`<path d="M${x1},${y1} C${(x1+x2)/2},${y1} ${(x1+x2)/2},${y2} ${x2},${y2}" fill="none" stroke="#6e7bf2" stroke-width="1.6" marker-end="url(#fa)"/>`;
+    if(e.lbl)g+=`<text x="${(x1+x2)/2}" y="${(y1+y2)/2-4}" text-anchor="middle" fill="#9da3b4" font-family="system-ui,sans-serif" font-size="10.5">${xmlEsc(e.lbl.slice(0,24))}</text>`;
+  }
+  for(const[k,lbl]of nodes){
+    const c=xy(k);
+    g+=`<rect x="${c.x-nw/2}" y="${c.y-nh/2}" width="${nw}" height="${nh}" rx="8" fill="#181b24" stroke="#3b4259" stroke-width="1.3"/>`;
+    g+=`<text x="${c.x}" y="${c.y+4}" text-anchor="middle" fill="#eef0f6" font-family="system-ui,sans-serif" font-size="12" font-weight="500">${xmlEsc(lbl.slice(0,22))}</text>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}">${g}</svg>`;
+}
+function openArtByIdx(id){
+  const it=artStore[id];if(!it)return;
+  curArt=it;artTab='preview';
+  toggleArtDock(true);
+}
+function setArtTab(t){artTab=t;renderArtDock();}
+function toggleArtVp(){artVp=artVp==='desktop'?'mobile':'desktop';renderArtDock();}
+function renderArtDock(){
+  if(!artOpen)return;
+  document.getElementById('av-prev').classList.toggle('active',artTab==='preview');
+  document.getElementById('av-src').classList.toggle('active',artTab==='source');
+  const vpBtn=document.getElementById('av-vp');
+  vpBtn.textContent=artVp==='mobile'?'Mobile 375':'Desktop';
+  vpBtn.classList.toggle('active',artVp==='mobile');
+  const box=document.getElementById('art-canvas');
+  if(!curArt){box.innerHTML='<div style="color:var(--fg-muted);font-size:13px">Click ▶ Preview on any HTML, SVG, or Mermaid code block to render it here.</div>';return;}
+  document.getElementById('art-title').textContent=`${curArt.lang.toUpperCase()} Preview`;
+  if(artTab==='source'){
+    box.innerHTML=`<div class="code-box" style="width:100%;height:100%;margin:0;overflow:auto"><pre><code>${shCode(curArt.raw)}</code></pre></div>`;
+    return;
+  }
+  if(curArt.lang==='image'){
+    box.innerHTML=`<img src="${esc(curArt.raw)}" alt="preview" style="max-width:100%;max-height:100%;border-radius:10px;border:1px solid var(--border)">`;
+    return;
+  }
+  if(curArt.lang==='svg'||curArt.lang==='mermaid'){
+    const svg=curArt.lang==='mermaid'?renderMermaidSvg(curArt.raw):curArt.raw;
+    const uri=svgDataUri(svg);
+    box.innerHTML=uri?`<div class="svg-card" style="width:100%;margin:0"><img src="${uri}" alt="diagram" style="margin:0 auto"></div>`:`<pre>${esc(curArt.raw)}</pre>`;
+    return;
+  }
+  box.innerHTML='';
+  const fr=document.createElement('iframe');
+  fr.className='art-iframe'+(artVp==='mobile'?' mob':'');
+  fr.setAttribute('sandbox','allow-scripts');
+  fr.srcdoc=curArt.raw;
+  box.appendChild(fr);
+}
+function downloadArt(){
+  if(!curArt)return toast('No active artifact');
+  const ext=curArt.lang==='mermaid'?'svg':curArt.lang==='svg'?'svg':'html';
+  const body=curArt.lang==='mermaid'?(renderMermaidSvg(curArt.raw)||curArt.raw):curArt.raw;
+  const blob=new Blob([body],{type:ext==='svg'?'image/svg+xml':'text/html'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`artifact.${ext}`;a.click();
+}
+
 function fmtMd(src){
   const lines=(src||'').replace(/\r\n/g,'\n').split('\n');
   let out='',i=0;
@@ -1058,9 +1262,15 @@ function fmtMd(src){
       i++;
       const raw=buf.join('\n');
       if(lang==='math'||lang==='latex'||lang==='tex')out+=`<div class="math-blk">${fmtTex(raw)}</div>`;
-      else if(lang==='svg'||raw.trim().startsWith('<svg')){
-        const uri=svgDataUri(raw);
-        out+=uri?`<div class="svg-card"><img src="${uri}" alt="diagram"></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
+      else if(lang==='mermaid'){
+        const aid=registerArt('mermaid',raw),svg=renderMermaidSvg(raw),uri=svg?svgDataUri(svg):'';
+        out+=uri?`<div class="code-box"><div class="code-bar"><span>mermaid diagram</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied mermaid')">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="mermaid diagram" style="max-width:100%;height:auto;display:block;margin:0 auto"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
+      }else if(lang==='svg'||raw.trim().startsWith('<svg')){
+        const aid=registerArt('svg',raw),uri=svgDataUri(raw);
+        out+=uri?`<div class="code-box"><div class="code-bar"><span>svg</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent)" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" data-aid="${aid}" onclick="copyText(artStore[+this.dataset.aid].raw,'Copied svg')">Copy</button></span></div><div style="padding:14px;background:var(--card)"><img src="${uri}" alt="diagram" style="max-width:100%;height:auto;display:block"></div></div>`:`<div class="code-box"><pre><code>${esc(raw)}</code></pre></div>`;
+      }else if(lang==='html'||lang==='htm'){
+        const aid=registerArt('html',raw);
+        out+=`<div class="code-box"><div class="code-bar"><span>${esc(lang)}</span><span style="display:inline-flex;gap:10px"><button class="meta-lnk" style="color:var(--accent);font-weight:600" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">▶ Preview</button><button class="meta-lnk" onclick="copyText(this.closest('.code-bar').nextElementSibling.textContent,'Copied code')">Copy</button></span></div><pre><code>${shCode(raw)}</code></pre></div>`;
       }else out+=`<div class="code-box"><div class="code-bar"><span>${esc(lang||'code')}</span><button class="meta-lnk" onclick="copyText(this.parentElement.nextElementSibling.textContent,'Copied code')">Copy</button></div><pre><code>${shCode(raw)}</code></pre></div>`;
       continue;
     }
@@ -1201,6 +1411,7 @@ function updateDocTitle(){
   else document.title=`${name} · twig`;
 }
 function renderList(){
+  if(sbMode==='auto'){renderAutoSidebar();return;}
   const q=(document.getElementById('q').value||'').trim().toLowerCase();
   const byParent={};
   for(const s of sessions){if(s.parent_sid)(byParent[s.parent_sid]=byParent[s.parent_sid]||[]).push(s);}
@@ -1293,7 +1504,16 @@ async function loadList(){
 }
 
 /* Thread Navigation & Timeline */
+function ensureThreadsMode(){
+  if(sbMode!=='threads'){
+    sbMode='threads';
+    document.getElementById('m-thr').classList.add('active');
+    document.getElementById('m-aut').classList.remove('active');
+    document.getElementById('sb-thr-filters').style.display='flex';
+  }
+}
 async function openSid(sid,resetScroll=false,fromPoll=false){
+  if(!fromPoll)ensureThreadsMode();
   draftNew=false;newWt=false;
   if(sid!==curSid)forceTail=true;
   if(resetScroll)forceTail=true;
@@ -1305,6 +1525,7 @@ async function openSid(sid,resetScroll=false,fromPoll=false){
 }
 function openParent(){if(detail&&detail.parent_sid)openSid(detail.parent_sid,true);}
 function newThread(withWorktree=false){
+  ensureThreadsMode();
   draftNew=true;curSid='';curWt=defaultWt;newWt=!!withWorktree;
   forceTail=true;lastHtml='';
   detail={messages:[],pending:[],todos:[],children:[],usage:{},diff:'',branch:defaultBranch,worktree:defaultWt,running:false};
@@ -1351,18 +1572,25 @@ function summarizeToolCall(name,rawArgs){
   if(name==='todo')return['Plan',`${(a.items||[]).length} step(s)`];
   return[name,JSON.stringify(a).slice(0,80)];
 }
-function groupTimeline(msgs){
+function groupTimeline(msgs,snaps){
   const toolOut={};
   for(const m of msgs){if(m.role==='tool'&&m.tool_call_id)toolOut[m.tool_call_id]=typeof m.content==='string'?m.content:JSON.stringify(m.content);}
-  const items=[];let curWork=null;
+  const items=[];let curWork=null,uCounter=0;userTurnTexts=[];
   const flushWork=()=>{if(curWork&&curWork.calls.length)items.push(curWork);curWork=null;};
   for(let i=0;i<msgs.length;i++){
     const m=msgs[i];
     if(m.role==='system'||m.role==='tool')continue;
     if(m.role==='user'){
       flushWork();
-      const txt=typeof m.content==='string'?m.content:Array.isArray(m.content)?m.content.map(x=>x.text||'[image]').join('\n'):JSON.stringify(m.content);
-      items.push({kind:'user',txt});
+      let txt='',uImgs=[];
+      if(typeof m.content==='string')txt=m.content;
+      else if(Array.isArray(m.content)){
+        txt=m.content.filter(x=>x.type==='text'||typeof x.text==='string').map(x=>x.text||'').join('\n');
+        uImgs=m.content.filter(x=>x.type==='image_url'&&x.image_url?.url).map(x=>x.image_url.url);
+      }else txt=JSON.stringify(m.content);
+      const uIdx=uCounter++;
+      userTurnTexts.push(txt);
+      items.push({kind:'user',uIdx,txt,imgs:uImgs,hasSnap:!!(snaps&&snaps[uIdx])});
       continue;
     }
     if(m.role==='assistant'){
@@ -1423,6 +1651,13 @@ function renderInspector(){
   document.getElementById('env-branch').textContent=br;
   document.getElementById('open-ed').href=ideUri(wt,'');
 
+  const pr=detail&&detail.pr;
+  const prSlot=document.getElementById('env-pr-slot');
+  if(pr&&pr.url){
+    const num=pr.number||String(pr.url).split('/').pop()||'PR';
+    prSlot.innerHTML=`<a class="pr-badge" href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${esc(num)} ↗</a>`;
+  }else prSlot.innerHTML='';
+
   const files=parseDiffFiles((detail&&detail.diff)||'');
   const totA=files.reduce((s,f)=>s+f.ins,0),totD=files.reduce((s,f)=>s+f.del,0);
   document.getElementById('env-diff-stat').innerHTML=files.length?`<span class="c-add">+${totA}</span> <span class="c-del">-${totD}</span>`:'clean';
@@ -1448,6 +1683,7 @@ function renderInspector(){
     document.getElementById('sub-list').innerHTML=kids.map(k=>`<div class="t-card" style="padding:7px 8px;margin:0;border:1px solid var(--border)" data-sid="${esc(k.sid)}" onclick="openSid(this.dataset.sid)">
       <div class="t-row1"><span style="color:var(--ok);font-weight:600">${esc(k.role||'sub')}</span><span class="t-status">${k.tool_count||0} tools</span></div>
       <div class="t-title" style="font-size:12px">${esc(k.task||k.sid)}</div>
+      <div style="display:flex;justify-content:flex-end;margin-top:4px"><button class="meta-lnk" style="color:var(--accent)" data-sid="${esc(k.sid)}" onclick="event.stopPropagation();applySubagentPatch(this.dataset.sid)">Apply patch</button></div>
     </div>`).join('');
   }
 
@@ -1459,27 +1695,42 @@ function renderInspector(){
   document.getElementById('cache-bar').style.width=pct+'%';
 }
 
-function render(){
-  if(!detail)return;
-  document.getElementById('parent-btn').style.display=detail.parent_sid?'inline-flex':'none';
-  const sMeta=sessions.find(s=>s.sid===curSid);
-  document.getElementById('stitle').textContent=detail.title||(sMeta&&sMeta.label)||(curSid?curSid:'New thread');
-  syncContextStrip();renderInspector();renderDiffDock();updateDocTitle();
-
-  const actBtn=document.getElementById('act-btn'),actIco=document.getElementById('act-ico');
-  if(detail.running){
+function syncActionBtn(){
+  const actBtn=document.getElementById('act-btn'),actIco=document.getElementById('act-ico'),stopPill=document.getElementById('stop-pill-btn');
+  const running=!!(detail&&detail.running);
+  const hasTxt=!!(document.getElementById('inp')?.value.trim());
+  actBtn.classList.remove('stop','steer');
+  stopPill.classList.toggle('show',running&&hasTxt);
+  if(running&&hasTxt){
+    actBtn.classList.add('steer');actBtn.title='Steer active turn live (Enter)';
+    actIco.innerHTML='<svg viewBox="0 0 24 24"><path d="M9 10l-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>';
+  }else if(running){
     actBtn.classList.add('stop');actBtn.title='Stop active turn';
     actIco.innerHTML='<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></svg>';
   }else{
-    actBtn.classList.remove('stop');actBtn.title='Send (Enter)';
+    actBtn.title='Send (Enter)';
     actIco.innerHTML='<svg viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
   }
+}
+
+function render(){
+  if(sbMode==='auto'){renderAutoStage();return;}
+  if(!detail)return;
+  document.querySelector('.composer-dock').style.display='';
+  document.getElementById('parent-btn').style.display=detail.parent_sid?'inline-flex':'none';
+  const sMeta=sessions.find(s=>s.sid===curSid);
+  document.getElementById('stitle').textContent=detail.title||(sMeta&&sMeta.label)||(curSid?curSid:'New thread');
+  syncContextStrip();renderInspector();renderDiffDock();updateDocTitle();syncActionBtn();
 
   const pane=document.getElementById('pane'),inner=document.getElementById('tl-inner');
   const nearBottom=forceTail||(pane.scrollHeight-pane.scrollTop-pane.clientHeight<64);
-  const grouped=groupTimeline(detail.messages||[]);
+  const grouped=groupTimeline(detail.messages||[],detail.snapshots||[]);
   const pending=detail.pending||[];
   const diffFiles=parseDiffFiles(detail.diff||'');
+  const kids=detail.children||[];
+  const streamTxt=(detail.running&&curSid&&liveText[curSid])||'';
+  const activeTl=(detail.running&&curSid&&liveTool[curSid])||null;
+  const steered=(detail.running&&curSid&&liveSteer[curSid])||'';
 
   let html='';
   if(!grouped.length&&!pending.length&&!detail.running){
@@ -1487,10 +1738,14 @@ function render(){
   }else{
     html+=grouped.map(it=>{
       if(it.kind==='user'){
+        const imgRow=it.imgs&&it.imgs.length?`<div class="u-imgs">${it.imgs.map(u=>{const aid=registerArt('image',u);return `<img src="${esc(u)}" alt="attachment" data-aid="${aid}" onclick="openArtByIdx(+this.dataset.aid)">`;}).join('')}</div>`:'';
+        const revCodeBtn=(!detail.running&&it.hasSnap)?`<button class="meta-lnk" style="color:var(--accent)" data-u="${it.uIdx}" onclick="rewindTurn(+this.dataset.u,true)" title="Restore worktree files & chat to before this turn">↺ Restore</button>`:'';
+        const revChatBtn=!detail.running?`<button class="meta-lnk" data-u="${it.uIdx}" onclick="rewindTurn(+this.dataset.u,false)" title="Rewind conversation to this turn without reverting files">↶ Rewind chat</button>`:'';
         return `<div class="u-row">
-          <div class="u-bubble">${esc(it.txt)}</div>
+          <div class="u-bubble">${imgRow}${esc(it.txt)}</div>
           <div class="msg-acts">
-            <button class="meta-lnk" onclick="copyText(${esc(JSON.stringify(it.txt))},'Copied prompt')">Copy</button>
+            ${revCodeBtn}${revChatBtn}
+            <button class="meta-lnk" data-u="${it.uIdx}" onclick="copyText(userTurnTexts[+this.dataset.u]||'','Copied prompt')">Copy</button>
             <button class="meta-lnk" onclick="forkCurrent()">⑂ Fork</button>
           </div>
         </div>`;
@@ -1524,7 +1779,26 @@ function render(){
       </div></div>`;
     }).join('');
 
-    if(detail.running)html+=`<div class="wl-sum shimmer">● Working…</div>`;
+    if(kids.length){
+      html+=`<div class="sub-swarm">${kids.map(k=>`<div class="sub-tile">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+          <span class="f-pill" style="color:var(--ok);height:20px">↳ ${esc(k.role||'scout')}</span>
+          <span style="font:11px/1 ui-monospace,monospace;color:var(--fg-muted)">${k.tool_count||0} tools · ${k.turns||0}t</span>
+        </div>
+        <div style="font-size:12.5px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(k.task||k.sid)}</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:2px">
+          <button class="meta-lnk" data-sid="${esc(k.sid)}" onclick="openSid(this.dataset.sid)">Inspect thread →</button>
+          <button class="meta-lnk" style="color:var(--accent)" data-sid="${esc(k.sid)}" onclick="applySubagentPatch(this.dataset.sid)">Apply patch</button>
+        </div>
+      </div>`).join('')}</div>`;
+    }
+
+    if(steered)html+=`<div class="wl-sum" style="color:var(--accent)">↳ Queued live steer: ${esc(steered)}</div>`;
+    if(streamTxt)html+=`<div class="a-row">${fmtMd(streamTxt)}<span class="live-cursor"></span></div>`;
+    if(detail.running){
+      const actLbl=activeTl?`● ${activeTl[0]} · ${activeTl[1]}`:'● Working…';
+      html+=`<div class="wl-sum shimmer">${esc(actLbl)}</div>`;
+    }
     html+=pending.map(a=>`<div class="ap-card">
       <div class="ap-eyebrow">⛨ Approval needed · ${esc(a.name)}</div>
       <div class="ap-cmd">${esc(a.args&&a.args.command?a.args.command:JSON.stringify(a.args))}</div>
@@ -1627,6 +1901,11 @@ function renderCmdk(){
     {t:'Settings · MCP Servers & Memory',h:'MCP',fn:()=>openSettings('mcp')},
     {t:'New thread',h:'Action',fn:()=>newThread(false)},
     {t:'New isolated Git worktree thread',h:'Worktree',fn:()=>newThread(true)},
+    {t:'Switch to Automations Queue',h:'Queue',fn:()=>setSbMode('auto')},
+    {t:'Smart Commit active worktree',h:'Git',fn:()=>smartCommit(false)},
+    {t:'Ship Pull Request (zero AI trailers)',h:'PR',fn:()=>shipPr()},
+    {t:'Move active thread into isolated Worktree',h:'Branch',fn:()=>moveToWorktree()},
+    {t:'Toggle Artifacts & Diagram Preview Dock',h:'Preview',fn:()=>toggleArtDock()},
     {t:'Toggle Diff Review Panel',h:'Ctrl+D',fn:()=>toggleDiffPanel()},
     {t:'Toggle Contextual Side Chat (/btw)',h:'Ctrl+;',fn:()=>toggleSideChat()},
     {t:'Toggle Quick Worktree Terminal',h:'Ctrl+`',fn:()=>toggleTerminal()},
@@ -1933,7 +2212,12 @@ function addImageFile(f){
   rd.readAsDataURL(f);
 }
 function autoGrow(el){el.style.height='auto';el.style.height=Math.min(180,Math.max(46,el.scrollHeight))+'px';}
-function primaryAction(){if(detail&&detail.running)cancelRun();else sendPrompt();}
+function primaryAction(){
+  if(detail&&detail.running){
+    if(document.getElementById('inp').value.trim())steerActiveTurn();
+    else cancelRun();
+  }else sendPrompt();
+}
 
 async function sendPrompt(){
   const inp=document.getElementById('inp');
@@ -1943,22 +2227,77 @@ async function sendPrompt(){
     const notes=reviewNotes.splice(0,reviewNotes.length).map(n=>`- \`${n.loc}\`: ${n.note}`).join('\n');
     text=`Address these inline diff review comments:\n${notes}${text?'\n\n'+text:''}`;
   }
-  inp.value='';autoGrow(inp);closeAc();forceTail=true;
+  inp.value='';autoGrow(inp);closeAc();forceTail=true;syncActionBtn();
   const slug=(!curSid&&newWt)?(document.getElementById('wt-slug').value.trim()||text.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||'task'):'';
   const imgs=images.splice(0,images.length);renderAttachments();
   const r=await api('/api/send',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,new_worktree_slug:slug,role:selRole,model:selModel,effort:selEffort,prompt:text,images:imgs})});
   if(r.error)return toast(r.error);
-  if(r.sid){draftNew=false;newWt=false;curSid=r.sid;if(r.worktree)curWt=r.worktree;syncWtUi();setTimeout(()=>openSid(curSid,true),220);}
+  if(r.sid){draftNew=false;newWt=false;curSid=r.sid;liveText[curSid]='';liveTool[curSid]=null;liveSteer[curSid]='';if(r.worktree)curWt=r.worktree;syncWtUi();setTimeout(()=>openSid(curSid,true),160);}
 }
-async function cancelRun(){if(!curSid)return;const r=await api('/api/cancel',{method:'POST',body:JSON.stringify({sid:curSid})});toast(r.stopped?'Interrupted active turn':'No active process');setTimeout(()=>openSid(curSid),260);}
+async function steerActiveTurn(){
+  if(!curSid)return;
+  const inp=document.getElementById('inp'),text=inp.value.trim();
+  if(!text)return;
+  inp.value='';autoGrow(inp);closeAc();syncActionBtn();
+  const r=await api('/api/steer',{method:'POST',body:JSON.stringify({sid:curSid,input:text})});
+  if(r.error)return toast(r.error);
+  if(r.idle){inp.value=text;return sendPrompt();}
+  liveSteer[curSid]=text;lastHtml='';render();
+  toast('↳ Queued live steer for next boundary');
+}
+async function rewindTurn(uIdx,restoreCode){
+  if(!curSid||!detail)return;
+  const totalU=userTurnTexts.length;
+  const turns=totalU-uIdx;
+  if(turns<=0)return;
+  const origTxt=userTurnTexts[uIdx]||'';
+  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'session.rewind',params:{turns,restore_code:!!restoreCode}})});
+  if(r.error)return toast(r.error);
+  toast(restoreCode?'↺ Restored worktree & rewound chat':`↶ Rewound ${r.rewound_turns||turns} turn(s)`);
+  const inp=document.getElementById('inp');
+  if(origTxt&&!inp.value.trim()){inp.value=origTxt;autoGrow(inp);inp.focus();}
+  lastHtml='';await openSid(curSid,true);loadList();
+}
+async function cancelRun(){if(!curSid)return;const r=await api('/api/cancel',{method:'POST',body:JSON.stringify({sid:curSid})});toast(r.stopped?'Interrupted active turn':'No active process');setTimeout(()=>openSid(curSid),220);}
 async function archiveSid(sid){const r=await api('/api/archive',{method:'POST',body:JSON.stringify({sid})});if(r.error)return toast(r.error);toast('Archived thread');if(curSid===sid)newThread(false);loadList();}
 async function approve(id,allow){await api('/api/approve',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,id,allow})});toast(allow?'Approved':'Declined');openSid(curSid);}
-async function commitNow(){
-  if(!curSid)return toast('Select an active thread first');
-  const hint=prompt('Optional commit message hint (leave blank for auto repo-style message):','');
-  if(hint===null)return;
-  const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,hint:hint||undefined})});
-  toast(r.summary||r.error||'Committed');openSid(curSid);loadList();
+async function smartCommit(withHint){
+  if(!curSid)return toast('Open a thread with changes first');
+  let hint=undefined;
+  if(withHint){
+    const h=prompt('Custom commit message hint (leave blank for auto repo-style message):','');
+    if(h===null)return;
+    hint=h.trim()||undefined;
+  }
+  toast('✦ Generating smart commit…');
+  const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,hint})});
+  toast(r.summary||r.error||'Committed changes');openSid(curSid);loadList();
+}
+async function shipPr(){
+  if(!curSid)return toast('Open an active thread first');
+  toast('⇪ Pushing branch & creating zero-trailer Pull Request…');
+  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.pr',params:{}})});
+  if(r.error)return toast(r.error);
+  toast(r.url?`Shipped PR #${r.number||''}`:(r.summary||'Pull Request created'));
+  openSid(curSid);loadList();
+}
+async function moveToWorktree(){
+  if(!curSid)return toast('Open an active thread first');
+  const def=(document.getElementById('stitle').textContent||'feature').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||'feature';
+  const slug=prompt('Move thread & uncommitted changes into isolated branch worktree:',def);
+  if(slug===null)return;
+  toast('⑂ Provisioning worktree & carrying uncommitted state…');
+  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'git.worktree',params:{arg:slug.trim()||def}})});
+  if(r.error)return toast(r.error);
+  if(r.worktree)curWt=r.worktree;
+  toast(r.branch?`Switched to ${r.branch}`:'Moved to isolated worktree');
+  openSid(curSid);loadList();
+}
+async function applySubagentPatch(childSid){
+  if(!curSid||!childSid)return;
+  const r=await api('/api/rpc',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,method:'session.apply',params:{sid:childSid}})});
+  if(r.error)return toast(r.error);
+  toast(r.summary||'Applied subagent patch');openSid(curSid);loadList();
 }
 async function renameCurrent(){
   if(!curSid)return;
@@ -2004,8 +2343,158 @@ async function runQuickCmd(cmd){
   if(curSid)openSid(curSid);
 }
 
-const inpEl=document.getElementById('inp');
-inpEl.addEventListener('input',()=>{autoGrow(inpEl);updateAc();});
+/* Automations Queue Mode (Threads | Automations) */
+async function setSbMode(m){
+  sbMode=m;
+  document.getElementById('m-thr').classList.toggle('active',m==='threads');
+  document.getElementById('m-aut').classList.toggle('active',m==='auto');
+  document.getElementById('sb-thr-filters').style.display=m==='auto'?'none':'flex';
+  if(m==='auto'){await loadAutomations();}
+  else{document.querySelector('.composer-dock').style.display='';renderList();lastHtml='';render();}
+}
+async function loadAutomations(){
+  autoData=await api('/api/automations?wt='+encodeURIComponent(curWt||defaultWt||''));
+  if(sbMode==='auto'){renderAutoSidebar();renderAutoStage();}
+}
+function renderAutoSidebar(){
+  const items=(autoData&&autoData.items)||[];
+  const q=(document.getElementById('q').value||'').trim().toLowerCase();
+  const filt=items.filter(it=>!q||`${it.title} #${it.number} ${it.state}`.toLowerCase().includes(q));
+  document.getElementById('sb-count').textContent=`${items.length} queued`;
+  document.getElementById('slist').innerHTML=filt.length?filt.map(it=>{
+    const col=it.state==='done'?'var(--ok)':it.state==='failed'?'var(--err)':it.state==='needs_attention'?'var(--warn)':'var(--accent)';
+    return `<div class="t-card" onclick="renderAutoStage()">
+      <div class="t-row1"><span class="proj-name">#${it.number} · ${esc(it.kind)}</span><span class="t-status" style="color:${col}">${esc(it.state)}</span></div>
+      <div class="t-title">${esc(it.title)}</div>
+      <div class="t-row3"><span class="t-branch">${esc(it.repository||'')}</span></div>
+    </div>`;
+  }).join(''):'<div style="padding:18px 12px;font-size:12.5px;color:var(--fg-muted)">Queue is empty. Configure or enqueue tasks on the right.</div>';
+}
+function renderAutoStage(){
+  document.querySelector('.composer-dock').style.display='none';
+  document.getElementById('stitle').textContent='Automations Queue';
+  const d=autoData||{items:[]},cfg=d.config||{},items=d.items||[];
+  const repo=cfg.repository||d.suggested_repo||'owner/repo';
+  const html=`<div class="auto-wrap">
+    <div class="stg-card">
+      <div class="stg-row">
+        <div><div class="stg-lbl">Durable GitHub & Worktree Automation (\`.twig/automation.json\`)</div><div class="stg-sub">Isolates each queued Issue/PR in its own worktree, runs acceptance checks + reviewer gate, and pauses before shipping.</div></div>
+        <div style="display:flex;gap:6px">
+          ${d.configured?`<button class="btn-xs" onclick="triggerAutoRun('run_local')">${d.running?'● Running…':'▶ Run Queued'}</button><button class="btn-pri" onclick="triggerAutoRun('poll_once')">↻ Sync GitHub & Run</button>`:''}
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;padding-top:4px">
+        <div><div class="stg-sub">GitHub owner/repo</div><input class="stg-in" id="au-repo" value="${esc(repo)}" style="width:100%;font-family:ui-monospace,monospace"></div>
+        <div><div class="stg-sub">Label filter</div><input class="stg-in" id="au-lbl" value="${esc(cfg.label||'twig')}" style="width:100%;font-family:ui-monospace,monospace"></div>
+        <div><div class="stg-sub">Verification check command</div><input class="stg-in" id="au-chk" value="${esc(cfg.check_command||'cargo test --quiet')}" style="width:100%;font-family:ui-monospace,monospace"></div>
+      </div>
+      <div class="stg-row" style="padding-top:4px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg-dim);cursor:pointer"><input type="checkbox" id="au-prs" ${cfg.include_pull_requests?'checked':''}> Include open PRs</label>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--fg-dim);cursor:pointer"><input type="checkbox" id="au-ship" ${cfg.create_pr?'checked':''}> Permit push + PR creation</label>
+        <button class="btn-xs" onclick="saveAutoCfg()">Save Automation Config</button>
+      </div>
+    </div>
+    ${d.configured?`<div class="stg-card">
+      <div class="stg-lbl">Enqueue Task Manually</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input class="stg-in" id="au-t-ttl" placeholder="Issue / maintenance task title…" style="flex:1;min-width:200px">
+        <input class="stg-in" id="au-t-body" placeholder="Acceptance criteria / reproduction notes…" style="flex:1;min-width:200px">
+        <button class="btn-pri" onclick="enqueueAutoTask()">+ Enqueue</button>
+      </div>
+    </div>`:''}
+    <div class="stg-card">
+      <div class="stg-lbl">Queue Ledger (${items.length})</div>
+      ${items.length?items.map(it=>`<div class="stg-row" style="padding:8px 10px;border-radius:9px;background:var(--bg);border:1px solid var(--border)">
+        <div style="min-width:0;flex:1">
+          <div style="display:flex;align-items:center;gap:7px"><strong style="font-size:13px">#${it.number} · ${esc(it.title)}</strong><span class="f-pill" style="height:20px">${esc(it.state)}</span></div>
+          <div class="stg-sub" style="font-family:ui-monospace,monospace">${esc(it.id)}${it.worktree?' · '+esc(it.worktree):''}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px">
+          ${it.url?`<a class="btn-xs" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer" style="text-decoration:none">GitHub ↗</a>`:''}
+          ${it.state==='needs_attention'?`<button class="btn-xs" data-id="${esc(it.id)}" data-act="${esc(it.pending_action||'create_pr')}" onclick="resolveAutoShip(this.dataset.id,this.dataset.act,true)">Confirm Shipped</button>`:''}
+        </div>
+      </div>`).join(''):'<div class="stg-sub">No work items queued yet.</div>'}
+    </div>
+  </div>`;
+  document.getElementById('tl-inner').innerHTML=html;
+  lastHtml='';
+}
+async function saveAutoCfg(){
+  const body={
+    action:'save_config',worktree:curWt||defaultWt,
+    repository:document.getElementById('au-repo').value.trim(),
+    label:document.getElementById('au-lbl').value.trim(),
+    check_command:document.getElementById('au-chk').value.trim(),
+    include_pull_requests:document.getElementById('au-prs').checked,
+    create_pr:document.getElementById('au-ship').checked,
+  };
+  const r=await api('/api/automations',{method:'POST',body:JSON.stringify(body)});
+  if(r.error)return toast(r.error);
+  toast('Saved .twig/automation.json');loadAutomations();
+}
+async function enqueueAutoTask(){
+  const title=document.getElementById('au-t-ttl').value.trim(),body=document.getElementById('au-t-body').value.trim();
+  if(!title)return toast('Task title required');
+  const r=await api('/api/automations',{method:'POST',body:JSON.stringify({action:'enqueue',worktree:curWt||defaultWt,title,body})});
+  if(r.error)return toast(r.error);
+  document.getElementById('au-t-ttl').value='';document.getElementById('au-t-body').value='';
+  toast('Enqueued automation task');loadAutomations();
+}
+async function triggerAutoRun(action){
+  const r=await api('/api/automations',{method:'POST',body:JSON.stringify({action,worktree:curWt||defaultWt})});
+  if(r.error)return toast(r.error);
+  toast(action==='poll_once'?'Polling GitHub & executing queue…':'Executing queued items in isolated worktrees…');
+  loadAutomations();
+}
+async function resolveAutoShip(id,shipping_action,completed){
+  const r=await api('/api/automations',{method:'POST',body:JSON.stringify({action:'resolve_shipping',worktree:curWt||defaultWt,id,shipping_action,completed})});
+  if(r.error)return toast(r.error);
+  toast('Resolved shipping state');loadAutomations();
+}
+
+/* Real-Time SSE Stream (/api/events) with Graceful Fallback */
+let rafPend=false;
+function scheduleLiveRender(){
+  if(rafPend)return;rafPend=true;
+  requestAnimationFrame(()=>{rafPend=false;if(sbMode==='threads'&&curSid)render();});
+}
+function connectSse(){
+  try{
+    const es=new EventSource('/api/events'+(tok?'?token='+encodeURIComponent(tok):''));
+    es.onopen=()=>{sseOk=true;document.getElementById('sse-dot')?.classList.add('live');};
+    es.onerror=()=>{sseOk=false;document.getElementById('sse-dot')?.classList.remove('live');};
+    es.onmessage=e=>{
+      let d;try{d=JSON.parse(e.data);}catch(_){return;}
+      const sid=d.sid||'';
+      if(d.ev==='automation.updated'){if(sbMode==='auto')loadAutomations();if(d.error)toast('Automation: '+d.error);return;}
+      if(d.ev==='session.started'){loadList();if(sid===curSid&&detail){detail.running=true;scheduleLiveRender();}return;}
+      if(d.ev==='model.delta'&&sid){
+        liveText[sid]=(liveText[sid]||'')+(d.text||'');
+        if(detail&&sid===curSid)detail.running=true;
+        if(sid===curSid)scheduleLiveRender();
+        return;
+      }
+      if(d.ev==='tool.started'&&sid){
+        liveTool[sid]=summarizeToolCall(d.tool,d.args);
+        if(sid===curSid)scheduleLiveRender();
+        return;
+      }
+      if(d.ev==='steering.queued'&&sid){
+        liveSteer[sid]=d.text||'';
+        if(sid===curSid)scheduleLiveRender();
+        return;
+      }
+      if(d.ev==='tool.completed'||d.ev==='approval.requested'||d.ev==='turn.completed'||d.ev==='session.idle'||d.ev==='session.settled'){
+        if(d.ev==='turn.completed'||d.ev==='session.settled'){liveText[sid]='';liveTool[sid]=null;if(d.ev==='session.settled')liveSteer[sid]='';}
+        loadList();
+        if(sid===curSid&&sbMode==='threads')openSid(curSid,false,true);
+      }
+    };
+  }catch(_){}
+}
+
+const inpEl=document.getElementById('inp'),compCard=document.querySelector('.composer-card');
+inpEl.addEventListener('input',()=>{autoGrow(inpEl);updateAc();syncActionBtn();});
 inpEl.addEventListener('keydown',e=>{
   if(acItems.length){
     if(e.key==='ArrowDown'){e.preventDefault();acIdx=(acIdx+1)%acItems.length;renderAc();return;}
@@ -2013,14 +2502,25 @@ inpEl.addEventListener('keydown',e=>{
     if(e.key==='Tab'||(e.key==='Enter'&&!e.shiftKey)){e.preventDefault();applyAc(acIdx);return;}
     if(e.key==='Escape'){e.preventDefault();closeAc();return;}
   }
-  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendPrompt();}
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();primaryAction();}
 });
-inpEl.addEventListener('paste',e=>{for(const it of(e.clipboardData?.items||[]))if(it.type.startsWith('image/'))addImageFile(it.getAsFile());});
-document.body.addEventListener('dragover',e=>e.preventDefault());
-document.body.addEventListener('drop',e=>{e.preventDefault();for(const f of(e.dataTransfer?.files||[]))addImageFile(f);});
+document.addEventListener('paste',e=>{
+  const items=[...(e.clipboardData?.items||[])].filter(it=>it.type.startsWith('image/'));
+  if(!items.length)return;
+  e.preventDefault();
+  for(const it of items)addImageFile(it.getAsFile());
+  toast('Attached clipboard image');
+});
+document.body.addEventListener('dragover',e=>{e.preventDefault();compCard?.classList.add('drop-active');});
+document.body.addEventListener('dragleave',e=>{if(!e.relatedTarget)compCard?.classList.remove('drop-active');});
+document.body.addEventListener('drop',e=>{e.preventDefault();compCard?.classList.remove('drop-active');for(const f of(e.dataTransfer?.files||[]))addImageFile(f);});
 
-loadMeta();loadList();
-setInterval(()=>{loadList();if(curSid)openSid(curSid,false,true);},2000);
+loadMeta();loadList();connectSse();
+setInterval(()=>{
+  if(sbMode==='auto')return;
+  loadList();
+  if(curSid&&!sseOk)openSid(curSid,false,true);
+},3500);
 </script>
 </body>
 </html>

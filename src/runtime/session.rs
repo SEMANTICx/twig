@@ -774,6 +774,16 @@ pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -
     let running = in_flight || crate::record::Lease::is_locked(&path.with_extension("lock"));
     let usage = crate::llm::summarize_usage(&rows);
     let children = load_child_threads(sid, None);
+    let pr_info = rows
+        .iter()
+        .rev()
+        .find(|r| r["kind"] == "git.pr_created")
+        .cloned();
+    let last_commit = rows
+        .iter()
+        .rev()
+        .find(|r| r["kind"] == "git.committed")
+        .cloned();
     Ok(json!({
         "sid": sid,
         "title": snap.title,
@@ -790,6 +800,10 @@ pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -
         "children": children,
         "messages": snap.messages,
         "pending": snap.pending,
+        "snapshots": snap.snapshots,
+        "constraints": snap.constraints,
+        "pr": pr_info,
+        "last_commit": last_commit,
         "diff": diff,
     }))
 }
