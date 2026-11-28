@@ -172,9 +172,10 @@ twig exec --check "cargo test --quiet" --json "Fix off-by-one bounds bug in pars
 | `Tab` / `3` *(in Approval)* | **Inline Rejection Feedback**: type instructions directly on Option 3 (`Tell twig instead: ...`) so the model pivots immediately |
 | `/btw <question>` | **Floating Ephemeral Side-Card**: answers above the composer reusing KV cache with zero history/transcript pollution (`Esc`/`Space` dismisses) |
 | `Esc×2` / `/rewind` / `/fork` / `/undo` | Rewind turns (`r` restores Git worktree tree snapshot; `f` forks session) / fork branch session / revert last file edit |
+| `/goal <objective>` | **Autonomous Closed-Loop Goal**: grounds in code, tracks `todo` waves without mid-run pauses, and finishes with an automatic blocker-gated `/review --fix` pass |
 | `/plan` → `/go` / `/dual-plan <goal>` | Explore read-only on `plan` model then `/go` to execute on `code` / blind `plan` × `advisor` synthesis |
 | `/roles` / `/operator` / `/study` | Configure per-role models / toggle multi-agent Operator coordinator mode / toggle REA epistemic provenance (`[Observed]`/`[Inferred]`) |
-| `/diff` / `/review` / `/walkthrough` / `/apply <sid>` | Line-numbered diff / independent read-only review (`xhigh` on sensitive paths) / architecture walkthrough / apply a `code` subagent patch |
+| `/diff` / `/review [--fix]` / `/walkthrough` / `/apply <sid>` | Line-numbered diff / independent read-only review (`--fix` auto-repairs concrete `blockers` up to 2 rounds; ignores `suggestions`) / architecture walkthrough / apply a `code` subagent patch |
 | `/commit [hint]` / `/pr` / `/worktree` | Repo-style smart commit (zero AI trailers) / push & open PR / live mid-session handoff to an isolated Git worktree |
 | `/mcp` / `/skills` / `/blackboard` / `/verify` / `/evolve` | Manage MCP servers / 3-tier skills / inspect RCI fact blackboard / verify BLAKE3 hash chain / propose session learnings |
 | `Ctrl+F` / `Ctrl+R` / `Ctrl+G` / `Alt+Y` / `Alt+V` | CJK-safe transcript search / fuzzy prompt history / `$EDITOR` draft / copy code (`Alt+Shift+Y` full reply) / paste clipboard image |

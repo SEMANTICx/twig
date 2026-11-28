@@ -3,7 +3,7 @@
 //! - Live `Subagents` strip with tool counts & turn-scoped visibility
 //! - `/btw` ephemeral answer card and queued follow-up strip
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
@@ -17,6 +17,7 @@ use super::theme::{
     clip_width, display_width, fmt_elapsed_compact, horizontal_pad, wrap_plain, MotionMode, ACCENT,
     ACCENT_PEAK, AMBER, BASH_MODE_COLOR, HAIRLINE, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE,
 };
+use super::transcript::{NoticeKind, Transcript};
 
 #[derive(Debug, Clone)]
 pub struct TodoEntry {
@@ -191,7 +192,7 @@ impl SubagentEntry {
         })
     }
 
-    pub fn from_started(id: String, ev: &Value) -> Self {
+    fn from_started(id: String, ev: &Value) -> Self {
         Self {
             id,
             child_sid: ev["sid"]
@@ -214,7 +215,7 @@ impl SubagentEntry {
         }
     }
 
-    pub fn apply_progress(&mut self, ev: &Value) {
+    fn apply_progress(&mut self, ev: &Value) {
         if let Some(csid) = ev["sid"].as_str().filter(|s| !s.is_empty()) {
             self.child_sid = Some(csid.to_owned());
         }
@@ -239,6 +240,170 @@ impl SubagentEntry {
                 }
             }
         }
+    }
+}
+
+fn find_running_subagent(subagents: &[SubagentEntry], id: &str, role: &str) -> Option<usize> {
+    (!id.is_empty())
+        .then(|| {
+            subagents
+                .iter()
+                .position(|s| s.status == SubagentStatus::Running && s.id == id)
+        })
+        .flatten()
+        .or_else(|| {
+            subagents
+                .iter()
+                .position(|s| s.status == SubagentStatus::Running && s.role == role)
+        })
+}
+
+fn handle_subagent_completed(
+    subagents: &mut Vec<SubagentEntry>,
+    transcripts: &mut HashMap<String, Transcript>,
+    ev: &Value,
+) -> bool {
+    let id = ev["id"].as_str().unwrap_or("");
+    let role = ev["role"].as_str().unwrap_or("subagent");
+    let child_sid = ev["sid"].as_str().filter(|s| !s.is_empty());
+    let model = ev["model"].as_str().map(str::to_owned);
+    let has_patch = ev["patch_artifact"].as_str().is_some();
+    let ok = ev["ok"] == true;
+    let secs = ev["elapsed_secs"].as_u64().unwrap_or(0);
+    let err_note = ev["error"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let next_status = if ok {
+        SubagentStatus::Completed
+    } else {
+        SubagentStatus::Failed
+    };
+    let match_idx = find_running_subagent(subagents, id, role).or_else(|| {
+        subagents
+            .iter()
+            .position(|s| s.status == SubagentStatus::Running)
+    });
+    let (done_id, resolved_sid) = if let Some(idx) = match_idx {
+        if let Some(csid) = child_sid {
+            subagents[idx].child_sid = Some(csid.to_owned());
+        }
+        if subagents[idx].model.is_none() {
+            subagents[idx].model = model;
+        }
+        subagents[idx].status = next_status;
+        subagents[idx].elapsed_secs = Some(secs);
+        subagents[idx].error = err_note.clone();
+        subagents[idx].activity = None;
+        (subagents[idx].id.clone(), subagents[idx].child_sid.clone())
+    } else {
+        let fallback_id = if id.is_empty() {
+            format!("{role}-{}", subagents.len() + 1)
+        } else {
+            id.to_owned()
+        };
+        let mut entry = SubagentEntry::from_started(fallback_id.clone(), ev);
+        entry.status = next_status;
+        entry.elapsed_secs = Some(secs);
+        entry.error = err_note.clone();
+        let csid = entry.child_sid.clone();
+        subagents.push(entry);
+        (fallback_id, csid)
+    };
+    if let Some(tr) = transcripts.get_mut(&done_id) {
+        if ok {
+            let apply_hint = match (has_patch, resolved_sid.as_deref()) {
+                (true, Some(csid)) => format!(" · patch ready: `/apply {csid}`"),
+                _ => String::new(),
+            };
+            tr.push_notice(
+                NoticeKind::Success,
+                format!(
+                    "subagent [{role}] completed in {secs}s{apply_hint} (Enter reply · Esc ← main)"
+                ),
+            );
+        } else {
+            tr.push_notice(
+                NoticeKind::Error,
+                format!(
+                    "subagent [{role}] failed: {}",
+                    err_note.as_deref().unwrap_or("error")
+                ),
+            );
+        }
+    }
+    has_patch
+}
+
+/// Apply a `subagent.*` stream/lifecycle event to the subagent thread tree.
+/// Returns `(optional_status_header, has_patch, sync_overlay)`.
+pub fn apply_subagent_event(
+    subagents: &mut Vec<SubagentEntry>,
+    transcripts: &mut HashMap<String, Transcript>,
+    viewing: Option<&str>,
+    ev: &Value,
+) -> (Option<String>, bool, bool) {
+    match ev["ev"].as_str() {
+        Some("subagent.started") => {
+            let raw_id = ev["id"].as_str().unwrap_or("");
+            let role = ev["role"].as_str().unwrap_or("subagent");
+            let id = if raw_id.is_empty() {
+                format!("{role}-{}", subagents.len() + 1)
+            } else {
+                raw_id.to_owned()
+            };
+            let entry = SubagentEntry::from_started(id.clone(), ev);
+            let header = format!("Subagent [{}]", entry.role);
+            let mut child_tr = Transcript::new();
+            if !entry.task.is_empty() {
+                child_tr.push_user(entry.task.clone());
+            }
+            transcripts.insert(id, child_tr);
+            subagents.push(entry);
+            if subagents.len() > 16 {
+                let drop_n = subagents.len() - 16;
+                for dropped in subagents.drain(..drop_n) {
+                    if viewing != Some(dropped.id.as_str()) {
+                        transcripts.remove(&dropped.id);
+                    }
+                }
+            }
+            (Some(header), false, true)
+        }
+        Some("subagent.progress") => {
+            let id = ev["id"].as_str().unwrap_or("");
+            let role = ev["role"].as_str().unwrap_or("subagent");
+            if let Some(idx) = find_running_subagent(subagents, id, role) {
+                subagents[idx].apply_progress(ev);
+                (None, false, true)
+            } else {
+                (None, false, false)
+            }
+        }
+        Some("subagent.stream") => {
+            let id = ev["id"].as_str().unwrap_or("");
+            let role = ev["role"].as_str().unwrap_or("subagent");
+            let key = if !id.is_empty() && transcripts.contains_key(id) {
+                Some(id.to_owned())
+            } else {
+                subagents
+                    .iter()
+                    .rev()
+                    .find(|s| s.status == SubagentStatus::Running && s.role == role)
+                    .map(|s| s.id.clone())
+            };
+            if let Some(k) = key {
+                if let Some(tr) = transcripts.get_mut(&k) {
+                    let _ = tr.apply_stream_event(&ev["child"]);
+                }
+            }
+            (None, false, false)
+        }
+        Some("subagent.completed") => {
+            let has_patch = handle_subagent_completed(subagents, transcripts, ev);
+            (None, has_patch, true)
+        }
+        _ => (None, false, false),
     }
 }
 

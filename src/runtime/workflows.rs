@@ -1,8 +1,9 @@
 //! Multi-agent engineering workflows built on `Daemon`, `SubagentPool`, and `Provider`:
-//! - `/diff` & `/review` independent fresh-context two-tier review (`blockers` vs `suggestions`)
+//! - `/goal` autonomous closed-loop execution with `todo` tracking & blocker-gated review
+//! - `/diff` & `/review [--fix]` independent fresh-context two-tier review (`blockers` vs `suggestions`)
 //! - `/walkthrough` intent-grouped diff explanation
 //! - `/dual-plan` blind parallel `plan` × `advisor` investigation and synthesis
-//! - `/evolve` guard-first ratchet prompt
+//! - `/evolve` negative-control guard-first ratchet prompt
 
 use std::path::Path;
 use std::process::Command;
@@ -15,13 +16,38 @@ use super::Daemon;
 use crate::config::HarnessConfig;
 use crate::llm::{cli, Llm, Provider};
 
-/// Prompt sent by `/evolve` for guard-first ratchet + bounded memory distillation.
+/// Prompt sent by `/evolve` for negative-control guard-first ratchet + bounded memory distillation.
 pub const EVOLVE_PROMPT: &str = "\
 Reflect on this session's friction, repeated errors, tool papercuts, or repo-specific conventions you discovered. \
-Apply a strict Guard-First Ratchet: \
-(1) First check whether the lesson can be enforced mechanically via a unit test, lint, or `post_edit_check` in `.twig/project.json` — prefer executable guards over prose! \
-(2) Only distill non-automatable conventions into `.twig/preferences.md` (strictly keep total `.twig/preferences.md` <= 2,400 chars by merging/pruning stale bullets rather than appending endlessly) or a focused skill under `.twig/skills/<name>/SKILL.md` (<500 lines). \
-Do NOT modify files yet — present ONE concise unified diff proposal with rationale for human review.";
+Apply a strict Guard-First Ratchet with Negative-Control Sensitivity: \
+(1) First check whether the lesson can be enforced mechanically via a unit test, architectural test, lint, or `post_edit_check` in `.twig/project.json` — prefer executable guards over prose! \
+(2) Prove Sensitivity (Negative Control): any proposed guard or regression test MUST demonstrably fail against the known/planted violation and pass on the clean state (never propose tautological always-green checks). \
+(3) Only distill non-automatable conventions into `.twig/preferences.md` (strictly keep total `.twig/preferences.md` <= 2,400 chars by merging/pruning stale bullets rather than appending endlessly) or a focused skill under `.twig/skills/<name>/SKILL.md` (<500 lines). \
+Do NOT modify files yet — present ONE concise unified diff proposal with rationale and negative-control proof for human review.";
+
+/// Build the autonomous closed-loop execution prompt for `/goal <objective>`.
+pub fn build_goal_prompt(goal: &str) -> String {
+    format!(
+        "[Autonomous Closed-Loop Goal Execution]\n\
+         Objective: {goal}\n\n\
+         Execution Contract:\n\
+         1. Ground in Reality First: inspect real modules, callers, and tests (`outline`, `grep`, `read`) before editing.\n\
+         2. Live Checklist: maintain a concise `todo` plan (`3..=8` verifiable waves/steps) and update status as each step completes.\n\
+         3. Entropy-Reducing Implementation: preserve Single Source of Truth, Canonical Implementation, and Deep Modules; when introducing a replacement, migrate existing callers and delete superseded dead code in the same wave.\n\
+         4. Prove Sensitivity & Verify: run the project's lint/test checks after each wave, and ensure new guards/tests fail on the buggy/violating state.\n\
+         5. No Premature Pauses: continue autonomously through all safe, unambiguous steps until the objective converges; pause ONLY if blocked on a destructive operation, missing credential, or genuine product/contract decision."
+    )
+}
+
+/// Build the epistemic clean-room specification prompt for `/study <target>`.
+pub fn build_study_prompt(goal: &str) -> String {
+    format!(
+        "[Clean-Room Study & SPEC Extraction]\n\
+         Target: {goal}\n\
+         Inspect observable behavior, structure (`read` headers/hexdump/.har, `outline` xrefs/deps), or run safe black-box probes without fabricating unseen internals. \
+         Produce a structured specification separating `[Observed]`, `[Derived]`, `[Inferred]`, and `[Unknown / Limitation]`, followed by concrete acceptance test cases ready for `/go`."
+    )
+}
 
 /// Collect working-tree diff (or staged diff if unstaged is empty) for `/diff`, `/review`, and `/walkthrough`.
 pub fn run_git_diff(repo: &str) -> Result<String, String> {
@@ -43,15 +69,17 @@ pub fn run_git_diff(repo: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&staged.stdout).into_owned())
 }
 
-/// Invoke `twig review <repo> <diff>` as an independent fresh read-only reviewer for `/review`.
-pub fn run_independent_review(repo: &str) -> Result<String, String> {
+/// Invoke `twig review <repo> <diff>` as an independent fresh read-only reviewer for `/review [--fix]`.
+/// Returns `(formatted_markdown, blocker_repair_prompt)` where `blocker_repair_prompt` is `Some(...)`
+/// ONLY when concrete `blockers` exist (`suggestions` never trigger a repair turn).
+pub fn run_independent_review(repo: &str) -> Result<(String, Option<String>), String> {
     let diff = run_git_diff(repo)?;
     if diff.trim().is_empty() {
         return Err("no unstaged or staged git changes to review".into());
     }
     let sensitive = diff_touches_sensitive_paths(&diff);
     let raw = invoke_review_subprocess(repo, &diff)?;
-    Ok(format_review_output(&raw, sensitive))
+    Ok(parse_review_output(&raw, sensitive))
 }
 
 fn invoke_review_subprocess(repo: &str, diff: &str) -> Result<String, String> {
@@ -73,9 +101,54 @@ fn invoke_review_subprocess(repo: &str, diff: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn format_review_output(raw: &str, sensitive: bool) -> String {
+fn format_blocker_bullets(blockers: &[Value]) -> Vec<String> {
+    blockers
+        .iter()
+        .filter_map(|b| {
+            let file = b["file"].as_str().unwrap_or("?").trim();
+            let trigger = b["trigger"].as_str().unwrap_or("-").trim();
+            let issue = b["issue"]
+                .as_str()
+                .or_else(|| b["note"].as_str())
+                .unwrap_or("")
+                .trim();
+            (!issue.is_empty()).then(|| format!("- **`{file}`** (trigger: `{trigger}`): {issue}"))
+        })
+        .collect()
+}
+
+fn format_suggestion_bullets(suggestions: &[Value]) -> Vec<String> {
+    suggestions
+        .iter()
+        .filter_map(|s| {
+            let file = s["file"].as_str().unwrap_or("?").trim();
+            let note = s["note"]
+                .as_str()
+                .or_else(|| s["issue"].as_str())
+                .unwrap_or("")
+                .trim();
+            (!note.is_empty()).then(|| format!("- `{file}`: {note}"))
+        })
+        .collect()
+}
+
+fn build_blocker_repair_prompt(blocker_lines: &[String]) -> Option<String> {
+    if blocker_lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[Evidence-Gated Review Repair]\n\
+         Independent review reported {} concrete blocker(s) in the current diff (non-blocking suggestions were intentionally excluded):\n\
+         {}\n\n\
+         Fix ONLY these reproducible blockers with minimal root-cause edits, run the relevant test/lint suite to verify, and avoid speculative style churn.",
+        blocker_lines.len(),
+        blocker_lines.join("\n")
+    ))
+}
+
+fn parse_review_output(raw: &str, sensitive: bool) -> (String, Option<String>) {
     let Ok(v) = serde_json::from_str::<Value>(raw.trim()) else {
-        return raw.to_owned();
+        return (raw.to_owned(), None);
     };
     let approved = v.get("approved").and_then(Value::as_bool);
     let summary = v
@@ -86,18 +159,20 @@ fn format_review_output(raw: &str, sensitive: bool) -> String {
     let blockers = v
         .get("blockers")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let suggestions = v
         .get("suggestions")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
 
-    let verdict = match approved {
-        Some(true) => "**APPROVED** (0 blockers)",
-        Some(false) => "**CHANGES REQUESTED**",
-        None => "**REVIEW COMPLETED**",
+    let blocker_lines = format_blocker_bullets(blockers);
+    let suggestion_lines = format_suggestion_bullets(suggestions);
+    let verdict = match (approved, blocker_lines.is_empty()) {
+        (Some(true), true) | (None, true) => "**APPROVED** (0 blockers)",
+        _ if !blocker_lines.is_empty() => "**CHANGES REQUESTED**",
+        _ => "**REVIEW COMPLETED**",
     };
     let effort_tag = if sensitive {
         " · effort escalated to `xhigh` (sensitive paths touched)"
@@ -105,27 +180,18 @@ fn format_review_output(raw: &str, sensitive: bool) -> String {
         " · effort `high`"
     };
     let mut md = format!("### Independent Review: {verdict}{effort_tag}\n\n{summary}\n");
-    if !blockers.is_empty() {
+    if !blocker_lines.is_empty() {
         md.push_str("\n#### Blockers (must fix)\n");
-        for b in &blockers {
-            let file = b["file"].as_str().unwrap_or("?");
-            let trigger = b["trigger"].as_str().unwrap_or("-");
-            let issue = b["issue"].as_str().unwrap_or("");
-            md.push_str(&format!("- **`{file}`** (trigger: `{trigger}`): {issue}\n"));
-        }
+        md.push_str(&blocker_lines.join("\n"));
+        md.push('\n');
     }
-    if !suggestions.is_empty() {
+    if !suggestion_lines.is_empty() {
         md.push_str("\n#### Suggestions (non-blocking)\n");
-        for s in &suggestions {
-            let file = s["file"].as_str().unwrap_or("?");
-            let note = s["note"]
-                .as_str()
-                .or_else(|| s["issue"].as_str())
-                .unwrap_or("");
-            md.push_str(&format!("- `{file}`: {note}\n"));
-        }
+        md.push_str(&suggestion_lines.join("\n"));
+        md.push('\n');
     }
-    md
+    let repair_prompt = build_blocker_repair_prompt(&blocker_lines);
+    (md, repair_prompt)
 }
 
 fn collect_repo_brief_context(repo: &str) -> String {
@@ -290,4 +356,52 @@ pub fn run_dual_plan(repo: &str, goal: &str) -> Result<String, String> {
     let plan_a = res_a?;
     let plan_b = res_b?;
     synthesize_dual_plans(&provider, goal, &plan_model, &advisor_model, &plan_a, &plan_b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_parser_gates_repair_strictly_on_blockers_ignoring_suggestions() {
+        let clean_with_nits = json!({
+            "approved": true,
+            "review_summary": "Solid fix.",
+            "blockers": [],
+            "suggestions": [{"file": "src/lib.rs", "note": "Consider renaming x to count"}]
+        })
+        .to_string();
+        let (md_ok, repair_ok) = parse_review_output(&clean_with_nits, false);
+        assert!(md_ok.contains("**APPROVED** (0 blockers)"));
+        assert!(md_ok.contains("Consider renaming x to count"));
+        assert!(
+            repair_ok.is_none(),
+            "non-blocking suggestions must never trigger a repair loop"
+        );
+
+        let with_blocker = json!({
+            "approved": false,
+            "review_summary": "Panic on empty slice.",
+            "blockers": [{
+                "file": "src/parser.rs",
+                "trigger": "parse(\"\")",
+                "issue": "index 0 out of bounds"
+            }],
+            "suggestions": [{"file": "src/parser.rs", "note": "Nit: add doc comment"}]
+        })
+        .to_string();
+        let (md_fail, repair_fail) = parse_review_output(&with_blocker, true);
+        assert!(md_fail.contains("**CHANGES REQUESTED**"));
+        assert!(md_fail.contains("`xhigh`"));
+        let prompt = repair_fail.expect("concrete blocker must produce repair prompt");
+        assert!(prompt.contains("src/parser.rs") && prompt.contains("parse(\"\")"));
+        assert!(
+            !prompt.contains("Nit: add doc comment"),
+            "repair prompt must exclude non-blocking suggestions"
+        );
+
+        let goal = build_goal_prompt("Eliminate duplicate session parsers");
+        assert!(goal.contains("todo") && goal.contains("Single Source of Truth"));
+        assert!(EVOLVE_PROMPT.contains("Negative-Control Sensitivity"));
+    }
 }

@@ -23,6 +23,7 @@ use super::theme::{
 
 /// Codex & Claude Code parity slash command catalog.
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/goal ", "run autonomous closed-loop goal with todo plan & blocker-gated review"),
     ("/plan", "toggle read-only planning mode (Shift+Tab)"),
     ("/study", "toggle REA epistemic clean-room study mode (/study [on|off|<target>])"),
     ("/go", "exit /plan & /study, switch to `code` role, and execute agreed spec/plan"),
@@ -49,7 +50,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/archive", "archive current session and start a new one"),
     ("/undo", "revert the last edit or write tool change"),
     ("/diff", "show current git diff with line numbers"),
-    ("/review", "run independent read-only review on current changes"),
+    ("/review", "run independent read-only review (/review [--fix] auto-repairs blockers)"),
     ("/image ", "attach image file or paste clipboard image (Alt+V)"),
     ("/agent", "peek into a subagent's live stream (Codex-style) or return to main"),
     ("/tasks", "list asynchronous background shell tasks"),
@@ -95,6 +96,7 @@ pub enum SlashCommand {
         effort: Option<String>,
     },
     DualPlan(String),
+    RunGoal(String),
     ExecutePlan(Option<String>),
     SideQuestion(String),
     RunWalkthrough,
@@ -122,7 +124,9 @@ pub enum SlashCommand {
     ArchiveSession,
     UndoEdit,
     RunDiff,
-    RunReview,
+    RunReview {
+        fix: bool,
+    },
     AttachImage(Option<String>),
     ClearImages,
     SwitchAgent(Option<String>),
@@ -207,7 +211,11 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/archive" => Some(SlashCommand::ArchiveSession),
         "/undo" => Some(SlashCommand::UndoEdit),
         "/diff" => Some(SlashCommand::RunDiff),
-        "/review" => Some(SlashCommand::RunReview),
+        "/goal" => Some(SlashCommand::RunGoal(String::new())),
+        "/review" => Some(SlashCommand::RunReview { fix: false }),
+        "/review --fix" | "/review fix" | "/review -f" => {
+            Some(SlashCommand::RunReview { fix: true })
+        }
         "/image" => Some(SlashCommand::AttachImage(None)),
         "/image clear" => Some(SlashCommand::ClearImages),
         "/agent" | "/agents" => Some(SlashCommand::SwitchAgent(None)),
@@ -369,6 +377,12 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
                 });
             }
             _ => return Some(SlashCommand::ShowRoles),
+        }
+    }
+    if let Some(arg) = trimmed.strip_prefix("/goal ") {
+        let a = arg.trim();
+        if !a.is_empty() {
+            return Some(SlashCommand::RunGoal(a.to_owned()));
         }
     }
     if let Some(arg) = trimmed
@@ -1554,6 +1568,18 @@ mod tests {
         assert_eq!(
             parse_slash("/unqueue", false),
             Some(SlashCommand::QueueFollowUp(Some("clear".into())))
+        );
+        assert_eq!(
+            parse_slash("/goal eliminate duplicate parsers", false),
+            Some(SlashCommand::RunGoal("eliminate duplicate parsers".into()))
+        );
+        assert_eq!(
+            parse_slash("/review", false),
+            Some(SlashCommand::RunReview { fix: false })
+        );
+        assert_eq!(
+            parse_slash("/review --fix", false),
+            Some(SlashCommand::RunReview { fix: true })
         );
     }
 

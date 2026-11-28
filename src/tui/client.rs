@@ -583,6 +583,42 @@ pub fn format_init_report(created: &[String], existing: &[String]) -> String {
     format!("twig init: {}", parts.join(" · "))
 }
 
+/// Execute `/rci [status|harvest|distill]` and format `(is_distill_success, notice, optional_markdown)`.
+pub fn format_rci_slash(repo: &str, sub: &str) -> Result<(bool, String, Option<String>), String> {
+    let repo_path = Path::new(repo);
+    let sessions_dir = paths::state_dir().join("sessions");
+    match sub {
+        "harvest" => {
+            let rep = crate::eval::rci::harvest_sessions(&sessions_dir)?;
+            let notice = format!(
+                "RCI label-free harvest: {} verified collective session(s) out of {} valid ledgers",
+                rep.verified_collective_sessions, rep.chain_valid_files
+            );
+            let body = serde_json::to_string_pretty(&rep.role_credits)
+                .ok()
+                .map(|p| format!("```json\n{p}\n```"));
+            Ok((false, notice, body))
+        }
+        "distill" | "distill --online" => {
+            let online = sub.contains("--online");
+            let (rep, files) =
+                crate::eval::rci::distill_role_notes(repo_path, &sessions_dir, online)?;
+            let msg = format!(
+                "RCI distilled {} role protocol cards ({} verified sessions harvested)",
+                files.len(),
+                rep.verified_collective_sessions
+            );
+            let bullets = files
+                .into_iter()
+                .map(|f| format!("- `{f}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok((true, msg, Some(bullets)))
+        }
+        _ => Ok((false, crate::runtime::blackboard::status_report(repo_path), None)),
+    }
+}
+
 pub fn detect_git_branch(repo: &str) -> Option<String> {
     let out = Command::new("git")
         .args(["-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
@@ -805,7 +841,10 @@ pub enum LocalMsg {
         exit_code: Option<i32>,
         elapsed: Duration,
     },
-    Review(Result<String, String>),
+    Review {
+        outcome: Result<(String, Option<String>), String>,
+        auto_fix: bool,
+    },
     Walkthrough(Result<String, String>),
     DualPlan(Result<String, String>),
     Doctor(Result<(String, bool), String>),
@@ -844,12 +883,11 @@ impl LocalWorkers {
         });
     }
 
-    pub fn spawn_review(&self, repo: String) {
+    pub fn spawn_review(&self, repo: String, auto_fix: bool) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(LocalMsg::Review(
-                crate::runtime::workflows::run_independent_review(&repo),
-            ));
+            let outcome = crate::runtime::workflows::run_independent_review(&repo);
+            let _ = tx.send(LocalMsg::Review { outcome, auto_fix });
         });
     }
 

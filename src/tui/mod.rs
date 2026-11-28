@@ -96,6 +96,14 @@ pub(super) enum PendingRpc {
     Worktree,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoReviewState {
+    Idle,
+    AwaitTurnEnd { fixes_left: u8 },
+    ReadyToSpawn { fixes_left: u8 },
+    Reviewing { fixes_left: u8 },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     None,
@@ -167,6 +175,7 @@ struct App {
     pending_rpcs: std::collections::HashMap<u64, PendingRpc>,
     queued_turns: std::collections::VecDeque<String>,
     auto_send_next: Option<String>,
+    auto_review: AutoReviewState,
     last_shell_cmd: Option<String>,
     last_shell: Option<(String, String, Option<i32>)>,
     running_tasks: usize,
@@ -240,6 +249,7 @@ impl App {
             pending_rpcs: std::collections::HashMap::new(),
             queued_turns: std::collections::VecDeque::new(),
             auto_send_next: None,
+            auto_review: AutoReviewState::Idle,
             last_shell_cmd: None,
             last_shell: None,
             running_tasks: 0,
@@ -290,6 +300,7 @@ impl App {
         self.pending_rpcs.clear();
         self.queued_turns.clear();
         self.auto_send_next = None;
+        self.auto_review = AutoReviewState::Idle;
         self.running_tasks = 0;
         self.cached_tasks.clear();
         self.todos.clear();
@@ -1349,6 +1360,8 @@ impl App {
                 if let Some(next_prompt) = self.auto_send_next.take() {
                     let act = self.dispatch_input(&next_prompt);
                     let _ = self.handle_action(act, terminal, client, workers)?;
+                } else if self.take_ready_auto_review() {
+                    workers.spawn_review(self.repo_raw.clone(), true);
                 }
             }
             if let Some((title, body)) = self.pending_notify.take() {
@@ -1442,6 +1455,8 @@ impl App {
                 self.send_rpc(client, "steer", json!({"input": text}), "");
             }
             Action::Cancel => {
+                self.auto_review = AutoReviewState::Idle;
+                self.auto_send_next = None;
                 let _ = client.send("cancel", json!({}));
             }
             Action::BackgroundActive => {

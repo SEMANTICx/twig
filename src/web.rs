@@ -223,9 +223,14 @@ fn write_http(
         401 => "401 Unauthorized",
         _ => "404 Not Found",
     };
+    let csp = if content_type.starts_with("text/html") {
+        "Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; object-src 'none'; base-uri 'none'\r\n"
+    } else {
+        ""
+    };
     write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{csp}Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
     stream.write_all(body)?;
@@ -329,73 +334,106 @@ const COCKPIT_HTML: &str = r#"<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>twig cockpit</title>
 <style>
-:root{--bg:#161311;--surf:#211d1a;--hi:#2c2622;--txt:#f0ebe3;--muted:#9a8f85;--acc:#d97757;--sage:#7ea87e;--amber:#e0a958;--err:#d96565}
+:root{color-scheme:dark;--bg:#141312;--surf:#1c1a18;--hi:#262320;--line:#2c2825;--txt:#f0ede8;--muted:#8e877f;--acc:#d97757;--sage:#7ea87e;--amber:#e0a958;--err:#d96565}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font:14px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);display:flex;height:100dvh;overflow:hidden}
-aside{width:290px;background:var(--surf);border-right:1px solid #332c27;display:flex;flex-direction:column;flex-shrink:0}
-header{padding:12px 14px;border-bottom:1px solid #332c27;display:flex;justify-content:space-between;align-items:center;font-weight:700;color:var(--acc)}
-.slist{overflow-y:auto;flex:1}
-.sitem{padding:10px 14px;border-bottom:1px solid #28231f;cursor:pointer}
-.sitem:hover,.sitem.active{background:var(--hi)}
-.badge{font-size:11px;font-weight:700;padding:1px 6px;border-radius:4px;margin-right:6px}
-.b-approval,.b-running{background:#3d2f1b;color:var(--amber)}
-.b-dirty{background:#3a231c;color:var(--acc)}
-.b-settled{background:#1f2f21;color:var(--sage)}
-main{flex:1;display:flex;flex-direction:column;min-width:0}
-.topbar{padding:10px 16px;border-bottom:1px solid #332c27;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--surf)}
-.tabs button,.btn{background:var(--hi);color:var(--txt);border:1px solid #3c342e;padding:5px 11px;border-radius:6px;cursor:pointer;font-size:12px}
-.tabs button.active,.btn.primary{background:var(--acc);color:#161311;border-color:var(--acc);font-weight:700}
-.pane{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
-.msg{padding:10px 14px;border-radius:8px;background:var(--surf);white-space:pre-wrap;word-break:break-word}
-.msg.assistant{white-space:normal}
-.msg.assistant p,.msg.assistant ul,.msg.assistant ol,.msg.assistant pre,.msg.assistant table,.msg.assistant blockquote{margin:6px 0}
+body{font:400 14px/24px 'Geist','Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);display:flex;height:100dvh;overflow:hidden;-webkit-font-smoothing:antialiased}
+aside{width:288px;background:var(--surf);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0}
+header{min-height:56px;padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.brand{font-size:16px;font-weight:600;line-height:24px;letter-spacing:-0.01em;color:var(--txt);display:inline-flex;align-items:center;gap:8px}
+.brand-dot{width:8px;height:8px;border-radius:8px;background:var(--acc)}
+.slist{overflow-y:auto;flex:1;padding:8px}
+.sitem{padding:12px;border-radius:8px;cursor:pointer;transition:background 120ms ease;margin-bottom:4px}
+.sitem:hover{background:var(--hi)}
+.sitem.active{background:var(--hi)}
+.srow{display:flex;align-items:center;gap:8px;min-width:0}
+.slabel{font-size:14px;font-weight:500;line-height:20px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ssub{font-size:12px;line-height:16px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{font-size:12px;line-height:16px;font-weight:500;padding:0 8px;height:20px;display:inline-flex;align-items:center;border-radius:8px;flex-shrink:0}
+.b-approval,.b-running{background:#332818;color:var(--amber)}
+.b-dirty{background:#32201a;color:var(--acc)}
+.b-settled{background:#1c291e;color:var(--sage)}
+main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
+.topbar{min-height:56px;padding:12px 24px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+#stitle{font-size:18px;font-weight:600;line-height:24px;letter-spacing:-0.01em;color:var(--txt)}
+#smeta{color:var(--muted);font-size:12px;line-height:16px;flex:1;min-width:120px}
+.tabs{display:inline-flex;gap:4px;padding:4px;background:var(--surf);border-radius:12px}
+.tabs button{background:transparent;color:var(--muted);border:0;height:28px;padding:0 12px;border-radius:8px;cursor:pointer;font:500 12px/16px inherit;transition:color 120ms ease,background 120ms ease}
+.tabs button:hover{color:var(--txt)}
+.tabs button.active{background:var(--hi);color:var(--txt)}
+.btn{background:var(--surf);color:var(--txt);border:1px solid var(--line);height:32px;padding:0 12px;border-radius:8px;cursor:pointer;font:500 12px/16px inherit;display:inline-flex;align-items:center;gap:8px;transition:background 120ms ease,color 120ms ease,border-color 120ms ease,opacity 140ms ease}
+.btn:hover{background:var(--hi)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn.ghost:hover,.btn.ghost:focus-visible{background:var(--surf);border-color:var(--line);color:var(--txt)}
+.btn.primary{background:var(--acc);color:#141312;border-color:var(--acc);font-weight:600;height:44px;padding:0 16px;border-radius:12px}
+.btn.primary:hover{filter:brightness(1.06)}
+.ico{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.ico svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.5;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.pane{flex:1;min-height:0;overflow-y:auto;padding:24px 32px;display:flex;flex-direction:column;gap:20px}
+.pane>*{width:100%;max-width:768px;margin-left:auto;margin-right:auto}
+.msg{word-break:break-word}
+.msg.user{background:var(--surf);padding:12px 16px;border-radius:12px;white-space:pre-wrap;color:var(--txt)}
+.msg.assistant{padding:4px 0;white-space:normal}
+.msg.assistant p,.msg.assistant ul,.msg.assistant ol,.msg.assistant pre,.msg.assistant table,.msg.assistant blockquote{margin:8px 0}
+.msg.assistant h2,.msg.assistant h3,.msg.assistant h4,.msg.assistant h5{font-size:16px;font-weight:600;line-height:24px;color:var(--txt);margin:16px 0 8px}
 .msg.assistant ul,.msg.assistant ol{padding-left:20px}
-.msg.assistant code{font:12.5px/1.4 ui-monospace,monospace;color:#f5b799;background:#2a231e;padding:1px 5px;border-radius:4px}
-.msg.assistant pre{background:#120f0d;border:1px solid #332c27;padding:10px 12px;border-radius:6px;overflow-x:auto;white-space:pre}
+.msg.assistant code{font:13px/20px 'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--txt);background:var(--surf);padding:0 4px;border-radius:4px}
+.msg.assistant pre{background:var(--surf);padding:16px;border-radius:12px;overflow-x:auto;white-space:pre}
 .msg.assistant pre code{background:none;padding:0;color:var(--txt)}
-.msg.assistant table{border-collapse:collapse;width:100%;font-size:13px}
-.msg.assistant th,.msg.assistant td{border:1px solid #3c342e;padding:5px 9px;text-align:left}
-.msg.assistant th{background:var(--hi);color:var(--acc)}
-.msg.assistant .math-blk{padding:6px 12px;margin:6px 0;border-left:2px solid var(--amber);color:var(--amber);font-family:ui-serif,Georgia,serif;font-size:15px}
-.msg.assistant .math-in{color:var(--amber);font-family:ui-serif,Georgia,serif}
-.msg.assistant .svg-card{background:#120f0d;border:1px solid #332c27;border-radius:6px;padding:10px;margin:6px 0;overflow-x:auto}
+.msg.assistant .code-hdr{display:flex;justify-content:space-between;align-items:center;min-height:24px;font-size:12px;line-height:16px;color:var(--muted);margin-bottom:8px}
+.copy-btn{opacity:0;height:24px;padding:0 8px;border-radius:8px;font-size:12px}
+.msg.assistant pre:hover .copy-btn,.msg.assistant pre:focus-within .copy-btn{opacity:1}
+.msg.assistant table{border-collapse:collapse;width:100%;font-size:13px;line-height:20px;background:var(--surf);border-radius:12px;overflow:hidden}
+.msg.assistant th,.msg.assistant td{border-bottom:1px solid var(--line);padding:8px 12px;text-align:left}
+.msg.assistant th{font-weight:600;color:var(--txt);background:var(--hi)}
+.msg.assistant .math-blk{padding:8px 16px;margin:8px 0;border-left:2px solid var(--line);color:var(--txt);font-family:ui-serif,Georgia,serif;font-size:16px;line-height:24px}
+.msg.assistant .math-in{color:var(--txt);font-family:ui-serif,Georgia,serif}
+.msg.assistant .svg-card{background:var(--surf);border-radius:12px;padding:16px;margin:12px 0;overflow-x:auto}
 .msg.assistant .svg-card img{max-width:100%;height:auto;display:block}
-.msg.assistant .code-hdr{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted);margin-bottom:4px}
-.msg.user{border-left:3px solid var(--acc);background:var(--hi)}
-.msg.tool{font:12px/1.45 ui-monospace,monospace;color:var(--muted);padding:6px 12px}
-.approval{background:#362917;border:1px solid var(--amber);padding:12px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;gap:10px}
-pre.diff{font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all}
+.msg.tool{font:12px/20px 'Geist Mono',ui-monospace,monospace;color:var(--muted);padding:0 4px;white-space:pre-wrap}
+.approval{background:var(--surf);border-left:2px solid var(--amber);padding:16px;border-radius:12px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.approval-actions{display:flex;gap:8px;align-items:center}
+.approval-actions .btn.primary{height:32px;padding:0 12px}
+pre.diff{font:12px/20px 'Geist Mono',ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;background:var(--surf);padding:16px;border-radius:12px}
 .d-add{color:var(--sage)}.d-del{color:var(--err)}.d-hunk{color:var(--amber)}
-.composer{padding:12px 16px;border-top:1px solid #332c27;display:flex;gap:8px;background:var(--surf)}
-textarea{flex:1;background:var(--bg);color:var(--txt);border:1px solid #3c342e;border-radius:6px;padding:8px 10px;font:inherit;resize:none;height:44px}
-@media(max-width:720px){body{flex-direction:column}aside{width:100%;height:190px;border-right:0;border-bottom:1px solid #332c27}}
+.empty{color:var(--muted);font-size:14px;line-height:24px;padding:24px 0}
+.composer{padding:16px 24px;border-top:1px solid var(--line);display:flex;gap:12px;align-items:flex-end;background:var(--bg)}
+.composer-inner{width:100%;max-width:768px;margin:0 auto;display:flex;gap:12px;align-items:center}
+textarea{flex:1;background:var(--surf);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:8px 12px;font:inherit;line-height:24px;resize:none;height:44px;outline:none;transition:border-color 120ms ease}
+textarea:focus{border-color:var(--muted)}
+@media(hover:none){.copy-btn{opacity:1}}
+@media(max-width:720px){body{flex-direction:column}aside{width:100%;height:192px;border-right:0;border-bottom:1px solid var(--line)}.topbar{padding:12px 16px}.pane{padding:16px;gap:16px}.composer{padding:12px 16px}}
 </style>
 </head>
 <body>
 <aside>
-  <header><span>twig cockpit</span><button class="btn" onclick="newThread()">+ New</button></header>
+  <header>
+    <span class="brand"><span class="brand-dot"></span>twig cockpit</span>
+    <button class="btn" onclick="newThread()"><span class="ico"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>New</button>
+  </header>
   <div class="slist" id="slist"></div>
 </aside>
 <main>
   <div class="topbar">
-    <strong id="stitle">Select or start a thread</strong>
-    <span id="smeta" style="color:var(--muted);font-size:12px;flex:1"></span>
+    <strong id="stitle">New thread</strong>
+    <span id="smeta"></span>
     <div class="tabs">
       <button id="t-chat" class="active" onclick="setTab('chat')">Thread</button>
       <button id="t-diff" onclick="setTab('diff')">Diff</button>
     </div>
-    <button class="btn" onclick="commitNow()">Commit</button>
+    <button class="btn ghost" onclick="commitNow()"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h6m6 0h6"/></svg></span>Commit</button>
   </div>
   <div class="pane" id="pane"></div>
   <div class="composer">
-    <textarea id="inp" placeholder="Ask twig… (Enter to send, Shift+Enter newline)"></textarea>
-    <button class="btn primary" onclick="sendPrompt()">Send</button>
+    <div class="composer-inner">
+      <textarea id="inp" placeholder="Ask twig…"></textarea>
+      <button class="btn primary" onclick="sendPrompt()"><span class="ico"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>Send</button>
+    </div>
   </div>
 </main>
 <script>
 const tok=new URLSearchParams(location.search).get('token')||localStorage.getItem('twig_tok')||'';
 if(tok)localStorage.setItem('twig_tok',tok);
-let curSid='',curWt='',tab='chat',detail=null,lastHtml='',forceTail=true;
+let curSid='',curWt='',tab='chat',detail=null,lastHtml='',forceTail=true,draftNew=false;
 const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+tok}:{'Content-Type':'application/json'};
 async function api(p,o={}){const r=await fetch(p,{...o,headers:hdrs()});return r.json();}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
@@ -430,7 +468,7 @@ function fmtMd(src){
         const uri=svgDataUri(buf.join('\n'));
         out+=uri?`<div class="svg-card"><img src="${uri}" alt="diagram"></div>`:`<pre><code>${esc(buf.join('\n'))}</code></pre>`;
       }
-      else out+=`<pre><div class="code-hdr"><span>${esc(lang||'code')}</span><button class="btn" style="padding:1px 7px;font-size:11px" onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)">Copy</button></div><code>${esc(buf.join('\n'))}</code></pre>`;
+      else out+=`<pre><div class="code-hdr"><span>${esc(lang||'code')}</span><button class="btn copy-btn" onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent)">Copy</button></div><code>${esc(buf.join('\n'))}</code></pre>`;
       continue;
     }
     if(tr.startsWith('$$')||tr.startsWith('\\[')){
@@ -449,7 +487,7 @@ function fmtMd(src){
     }
     if(!tr){i++;continue;}
     const hm=tr.match(/^(#{1,4})\s+(.+)$/);
-    if(hm){const lv=hm[1].length+1;out+=`<h${lv} style="color:var(--acc);margin:8px 0 4px">${fmtIn(hm[2])}</h${lv}>`;i++;continue;}
+    if(hm){const lv=hm[1].length+1;out+=`<h${lv}>${fmtIn(hm[2])}</h${lv}>`;i++;continue;}
     if(/^[-*]\s+/.test(tr)){
       let items='';while(i<lines.length&&/^[-*]\s+/.test(lines[i].trim())){items+=`<li>${fmtIn(lines[i].trim().replace(/^[-*]\s+/,''))}</li>`;i++;}
       out+=`<ul>${items}</ul>`;continue;
@@ -467,19 +505,19 @@ async function loadList(){
     const cls='b-'+(s.status||'settled');
     const tag=s.status==='approval'?'wait':s.status==='running'?'run':s.status==='dirty'?'diff':'ok';
     return `<div class="sitem ${s.sid===curSid?'active':''}" data-sid="${esc(s.sid)}" onclick="openSid(this.dataset.sid)">
-      <div><span class="badge ${esc(cls)}">${tag}</span><strong>${esc(s.label)}</strong></div>
-      <div style="font-size:11px;color:var(--muted);margin-top:3px">${esc(s.branch||'main')} · t${s.turns} · ${esc(s.age)}</div>
+      <div class="srow"><span class="badge ${esc(cls)}">${tag}</span><span class="slabel">${esc(s.label)}</span></div>
+      <div class="ssub">${esc(s.branch||'main')} · t${s.turns} · ${esc(s.age)}</div>
     </div>`;
   }).join('');
-  if(!curSid&&d.sessions.length)openSid(d.sessions[0].sid);
+  if(!curSid&&!draftNew&&d.sessions.length)openSid(d.sessions[0].sid);
 }
-async function openSid(sid,resetScroll=false){if(sid!==curSid)forceTail=true;if(resetScroll)forceTail=true;curSid=sid;detail=await api('/api/session/'+sid);curWt=detail.worktree||curWt;render();}
-function newThread(){curSid='';forceTail=true;lastHtml='';detail={messages:[],pending:[],diff:'',branch:'new',worktree:curWt};render();}
+async function openSid(sid,resetScroll=false){draftNew=false;if(sid!==curSid)forceTail=true;if(resetScroll)forceTail=true;curSid=sid;detail=await api('/api/session/'+sid);curWt=detail.worktree||curWt;render();}
+function newThread(){draftNew=true;curSid='';forceTail=true;lastHtml='';detail={messages:[],pending:[],diff:'',branch:'new',worktree:curWt};setTab('chat');}
 function setTab(t){tab=t;lastHtml='';document.getElementById('t-chat').className=t==='chat'?'active':'';document.getElementById('t-diff').className=t==='diff'?'active':'';render();}
 function render(){
   if(!detail)return;
-  document.getElementById('stitle').textContent=curSid?curSid.slice(0,12):'New Thread';
-  document.getElementById('smeta').textContent=`${detail.branch||''} · ${detail.model||''} ${detail.running?'· ✻ running…':''}`;
+  document.getElementById('stitle').textContent=curSid?curSid.slice(0,12):'New thread';
+  document.getElementById('smeta').textContent=[detail.branch,detail.model,detail.running?'running…':''].filter(Boolean).join(' · ');
   const p=document.getElementById('pane');
   const nearBottom=forceTail||(p.scrollHeight-p.scrollTop-p.clientHeight<56);
   if(tab==='diff'){
@@ -491,14 +529,14 @@ function render(){
     if(next!==lastHtml){const prevTop=p.scrollTop;p.innerHTML=next;lastHtml=next;p.scrollTop=prevTop;}
     return;
   }
-  let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div style="font-size:12px;color:var(--muted)">${esc(JSON.stringify(a.args))}</div></div><div><button class="btn primary" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true)">Allow</button> <button class="btn" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false)">Deny</button></div></div>`).join('');
+  let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div class="ssub">${esc(JSON.stringify(a.args))}</div></div><div class="approval-actions"><button class="btn primary" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true)">Allow</button><button class="btn" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false)">Deny</button></div></div>`).join('');
   html+=(detail.messages||[]).filter(m=>m.role!=='system').map(m=>{
     const txt=typeof m.content==='string'?m.content:JSON.stringify(m.content);
     const rCls=m.role==='assistant'?'assistant':m.role==='user'?'user':'tool';
     if(m.role==='tool')return `<div class="msg tool">↳ ${esc(txt.slice(0,400))}</div>`;
     return `<div class="msg ${rCls}">${m.role==='assistant'?fmtMd(txt):esc(txt)}</div>`;
   }).join('');
-  const finalHtml=html||'<div style="color:var(--muted)">Send a prompt below to begin.</div>';
+  const finalHtml=html||'<div class="empty">No messages yet.</div>';
   if(finalHtml!==lastHtml){
     const prevTop=p.scrollTop;
     p.innerHTML=finalHtml;
@@ -552,9 +590,11 @@ mod tests {
         let mut r1 = String::new();
         c1.read_to_string(&mut r1).unwrap();
         assert!(r1.contains("200 OK") && r1.contains("twig cockpit"));
+        assert!(r1.contains("Content-Security-Policy:"));
         assert!(!COCKPIT_HTML.contains("approve('${a.id}'"));
         assert!(!COCKPIT_HTML.contains("openSid('${s.sid}'"));
         assert!(COCKPIT_HTML.contains("data:image/svg+xml;base64,"));
+        assert!(COCKPIT_HTML.contains("'Geist'") && COCKPIT_HTML.contains(".copy-btn{opacity:0"));
 
         // 2. GET /api/sessions without token is rejected with 401
         let mut c2 = TcpStream::connect(addr).unwrap();

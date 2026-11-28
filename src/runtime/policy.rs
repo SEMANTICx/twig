@@ -839,6 +839,11 @@ impl Policy {
                 })
             };
             match prog {
+                "eval" => {
+                    let joined = rest.join(" ");
+                    HARD_DENY.iter().any(|d| joined.contains(d))
+                        || Self::check_tokens(&joined, catastrophic_only)
+                }
                 "sh" | "bash" | "zsh" | "dash" => {
                     if let Some(pos) = rest.iter().position(|t| *t == "-c" || (*t != "--" && t.starts_with('-') && !t.starts_with("--") && t[1..].contains('c'))) {
                         if let Some(script) = rest.get(pos + 1) {
@@ -1198,6 +1203,7 @@ mod tests {
         assert_eq!(p.classify("echo `cat .env`"), Tier::Deny);
         assert_eq!(p.classify("cat <(cat .env.production)"), Tier::Deny);
         assert_eq!(p.classify("echo $(cp evil.json .twig/project.json)"), Tier::Deny);
+        assert_eq!(p.classify("eval \"rm -r -f /\""), Tier::Deny);
         // Unbalanced quotes or substitutions fail closed to Deny.
         assert_eq!(p.classify("echo $(rm -rf /"), Tier::Deny);
         assert_eq!(p.classify("echo 'unterminated"), Tier::Deny);

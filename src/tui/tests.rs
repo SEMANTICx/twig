@@ -596,3 +596,72 @@ fn pending_rpc_error_and_session_reset_clean_up_all_trackers() {
         "reset_session_view must clear History and all pending RPCs"
     );
 }
+
+#[test]
+fn goal_and_blocker_gated_review_fix_state_machine_converges_and_caps_rounds() {
+    let mut app = App::new(".");
+    assert_eq!(
+        app.dispatch_input("/goal unify config loaders"),
+        Action::Slash(SlashCommand::RunGoal("unify config loaders".into()))
+    );
+    assert_eq!(
+        app.dispatch_input("/review --fix"),
+        Action::Slash(SlashCommand::RunReview { fix: true })
+    );
+
+    // 1. Suggestions alone (repair_opt == None) converge immediately with 0 repair turns!
+    app.auto_review = AutoReviewState::Reviewing { fixes_left: 2 };
+    app.apply_local_msg(LocalMsg::Review {
+        outcome: Ok(("### APPROVED\n- Suggestion: rename x".into(), None)),
+        auto_fix: true,
+    });
+    assert_eq!(app.auto_review, AutoReviewState::Idle);
+    assert!(app.auto_send_next.is_none());
+
+    // 2. Concrete blocker queues repair round 1/2, transitions to ReadyToSpawn on final turn, and caps at 2 rounds.
+    app.viewing_subagent = Some("scout-1".into());
+    app.auto_review = AutoReviewState::Reviewing { fixes_left: 2 };
+    app.apply_local_msg(LocalMsg::Review {
+        outcome: Ok((
+            "### CHANGES REQUESTED".into(),
+            Some("[Evidence-Gated Review Repair]\n- blocker 1".into()),
+        )),
+        auto_fix: true,
+    });
+    assert_eq!(app.auto_review, AutoReviewState::AwaitTurnEnd { fixes_left: 1 });
+    assert!(app.viewing_subagent.is_none());
+    assert!(app.auto_send_next.take().unwrap().contains("blocker 1"));
+
+    // Simulate repair turn 1 finishing cleanly:
+    app.pending_rpcs.insert(91, PendingRpc::Turn);
+    app.apply_server_msg(ServerMsg::Reply {
+        id: 91,
+        result: json!({"done": true, "reason": "final", "text": "fixed 1"}),
+    });
+    assert_eq!(app.auto_review, AutoReviewState::ReadyToSpawn { fixes_left: 1 });
+
+    // Round 2/2: another blocker consumes last repair slot (`fixes_left: 0`):
+    app.auto_review = AutoReviewState::Reviewing { fixes_left: 1 };
+    app.apply_local_msg(LocalMsg::Review {
+        outcome: Ok((
+            "### CHANGES REQUESTED".into(),
+            Some("[Evidence-Gated Review Repair]\n- blocker 2".into()),
+        )),
+        auto_fix: true,
+    });
+    assert_eq!(app.auto_review, AutoReviewState::AwaitTurnEnd { fixes_left: 0 });
+    assert!(app.auto_send_next.take().is_some());
+
+    // After 2 repair rounds, if a blocker still remains (`fixes_left == 0`), stop cleanly without looping!
+    app.auto_review = AutoReviewState::Reviewing { fixes_left: 0 };
+    app.apply_local_msg(LocalMsg::Review {
+        outcome: Ok((
+            "### CHANGES REQUESTED".into(),
+            Some("[Evidence-Gated Review Repair]\n- stubborn blocker".into()),
+        )),
+        auto_fix: true,
+    });
+    assert_eq!(app.auto_review, AutoReviewState::Idle);
+    assert!(app.auto_send_next.is_none());
+}
+

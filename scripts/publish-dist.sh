@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Publish stripped, path-sanitized `twig` binaries and installer scripts to a
-# public release-only GitHub repository (`SEMANTICx/twig-dist`) while keeping
-# the main source repository (`SEMANTICx/twig`) 100% PRIVATE with zero git history shared.
+# Publish stripped, path-sanitized `twig` binaries and installer scripts to the
+# binary distribution GitHub repository (`SEMANTICx/twig-dist`).
 #
 # Usage:
 #   ./scripts/publish-dist.sh --init-only           # Create/sync public installer repo only

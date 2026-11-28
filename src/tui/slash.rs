@@ -10,18 +10,22 @@ use serde_json::{json, Value};
 
 use super::client::{
     edit_file_in_external_editor, ensure_memory_file, format_config_report, format_init_report,
-    format_mcp_report, format_tasks_report, format_verify_report, init_project_files,
-    load_image_data_url, paste_clipboard_image, read_memory_preview, write_export_file, LocalMsg,
-    LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
+    format_mcp_report, format_rci_slash, format_tasks_report, format_verify_report,
+    init_project_files, load_image_data_url, paste_clipboard_image, read_memory_preview,
+    write_export_file, LocalMsg, LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
 };
 use super::composer::{parse_slash, SlashCommand};
 use super::overlays::OverlayPicker;
-use super::strips::{parse_todos, BtwCard, SubagentEntry, SubagentStatus, TodoEntry};
+use super::strips::{
+    apply_subagent_event, parse_todos, BtwCard, SubagentEntry, SubagentStatus, TodoEntry,
+};
 use super::theme::{format_status_notice, title_tool_name, FooterMode};
 use super::transcript::NoticeKind;
-use super::{Action, App, PendingRpc};
+use super::{Action, App, AutoReviewState, PendingRpc};
 use crate::llm::Llm;
-use crate::runtime::workflows::{run_git_diff, EVOLVE_PROMPT};
+use crate::runtime::workflows::{
+    build_goal_prompt, build_study_prompt, run_git_diff, EVOLVE_PROMPT,
+};
 
 impl App {
     /// Process a message from `twig serve`. Returns `Some(new_sid)` when a `Fork` RPC completes.
@@ -114,6 +118,7 @@ impl App {
                             self.running = false;
                             self.run_started = None;
                             self.last_delta_at = None;
+                            self.auto_review = AutoReviewState::Idle;
                         }
                         PendingRpc::Btw => {
                             self.btw_card = None;
@@ -141,6 +146,7 @@ impl App {
                 self.run_started = None;
                 self.last_delta_at = None;
                 self.pending_rpcs.clear();
+                self.auto_review = AutoReviewState::Idle;
                 self.btw_card = None;
                 self.transcript
                     .push_notice(NoticeKind::Error, "twig serve process exited");
@@ -390,12 +396,38 @@ impl App {
                         }
                         if let Some(next_q) = self.queued_turns.pop_front() {
                             self.auto_send_next = Some(next_q);
+                        } else if let AutoReviewState::AwaitTurnEnd { fixes_left } =
+                            self.auto_review
+                        {
+                            self.auto_review = AutoReviewState::ReadyToSpawn { fixes_left };
                         }
+                    } else if reason != "awaiting_approval" {
+                        self.auto_review = AutoReviewState::Idle;
                     }
                 }
             }
             PendingRpc::Fork => {}
         }
+    }
+
+    pub(super) fn take_ready_auto_review(&mut self) -> bool {
+        let AutoReviewState::ReadyToSpawn { fixes_left } = self.auto_review else {
+            return false;
+        };
+        let has_diff = run_git_diff(&self.repo_raw)
+            .map(|d| !d.trim().is_empty())
+            .unwrap_or(false);
+        if !has_diff {
+            self.auto_review = AutoReviewState::Idle;
+            return false;
+        }
+        self.auto_review = AutoReviewState::Reviewing { fixes_left };
+        self.transcript.push_notice(
+            NoticeKind::Playbook,
+            "running blocker-gated independent review on changes…",
+        );
+        self.transcript.follow_tail();
+        true
     }
 
     pub(super) fn apply_local_msg(&mut self, msg: LocalMsg) {
@@ -415,14 +447,56 @@ impl App {
                     .finish_tool(&id, Some(output), exit_code, Some(elapsed));
                 self.git_stat_dirty = true;
             }
-            LocalMsg::Review(Ok(text)) => {
-                self.transcript
-                    .push_notice(NoticeKind::Success, "independent review completed");
-                self.transcript.push_assistant(text);
-            }
-            LocalMsg::Review(Err(e)) => self
-                .transcript
-                .push_notice(NoticeKind::Error, format!("review: {e}")),
+            LocalMsg::Review { outcome, auto_fix } => match outcome {
+                Ok((md, repair_opt)) => {
+                    let fixes_left = match self.auto_review {
+                        AutoReviewState::Reviewing { fixes_left } => fixes_left,
+                        _ => 0,
+                    };
+                    if !auto_fix {
+                        self.auto_review = AutoReviewState::Idle;
+                        self.transcript
+                            .push_notice(NoticeKind::Success, "independent review completed");
+                        self.transcript.push_assistant(md);
+                    } else if let Some(repair_prompt) = repair_opt {
+                        if fixes_left > 0 {
+                            let remaining = fixes_left - 1;
+                            self.auto_review = AutoReviewState::AwaitTurnEnd {
+                                fixes_left: remaining,
+                            };
+                            self.viewing_subagent = None;
+                            self.transcript.push_notice(
+                                NoticeKind::Warn,
+                                format!(
+                                    "review reported blocker(s) — auto-repairing ({}/2)…",
+                                    2 - remaining
+                                ),
+                            );
+                            self.transcript.push_assistant(md);
+                            self.auto_send_next = Some(repair_prompt);
+                        } else {
+                            self.auto_review = AutoReviewState::Idle;
+                            self.transcript.push_notice(
+                                NoticeKind::Warn,
+                                "review --fix stopped after max 2 repair rounds; remaining blockers require human review",
+                            );
+                            self.transcript.push_assistant(md);
+                        }
+                    } else {
+                        self.auto_review = AutoReviewState::Idle;
+                        self.transcript.push_notice(
+                            NoticeKind::Success,
+                            "review --fix converged: 0 blockers (suggestions left untouched)",
+                        );
+                        self.transcript.push_assistant(md);
+                    }
+                }
+                Err(e) => {
+                    self.auto_review = AutoReviewState::Idle;
+                    self.transcript
+                        .push_notice(NoticeKind::Error, format!("review: {e}"));
+                }
+            },
             LocalMsg::Walkthrough(Ok(text)) => {
                 self.transcript
                     .push_notice(NoticeKind::Success, "change walkthrough ready");
@@ -609,135 +683,28 @@ impl App {
                     );
                 }
             }
-            Some("subagent.started") => {
-                let raw_id = ev["id"].as_str().unwrap_or("");
-                let role = ev["role"].as_str().unwrap_or("subagent");
-                let id = if raw_id.is_empty() {
-                    format!("{role}-{}", self.subagents.len() + 1)
-                } else {
-                    raw_id.to_owned()
-                };
-                let entry = SubagentEntry::from_started(id.clone(), ev);
-                self.update_status_header(format!("Subagent [{}]", entry.role));
-                let mut child_tr = super::transcript::Transcript::new();
-                if !entry.task.is_empty() {
-                    child_tr.push_user(entry.task.clone());
+            Some(
+                "subagent.started"
+                | "subagent.progress"
+                | "subagent.stream"
+                | "subagent.completed",
+            ) => {
+                let viewing = self.viewing_subagent.clone();
+                let (hdr, has_patch, sync_ov) = apply_subagent_event(
+                    &mut self.subagents,
+                    &mut self.subagent_transcripts,
+                    viewing.as_deref(),
+                    ev,
+                );
+                if let Some(h) = hdr {
+                    self.update_status_header(h);
                 }
-                self.subagent_transcripts.insert(id, child_tr);
-                self.subagents.push(entry);
-                if self.subagents.len() > 16 {
-                    let drop_n = self.subagents.len() - 16;
-                    for dropped in self.subagents.drain(..drop_n) {
-                        if self.viewing_subagent.as_deref() != Some(dropped.id.as_str()) {
-                            self.subagent_transcripts.remove(&dropped.id);
-                        }
-                    }
-                }
-                self.sync_tasks_overlay();
-            }
-            Some("subagent.progress") => {
-                let id = ev["id"].as_str().unwrap_or("");
-                let role = ev["role"].as_str().unwrap_or("subagent");
-                if let Some(idx) = self.find_running_subagent(id, role) {
-                    self.subagents[idx].apply_progress(ev);
-                    self.sync_tasks_overlay();
-                }
-            }
-            Some("subagent.stream") => {
-                let id = ev["id"].as_str().unwrap_or("");
-                let role = ev["role"].as_str().unwrap_or("subagent");
-                let key = if !id.is_empty() && self.subagent_transcripts.contains_key(id) {
-                    Some(id.to_owned())
-                } else {
-                    self.subagents
-                        .iter()
-                        .rev()
-                        .find(|s| s.status == SubagentStatus::Running && s.role == role)
-                        .map(|s| s.id.clone())
-                };
-                if let Some(k) = key {
-                    if let Some(tr) = self.subagent_transcripts.get_mut(&k) {
-                        let _ = tr.apply_stream_event(&ev["child"]);
-                    }
-                }
-            }
-            Some("subagent.completed") => {
-                let id = ev["id"].as_str().unwrap_or("");
-                let role = ev["role"].as_str().unwrap_or("subagent");
-                let child_sid = ev["sid"].as_str().filter(|s| !s.is_empty());
-                let model = ev["model"].as_str().map(str::to_owned);
-                let has_patch = ev["patch_artifact"].as_str().is_some();
-                let ok = ev["ok"] == true;
-                let secs = ev["elapsed_secs"].as_u64().unwrap_or(0);
-                let err_note = ev["error"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned);
-                let next_status = if ok {
-                    SubagentStatus::Completed
-                } else {
-                    SubagentStatus::Failed
-                };
-                let match_idx = self.find_running_subagent(id, role).or_else(|| {
-                    self.subagents
-                        .iter()
-                        .position(|s| s.status == SubagentStatus::Running)
-                });
-                let (done_id, resolved_sid) = if let Some(idx) = match_idx {
-                    if let Some(csid) = child_sid {
-                        self.subagents[idx].child_sid = Some(csid.to_owned());
-                    }
-                    if self.subagents[idx].model.is_none() {
-                        self.subagents[idx].model = model;
-                    }
-                    self.subagents[idx].status = next_status;
-                    self.subagents[idx].elapsed_secs = Some(secs);
-                    self.subagents[idx].error = err_note.clone();
-                    self.subagents[idx].activity = None;
-                    (
-                        self.subagents[idx].id.clone(),
-                        self.subagents[idx].child_sid.clone(),
-                    )
-                } else {
-                    let fallback_id = if id.is_empty() {
-                        format!("{role}-{}", self.subagents.len() + 1)
-                    } else {
-                        id.to_owned()
-                    };
-                    let mut entry = SubagentEntry::from_started(fallback_id.clone(), ev);
-                    entry.status = next_status;
-                    entry.elapsed_secs = Some(secs);
-                    entry.error = err_note.clone();
-                    let csid = entry.child_sid.clone();
-                    self.subagents.push(entry);
-                    (fallback_id, csid)
-                };
                 if has_patch {
                     self.git_stat_dirty = true;
                 }
-                if let Some(tr) = self.subagent_transcripts.get_mut(&done_id) {
-                    if ok {
-                        let apply_hint = match (has_patch, resolved_sid.as_deref()) {
-                            (true, Some(csid)) => format!(" · patch ready: `/apply {csid}`"),
-                            _ => String::new(),
-                        };
-                        tr.push_notice(
-                            NoticeKind::Success,
-                            format!(
-                                "subagent [{role}] completed in {secs}s{apply_hint} (Enter reply · Esc ← main)"
-                            ),
-                        );
-                    } else {
-                        tr.push_notice(
-                            NoticeKind::Error,
-                            format!(
-                                "subagent [{role}] failed: {}",
-                                err_note.as_deref().unwrap_or("error")
-                            ),
-                        );
-                    }
+                if sync_ov {
+                    self.sync_tasks_overlay();
                 }
-                self.sync_tasks_overlay();
             }
             Some("task.started") => {
                 let id = ev["id"].as_str().unwrap_or("bg");
@@ -814,21 +781,6 @@ impl App {
             }
             _ => {}
         }
-    }
-
-    fn find_running_subagent(&self, id: &str, role: &str) -> Option<usize> {
-        (!id.is_empty())
-            .then(|| {
-                self.subagents
-                    .iter()
-                    .position(|s| s.status == SubagentStatus::Running && s.id == id)
-            })
-            .flatten()
-            .or_else(|| {
-                self.subagents
-                    .iter()
-                    .position(|s| s.status == SubagentStatus::Running && s.role == role)
-            })
     }
 
     fn sync_tasks_overlay(&mut self) {
@@ -1270,55 +1222,22 @@ impl App {
                     PendingRpc::Blackboard,
                 );
             }
-            SlashCommand::RunRci(sub) => {
-                let repo_path = std::path::Path::new(&self.repo_raw);
-                let sessions_dir = crate::config::paths::state_dir().join("sessions");
-                match sub.as_str() {
-                    "harvest" => match crate::eval::rci::harvest_sessions(&sessions_dir) {
-                        Ok(rep) => {
-                            self.transcript.push_notice(
-                                NoticeKind::Playbook,
-                                format!(
-                                    "RCI label-free harvest: {} verified collective session(s) out of {} valid ledgers",
-                                    rep.verified_collective_sessions, rep.chain_valid_files
-                                ),
-                            );
-                            if let Ok(pretty) = serde_json::to_string_pretty(&rep.role_credits) {
-                                self.transcript
-                                    .push_assistant(format!("```json\n{pretty}\n```"));
-                            }
-                        }
-                        Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                    },
-                    "distill" | "distill --online" => {
-                        let online = sub.contains("--online");
-                        match crate::eval::rci::distill_role_notes(repo_path, &sessions_dir, online)
-                        {
-                            Ok((rep, files)) => {
-                                let msg = format!(
-                                    "RCI distilled {} role protocol cards ({} verified sessions harvested)",
-                                    files.len(),
-                                    rep.verified_collective_sessions
-                                );
-                                self.flash(&msg);
-                                self.transcript.push_notice(NoticeKind::Success, msg);
-                                self.transcript.push_assistant(
-                                    files
-                                        .into_iter()
-                                        .map(|f| format!("- `{f}`"))
-                                        .collect::<Vec<_>>()
-                                        .join("\n"),
-                                );
-                            }
-                            Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
-                        }
+            SlashCommand::RunRci(sub) => match format_rci_slash(&self.repo_raw, &sub) {
+                Ok((distilled, notice, body)) => {
+                    if distilled {
+                        self.flash(&notice);
+                        self.transcript.push_notice(NoticeKind::Success, notice);
+                    } else if sub == "harvest" {
+                        self.transcript.push_notice(NoticeKind::Playbook, notice);
+                    } else {
+                        self.transcript.push_notice(NoticeKind::Info, notice);
                     }
-                    _ => {
-                        let msg = crate::runtime::blackboard::status_report(repo_path);
-                        self.transcript.push_notice(NoticeKind::Info, msg);
+                    if let Some(md) = body {
+                        self.transcript.push_assistant(md);
                     }
                 }
-            }
+                Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
+            },
             SlashCommand::CompactNow => {
                 self.send_rpc(client, "session.compact", json!({}), "Compacting context…");
             }
@@ -1400,13 +1319,50 @@ impl App {
                 }
                 Err(e) => self.transcript.push_notice(NoticeKind::Error, e),
             },
-            SlashCommand::RunReview => {
+            SlashCommand::RunReview { fix } => {
+                if fix && self.running {
+                    self.flash("Wait for the active turn to finish before running /review --fix");
+                    return Ok(());
+                }
+                if fix {
+                    let _ = self.exit_readonly_for_code(client);
+                    self.auto_review = AutoReviewState::Reviewing { fixes_left: 2 };
+                    self.transcript.push_notice(
+                        NoticeKind::Playbook,
+                        "starting blocker-gated review (--fix: max 2 repair rounds; suggestions ignored)…",
+                    );
+                } else {
+                    self.auto_review = AutoReviewState::Idle;
+                    self.transcript.push_notice(
+                        NoticeKind::Playbook,
+                        "starting independent read-only review on current git diff…",
+                    );
+                }
+                self.transcript.follow_tail();
+                workers.spawn_review(self.repo_raw.clone(), fix);
+            }
+            SlashCommand::RunGoal(goal) => {
+                if goal.trim().is_empty() {
+                    self.transcript.push_notice(
+                        NoticeKind::Info,
+                        "usage: `/goal <objective>` — runs autonomous closed-loop execution + blocker-gated review",
+                    );
+                    return Ok(());
+                }
+                if self.running {
+                    self.flash("Wait for the active turn to finish before running /goal");
+                    return Ok(());
+                }
+                let code_model = self.exit_readonly_for_code(client);
+                self.auto_review = AutoReviewState::AwaitTurnEnd { fixes_left: 2 };
                 self.transcript.push_notice(
                     NoticeKind::Playbook,
-                    "starting independent read-only review on current git diff…",
+                    format!(
+                        "goal started → autonomous convergence + blocker-gated review (`{code_model}`)"
+                    ),
                 );
-                self.transcript.follow_tail();
-                workers.spawn_review(self.repo_raw.clone());
+                let act = self.begin_turn(build_goal_prompt(&goal), "Goal", Some("code"), true);
+                let _ = self.handle_action(act, terminal, client, workers)?;
             }
             SlashCommand::RunWalkthrough => {
                 self.transcript.push_notice(
@@ -1442,16 +1398,7 @@ impl App {
                     self.flash("Wait for the active turn to finish before running /go");
                     return Ok(());
                 }
-                if self.plan_mode {
-                    let _ = client.send("mode.set", json!({"plan": false}));
-                    self.plan_mode = false;
-                }
-                if self.study_mode {
-                    let _ = client.send("mode.study", json!({"enabled": false}));
-                    self.study_mode = false;
-                }
-                let code_model = crate::llm::Provider::new().roles().get("code").to_owned();
-                self.model = code_model.clone();
+                let code_model = self.exit_readonly_for_code(client);
                 let prompt = match extra {
                     Some(note) => format!(
                         "Proceed to implement the agreed plan above step-by-step, then run relevant tests/lints to verify.\nAdditional instructions: {note}"
@@ -1619,17 +1566,12 @@ impl App {
                         return Ok(());
                     }
                     let role = if self.plan_mode { "plan" } else { "code" };
-                    let prompt = format!(
-                        "[Clean-Room Study & SPEC Extraction]\n\
-                         Target: {goal}\n\
-                         Inspect observable behavior, structure (`read` headers/hexdump/.har, `outline` xrefs/deps), or run safe black-box probes without fabricating unseen internals. \
-                         Produce a structured specification separating `[Observed]`, `[Derived]`, `[Inferred]`, and `[Unknown / Limitation]`, followed by concrete acceptance test cases ready for `/go`."
-                    );
                     self.transcript.push_notice(
                         NoticeKind::Playbook,
                         format!("REA Study mode ON · studying `{goal}`"),
                     );
-                    let act = self.begin_turn(prompt, "Studying", Some(role), true);
+                    let act =
+                        self.begin_turn(build_study_prompt(&goal), "Studying", Some(role), true);
                     let _ = self.handle_action(act, terminal, client, workers)?;
                 } else {
                     let msg = if next {
@@ -1644,5 +1586,19 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn exit_readonly_for_code(&mut self, client: &mut ServeClient) -> String {
+        if self.plan_mode {
+            let _ = client.send("mode.set", json!({"plan": false}));
+            self.plan_mode = false;
+        }
+        if self.study_mode {
+            let _ = client.send("mode.study", json!({"enabled": false}));
+            self.study_mode = false;
+        }
+        let code_model = crate::llm::Provider::new().roles().get("code").to_owned();
+        self.model = code_model.clone();
+        code_model
     }
 }
