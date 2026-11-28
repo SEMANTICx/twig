@@ -379,17 +379,75 @@ fn provision_isolated_worktree(base_repo: &Path, raw_slug: &str) -> Result<PathB
     Ok(dst.canonicalize().unwrap_or(dst))
 }
 
+fn decode_b64(input: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let a = val(*chunk.first()?)?;
+        let b = val(*chunk.get(1)?)?;
+        out.push((a << 2) | (b >> 4));
+        if let Some(&c_raw) = chunk.get(2) {
+            let c = val(c_raw)?;
+            out.push((b << 4) | (c >> 2));
+            if let Some(&d_raw) = chunk.get(3) {
+                let d = val(d_raw)?;
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn stage_data_images(sid: &str, imgs: &[Value]) -> Vec<String> {
+    let dir = paths::state_dir().join("web-uploads");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut refs = Vec::new();
+    for (idx, item) in imgs.iter().take(4).enumerate() {
+        let Some(url) = item["url"].as_str() else { continue };
+        let Some((hdr, b64)) = url.split_once(";base64,") else { continue };
+        let ext = if hdr.contains("jpeg") || hdr.contains("jpg") {
+            "jpg"
+        } else if hdr.contains("webp") {
+            "webp"
+        } else if hdr.contains("gif") {
+            "gif"
+        } else {
+            "png"
+        };
+        let Some(bytes) = decode_b64(b64) else { continue };
+        if bytes.is_empty() || bytes.len() > 8 * 1024 * 1024 {
+            continue;
+        }
+        let path = dir.join(format!("{sid}-{idx}-{}.{ext}", std::process::id()));
+        if std::fs::write(&path, bytes).is_ok() {
+            refs.push(format!("@{}", path.display()));
+        }
+    }
+    refs
+}
+
 fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
     let raw_prompt = req["prompt"]
         .as_str()
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or("prompt required")?;
-    let prompt = if let Some(goal) = raw_prompt.strip_prefix("/goal ") {
-        build_goal_prompt(goal.trim())
-    } else {
-        raw_prompt.to_owned()
-    };
+        .unwrap_or("");
+    let has_images = req["images"].as_array().is_some_and(|a| !a.is_empty());
+    if raw_prompt.is_empty() && !has_images {
+        return Err("prompt required".into());
+    }
     let sid = req["sid"]
         .as_str()
         .map(str::trim)
@@ -398,6 +456,19 @@ fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value,
         .unwrap_or_else(paths::session_id);
     if !paths::valid_session(&sid) {
         return Err("invalid session id".into());
+    }
+    let mut prompt = if let Some(goal) = raw_prompt.strip_prefix("/goal ") {
+        build_goal_prompt(goal.trim())
+    } else if raw_prompt.is_empty() {
+        "Inspect the attached image(s).".to_owned()
+    } else {
+        raw_prompt.to_owned()
+    };
+    if let Some(imgs) = req["images"].as_array() {
+        let staged = stage_data_images(&sid, imgs);
+        if !staged.is_empty() {
+            prompt = format!("{} {prompt}", staged.join(" "));
+        }
     }
     let mut repo = req["worktree"]
         .as_str()
@@ -544,12 +615,12 @@ mod tests {
         write!(c1, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
         let mut r1 = String::new();
         c1.read_to_string(&mut r1).unwrap();
-        assert!(r1.contains("200 OK") && r1.contains("twig cockpit"));
+        assert!(r1.contains("200 OK") && r1.contains("<title>twig</title>"));
         assert!(r1.contains("Content-Security-Policy:"));
         assert!(!COCKPIT_HTML.contains("approve('${a.id}'"));
         assert!(!COCKPIT_HTML.contains("openSid('${s.sid}'"));
         assert!(COCKPIT_HTML.contains("data:image/svg+xml;base64,"));
-        assert!(COCKPIT_HTML.contains("'Geist'") && COCKPIT_HTML.contains("Environment"));
+        assert!(COCKPIT_HTML.contains("Open in ") && COCKPIT_HTML.contains("What should we build"));
 
         // 2. GET /api/sessions without token is rejected with 401
         let mut c2 = TcpStream::connect(addr).unwrap();

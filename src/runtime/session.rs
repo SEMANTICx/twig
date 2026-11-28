@@ -461,6 +461,10 @@ pub struct SessionInfo {
     pub age: String,
     #[serde(default)]
     pub status: String,
+    #[serde(default)]
+    pub diff_add: usize,
+    #[serde(default)]
+    pub diff_del: usize,
 }
 
 /// Scan `<state_dir>/sessions/*.jsonl` (and optional `subagents/*-runs/*.jsonl`) newest-first.
@@ -508,16 +512,37 @@ pub fn scan_sessions(repo_filter: Option<&Path>, limit: usize) -> Vec<SessionInf
             }
         }
         let mut info = info;
-        if out.len() < 15 && info.status == "settled" {
+        if out.len() < 15 {
             if let Some(ref wt) = info.worktree {
                 if Path::new(wt).is_dir() {
-                    let dirty = Command::new("git")
-                        .args(["-C", wt, "status", "--porcelain", "-uno"])
+                    if let Ok(numstat) = Command::new("git")
+                        .args(["-C", wt, "diff", "HEAD", "--numstat"])
                         .output()
-                        .ok()
-                        .is_some_and(|o| o.status.success() && !o.stdout.is_empty());
-                    if dirty {
-                        info.status = "dirty".to_owned();
+                    {
+                        if numstat.status.success() && !numstat.stdout.is_empty() {
+                            let mut add = 0usize;
+                            let mut del = 0usize;
+                            for line in String::from_utf8_lossy(&numstat.stdout).lines() {
+                                let mut cols = line.split_whitespace();
+                                add += cols.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+                                del += cols.next().and_then(|n| n.parse::<usize>().ok()).unwrap_or(0);
+                            }
+                            info.diff_add = add;
+                            info.diff_del = del;
+                            if info.status == "settled" {
+                                info.status = "dirty".to_owned();
+                            }
+                        }
+                    }
+                    if info.status == "settled" {
+                        let dirty = Command::new("git")
+                            .args(["-C", wt, "status", "--porcelain", "-uno"])
+                            .output()
+                            .ok()
+                            .is_some_and(|o| o.status.success() && !o.stdout.is_empty());
+                        if dirty {
+                            info.status = "dirty".to_owned();
+                        }
                     }
                 }
             }
@@ -591,6 +616,8 @@ fn inspect_session_file(path: &Path, mtime: SystemTime, now: SystemTime) -> Opti
         turns,
         age,
         status,
+        diff_add: 0,
+        diff_del: 0,
     })
 }
 
