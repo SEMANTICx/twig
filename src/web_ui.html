@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>twig cockpit</title>
+<style>
+:root{color-scheme:dark;--bg:#141312;--surf:#1c1a18;--hi:#262320;--line:#2c2825;--txt:#f0ede8;--muted:#8e877f;--acc:#d97757;--sage:#7ea87e;--amber:#e0a958;--err:#d96565}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:400 14px/24px 'Geist','Inter',ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--txt);display:flex;height:100dvh;overflow:hidden;-webkit-font-smoothing:antialiased}
+aside.inbox{width:288px;background:var(--surf);border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;min-height:0}
+header{min-height:56px;padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.brand{font-size:16px;font-weight:600;line-height:24px;letter-spacing:-0.01em;color:var(--txt);display:inline-flex;align-items:center;gap:8px}
+.brand-dot{width:8px;height:8px;border-radius:8px;background:var(--acc)}
+.ver{font-size:12px;line-height:16px;color:var(--muted);font-weight:400}
+.inbox-bar{padding:8px 12px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:8px}
+.search-in{width:100%;height:32px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:0 12px;font:400 12px/16px inherit;outline:none}
+.search-in:focus{border-color:var(--muted)}
+.filter-row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.seg{display:inline-flex;gap:4px;padding:4px;background:var(--bg);border-radius:12px}
+.seg button{background:transparent;color:var(--muted);border:0;height:24px;padding:0 8px;border-radius:8px;cursor:pointer;font:500 12px/16px inherit;transition:color 120ms ease,background 120ms ease}
+.seg button:hover{color:var(--txt)}
+.seg button.active{background:var(--hi);color:var(--txt)}
+.slist{overflow-y:auto;flex:1;padding:8px;min-height:0}
+.sitem{padding:12px;border-radius:8px;cursor:pointer;transition:background 120ms ease;margin-bottom:4px;position:relative}
+.sitem:hover,.sitem.active{background:var(--hi)}
+.sitem.child{margin-left:16px;padding:8px 12px}
+.srow{display:flex;align-items:center;gap:8px;min-width:0}
+.slabel{font-size:14px;font-weight:500;line-height:20px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.sitem.child .slabel{font-size:12px;color:var(--muted)}
+.ssub{font-size:12px;line-height:16px;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.arch-btn{opacity:0;background:transparent;border:0;color:var(--muted);width:24px;height:24px;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity 120ms ease,background 120ms ease,color 120ms ease}
+.sitem:hover .arch-btn,.arch-btn:focus-visible{opacity:1}
+.arch-btn:hover{background:var(--surf);color:var(--txt)}
+.badge{font-size:12px;line-height:16px;font-weight:500;padding:0 8px;height:20px;display:inline-flex;align-items:center;border-radius:8px;flex-shrink:0}
+.b-approval,.b-running{background:#332818;color:var(--amber)}
+.b-dirty{background:#32201a;color:var(--acc)}
+.b-settled{background:#1c291e;color:var(--sage)}
+main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
+.topbar{min-height:56px;padding:12px 24px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+#stitle{font-size:18px;font-weight:600;line-height:24px;letter-spacing:-0.01em;color:var(--txt)}
+#smeta{color:var(--muted);font-size:12px;line-height:16px;flex:1;min-width:120px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tabs{display:inline-flex;gap:4px;padding:4px;background:var(--surf);border-radius:12px}
+.tabs button{background:transparent;color:var(--muted);border:0;height:28px;padding:0 12px;border-radius:8px;cursor:pointer;font:500 12px/16px inherit;transition:color 120ms ease,background 120ms ease}
+.tabs button:hover{color:var(--txt)}
+.tabs button.active{background:var(--hi);color:var(--txt)}
+.btn{background:var(--surf);color:var(--txt);border:1px solid var(--line);height:32px;padding:0 12px;border-radius:8px;cursor:pointer;font:500 12px/16px inherit;display:inline-flex;align-items:center;gap:8px;text-decoration:none;transition:background 120ms ease,color 120ms ease,border-color 120ms ease,opacity 140ms ease}
+.btn:hover{background:var(--hi)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.btn.ghost:hover,.btn.ghost:focus-visible,.btn.ghost.on{background:var(--surf);border-color:var(--line);color:var(--txt)}
+.btn.primary{background:var(--acc);color:#141312;border-color:var(--acc);font-weight:600;height:44px;padding:0 16px;border-radius:12px}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.danger{background:#321c1c;color:var(--err);border-color:#4a2828;height:44px;padding:0 16px;border-radius:12px;font-weight:600}
+.ico{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+.ico svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.5;fill:none;stroke-linecap:round;stroke-linejoin:round}
+.workspace{flex:1;display:flex;min-width:0;min-height:0}
+.center-col{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.pane{flex:1;min-height:0;overflow-y:auto;padding:24px 32px;display:flex;flex-direction:column;gap:20px}
+.pane>*{width:100%;max-width:768px;margin-left:auto;margin-right:auto}
+.msg{word-break:break-word}
+.msg.user{background:var(--surf);padding:12px 16px;border-radius:12px;white-space:pre-wrap;color:var(--txt)}
+.msg.assistant{padding:4px 0;white-space:normal}
+.msg.assistant p,.msg.assistant ul,.msg.assistant ol,.msg.assistant pre,.msg.assistant table,.msg.assistant blockquote{margin:8px 0}
+.msg.assistant h2,.msg.assistant h3,.msg.assistant h4,.msg.assistant h5{font-size:16px;font-weight:600;line-height:24px;color:var(--txt);margin:16px 0 8px}
+.msg.assistant ul,.msg.assistant ol{padding-left:20px}
+.msg.assistant code{font:13px/20px 'Geist Mono',ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--txt);background:var(--surf);padding:0 4px;border-radius:4px}
+.msg.assistant a,.file-lnk{color:var(--acc);text-decoration:underline;text-underline-offset:4px;cursor:pointer}
+.msg.assistant pre{background:var(--surf);padding:16px;border-radius:12px;overflow-x:auto;white-space:pre}
+.msg.assistant pre code{background:none;padding:0;color:var(--txt)}
+.msg.assistant .code-hdr{display:flex;justify-content:space-between;align-items:center;min-height:24px;font-size:12px;line-height:16px;color:var(--muted);margin-bottom:8px}
+.copy-btn{opacity:0;height:24px;padding:0 8px;border-radius:8px;font-size:12px}
+.msg.assistant pre:hover .copy-btn,.msg.assistant pre:focus-within .copy-btn{opacity:1}
+.msg.assistant table{border-collapse:collapse;width:100%;font-size:13px;line-height:20px;background:var(--surf);border-radius:12px;overflow:hidden}
+.msg.assistant th,.msg.assistant td{border-bottom:1px solid var(--line);padding:8px 12px;text-align:left}
+.msg.assistant th{font-weight:600;color:var(--txt);background:var(--hi)}
+.msg.assistant .math-blk{padding:8px 16px;margin:8px 0;border-left:2px solid var(--line);color:var(--txt);font-family:ui-serif,Georgia,serif;font-size:16px;line-height:24px}
+.msg.assistant .math-in{color:var(--txt);font-family:ui-serif,Georgia,serif}
+.msg.assistant .svg-card{background:var(--surf);border-radius:12px;padding:16px;margin:12px 0;overflow-x:auto}
+.msg.assistant .svg-card img{max-width:100%;height:auto;display:block}
+.msg.tool{font:12px/20px 'Geist Mono',ui-monospace,monospace;color:var(--muted);padding:0 4px;white-space:pre-wrap}
+.approval{background:var(--surf);border-left:2px solid var(--amber);padding:16px;border-radius:12px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.approval-actions{display:flex;gap:8px;align-items:center}
+.approval-actions .btn.primary{height:32px;padding:0 12px;border-radius:8px}
+.diff-nav{display:flex;flex-wrap:wrap;gap:8px;padding-bottom:4px}
+.diff-chip{background:var(--surf);color:var(--txt);border:0;height:28px;padding:0 12px;border-radius:8px;cursor:pointer;font:12px/16px 'Geist Mono',ui-monospace,monospace;display:inline-flex;align-items:center;gap:8px}
+.diff-chip:hover{background:var(--hi)}
+.diff-sec{display:flex;flex-direction:column;gap:8px}
+.diff-hdr{font:600 12px/16px 'Geist Mono',ui-monospace,monospace;color:var(--txt);display:flex;justify-content:space-between;align-items:center;padding:4px 0}
+pre.diff{font:12px/20px 'Geist Mono',ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;background:var(--surf);padding:16px;border-radius:12px}
+.d-add{color:var(--sage)}.d-del{color:var(--err)}.d-hunk{color:var(--amber)}
+.empty{color:var(--muted);font-size:14px;line-height:24px;padding:24px 0}
+.composer{padding:12px 24px 16px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:8px;background:var(--bg)}
+.composer-bar,.composer-inner,.attach-row{width:100%;max-width:768px;margin:0 auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.composer-inner{gap:12px;flex-wrap:nowrap}
+.sel{background:var(--surf);color:var(--muted);border:1px solid var(--line);height:28px;padding:0 8px;border-radius:8px;font:500 12px/26px inherit;outline:none;cursor:pointer;max-width:208px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sel:hover,.sel:focus{color:var(--txt);border-color:var(--muted)}
+.chip{background:var(--surf);color:var(--muted);border:1px solid var(--line);height:28px;padding:0 12px;border-radius:8px;font:500 12px/16px inherit;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.chip:hover{color:var(--txt);background:var(--hi)}
+.chip.active{background:var(--hi);color:var(--acc);border-color:var(--acc)}
+.wt-in{height:28px;width:144px;background:var(--surf);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:0 8px;font:12px/16px 'Geist Mono',ui-monospace,monospace;outline:none}
+.att-pill{background:var(--hi);color:var(--txt);height:24px;padding:0 8px;border-radius:8px;font-size:12px;display:inline-flex;align-items:center;gap:8px}
+textarea{flex:1;background:var(--surf);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:8px 12px;font:inherit;line-height:24px;resize:none;height:44px;outline:none;transition:border-color 120ms ease}
+textarea:focus{border-color:var(--muted)}
+aside.insp{width:288px;background:var(--surf);border-left:1px solid var(--line);padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:20px;flex-shrink:0;min-height:0}
+aside.insp.hidden{display:none}
+.insp-sec{display:flex;flex-direction:column;gap:8px}
+.insp-ttl{font-size:12px;font-weight:600;line-height:16px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em}
+.insp-kv{font-size:12px;line-height:20px;color:var(--txt);word-break:break-all}
+.todo-row{display:flex;gap:8px;align-items:flex-start;font-size:12px;line-height:20px;color:var(--txt)}
+.todo-done{color:var(--muted)}
+.meter{height:8px;background:var(--bg);border-radius:8px;overflow:hidden}
+.meter-fill{height:100%;background:var(--acc);border-radius:8px}
+.toast{position:fixed;bottom:80px;right:24px;background:var(--hi);color:var(--txt);border:1px solid var(--line);padding:8px 16px;border-radius:8px;font-size:12px;line-height:20px;opacity:0;pointer-events:none;transition:opacity 160ms ease;z-index:20}
+.toast.show{opacity:1}
+.insp-close{display:none}
+@media(hover:none){.copy-btn,.arch-btn{opacity:1}}
+@media(max-width:960px){aside.insp{display:none}aside.insp.mobile-open{display:flex;position:fixed;top:0;right:0;bottom:0;z-index:25;box-shadow:-12px 0 32px rgba(0,0,0,.5)}.insp-close{display:inline-flex}}
+@media(max-width:720px){body{flex-direction:column}aside.inbox{width:100%;height:192px;border-right:0;border-bottom:1px solid var(--line)}.inbox-bar{display:none}.topbar{padding:12px 16px}.pane{padding:16px;gap:16px}.composer{padding:8px 16px 12px}}
+</style>
+</head>
+<body>
+<aside class="inbox">
+  <header>
+    <span class="brand"><span class="brand-dot"></span>twig cockpit <span class="ver" id="ver"></span></span>
+    <button class="btn" onclick="newThread()"><span class="ico"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>New</button>
+  </header>
+  <div class="inbox-bar">
+    <input class="search-in" id="q" placeholder="Filter threads…" oninput="renderList()">
+    <div class="filter-row">
+      <div class="seg">
+        <button id="f-all" class="active" onclick="setFilter('all')">All</button>
+        <button id="f-act" onclick="setFilter('active')">Active</button>
+        <button id="f-dif" onclick="setFilter('diff')">Diff</button>
+      </div>
+      <button class="chip" id="scope-btn" style="height:24px;padding:0 8px" onclick="toggleAllRepos()">Repo</button>
+    </div>
+  </div>
+  <div class="slist" id="slist"></div>
+</aside>
+<main>
+  <div class="topbar">
+    <button class="btn ghost" id="parent-btn" style="display:none" onclick="openParent()">← Parent</button>
+    <strong id="stitle">New thread</strong>
+    <span id="smeta"></span>
+    <div class="tabs">
+      <button id="t-chat" class="active" onclick="setTab('chat')">Thread</button>
+      <button id="t-diff" onclick="setTab('diff')">Diff</button>
+    </div>
+    <button class="btn ghost" onclick="commitNow()"><span class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M3 12h6m6 0h6"/></svg></span>Commit</button>
+    <button class="btn ghost" id="notif-btn" onclick="toggleNotif()" title="Notify on background approval or completion"><span class="ico"><svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg></span></button>
+    <button class="btn ghost on" id="insp-btn" onclick="toggleInspector()"><span class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg></span></button>
+  </div>
+  <div class="workspace">
+    <div class="center-col">
+      <div class="pane" id="pane"></div>
+      <div class="composer">
+        <div class="attach-row" id="att-row" style="display:none"></div>
+        <div class="composer-bar">
+          <select class="sel" id="role-sel" title="Agent role">
+            <option value="code">Role: code</option>
+            <option value="plan">Role: plan (RO)</option>
+          </select>
+          <select class="sel" id="model-sel" title="Model override"><option value="">Model: default</option></select>
+          <select class="sel" id="effort-sel" title="Reasoning effort">
+            <option value="">Effort: default</option>
+            <option value="low">Effort: low</option>
+            <option value="medium">Effort: medium</option>
+            <option value="high">Effort: high</option>
+            <option value="xhigh">Effort: xhigh</option>
+          </select>
+          <button class="chip" id="wt-toggle" onclick="toggleNewWt()" title="Create isolated Git worktree for this thread">⎇ Worktree</button>
+          <input class="wt-in" id="wt-slug" placeholder="branch-slug (auto)" style="display:none">
+          <button class="chip" onclick="prefillCmd('/goal ')">/goal</button>
+          <button class="chip" onclick="prefillCmd('/review --fix')">/review</button>
+        </div>
+        <div class="composer-inner">
+          <textarea id="inp" placeholder="Ask twig…"></textarea>
+          <button class="btn danger" id="stop-btn" style="display:none" onclick="cancelRun()">Stop</button>
+          <button class="btn primary" id="send-btn" onclick="sendPrompt()"><span class="ico"><svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>Send</button>
+        </div>
+      </div>
+    </div>
+    <aside class="insp" id="insp">
+      <div class="insp-sec">
+        <div style="display:flex;justify-content:space-between;align-items:center"><span class="insp-ttl">Environment</span><button class="arch-btn insp-close" style="opacity:1" onclick="toggleInspector()" title="Close inspector">×</button></div>
+        <div class="insp-kv" id="env-wt">—</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select class="sel" id="ed-sel" onchange="saveEditor()">
+            <option value="cursor">Cursor</option>
+            <option value="vscode">VS Code</option>
+            <option value="zed">Zed</option>
+          </select>
+          <a class="btn" id="open-ed" href="#">Open IDE</a>
+        </div>
+      </div>
+      <div class="insp-sec">
+        <div class="insp-ttl" id="todo-ttl">Plan progress</div>
+        <div id="todo-list" class="insp-kv" style="color:var(--muted)">No active checklist</div>
+      </div>
+      <div class="insp-sec">
+        <div class="insp-ttl">Subagents</div>
+        <div id="sub-list" class="insp-kv" style="color:var(--muted)">None in this thread</div>
+      </div>
+      <div class="insp-sec">
+        <div class="insp-ttl">Telemetry</div>
+        <div class="insp-kv" id="usage-kv">0 in · 0 out · cache 0%</div>
+        <div class="meter"><div class="meter-fill" id="cache-bar" style="width:0%"></div></div>
+      </div>
+    </aside>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const tok=new URLSearchParams(location.search).get('token')||localStorage.getItem('twig_tok')||'';
+if(tok)localStorage.setItem('twig_tok',tok);
+let curSid='',curWt='',defaultWt='',tab='chat',filter='all',allRepos=false,sessions=[],detail=null,lastHtml='',forceTail=true,draftNew=false,newWt=false,notifOn=localStorage.getItem('twig_notif')==='1',editor=localStorage.getItem('twig_ed')||'cursor',images=[],prevStates={};
+document.getElementById('ed-sel').value=editor;
+if(notifOn)document.getElementById('notif-btn').classList.add('on');
+const hdrs=()=>tok?{'Content-Type':'application/json','Authorization':'Bearer '+tok}:{'Content-Type':'application/json'};
+async function api(p,o={}){const r=await fetch(p,{...o,headers:hdrs()});return r.json();}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._tm);t._tm=setTimeout(()=>t.classList.remove('show'),2600);}
+function ideUri(absPath,line){const clean=String(absPath||'').replace(/^file:\/\//,'');if(!clean)return '#';const p=clean.startsWith('/')?clean:'/'+clean;return line?`${editor}://file${p}:${line}:1`:`${editor}://file${p}`;}
+function saveEditor(){editor=document.getElementById('ed-sel').value;localStorage.setItem('twig_ed',editor);renderInspector();}
+function toggleInspector(){const el=document.getElementById('insp'),b=document.getElementById('insp-btn');if(innerWidth<=960){el.classList.toggle('mobile-open');}else{el.classList.toggle('hidden');b.classList.toggle('on',!el.classList.contains('hidden'));}}
+async function toggleNotif(){if(!('Notification'in window))return toast('Browser notifications unsupported');if(!notifOn){const p=await Notification.requestPermission();if(p!=='granted')return toast('Notification permission denied');notifOn=true;}else{notifOn=false;}localStorage.setItem('twig_notif',notifOn?'1':'0');document.getElementById('notif-btn').classList.toggle('on',notifOn);toast(notifOn?'Background alerts enabled':'Background alerts off');}
+function maybeNotify(list){if(!notifOn||!('Notification'in window)||Notification.permission!=='granted')return;for(const s of list){const prev=prevStates[s.sid];if(prev&&prev!==s.status&&document.hidden){if(s.status==='approval')new Notification('twig · Approval needed',{body:s.label});else if(prev==='running'&&s.status!=='running')new Notification('twig · Turn finished',{body:s.label});}prevStates[s.sid]=s.status;}}
+function svgDataUri(raw){try{const b=new TextEncoder().encode(raw);let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return 'data:image/svg+xml;base64,'+btoa(s);}catch(_){return '';}}
+const SYM={'\\alpha':'α','\\beta':'β','\\gamma':'γ','\\delta':'δ','\\theta':'θ','\\lambda':'λ','\\mu':'μ','\\pi':'π','\\sigma':'σ','\\omega':'ω','\\Delta':'Δ','\\Sigma':'∑','\\sum':'∑','\\prod':'∏','\\int':'∫','\\infty':'∞','\\pm':'±','\\times':'×','\\cdot':'·','\\leq':'≤','\\le':'≤','\\geq':'≥','\\ge':'≥','\\neq':'≠','\\ne':'≠','\\approx':'≈','\\to':'→','\\rightarrow':'→','\\Rightarrow':'⇒','\\in':'∈','\\forall':'∀','\\exists':'∃','\\partial':'∂','\\nabla':'∇'};
+function fmtTex(s){
+  let o=esc(s).replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g,'($1)/($2)').replace(/\\sqrt\{([^{}]+)\}/g,'√($1)').replace(/\\text\{([^{}]+)\}/g,'$1');
+  for(const[k,v]of Object.entries(SYM))o=o.split(k).join(v);
+  return o.replace(/\^\{([^{}]+)\}/g,'<sup>$1</sup>').replace(/\^([0-9a-zA-Z])/g,'<sup>$1</sup>').replace(/_\{([^{}]+)\}/g,'<sub>$1</sub>').replace(/_([0-9a-zA-Z])/g,'<sub>$1</sub>');
+}
+function fmtFileLink(label,rawUrl){
+  const clean=rawUrl.replace(/^file:\/\//,'');const[p,frag]=clean.split('#');
+  const ln=frag?frag.replace(/^[Ll]/,'').split('-')[0]:'';
+  return `<a class="file-lnk" href="${esc(ideUri(p,ln))}">${esc(label)}</a>`;
+}
+function fmtIn(s){
+  const codes=[];
+  let o=s.replace(/`([^`\n]+)`/g,(_,c)=>{
+    const m=c.match(/^([A-Za-z0-9_./-]+\.[a-z]{1,6})(?::(\d+)|#L(\d+))?$/);
+    if(m&&(c.includes('/')||m[2]||m[3])){const base=(curWt||defaultWt||'').replace(/\/$/,'');const abs=m[1].startsWith('/')?m[1]:`${base}/${m[1]}`;codes.push(`<a class="file-lnk" href="${esc(ideUri(abs,m[2]||m[3]||''))}"><code>${esc(c)}</code></a>`);}
+    else codes.push(`<code>${esc(c)}</code>`);
+    return `\x00C${codes.length-1}\x00`;
+  });
+  o=esc(o)
+    .replace(/\\\((.+?)\\\)/g,(_,m)=>`<span class="math-in">${fmtTex(m)}</span>`)
+    .replace(/(^|[^\\$])\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$/g,(all,p,m)=>/^[0-9.,]+$/.test(m)?all:`${p}<span class="math-in">${fmtTex(m)}</span>`)
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((file:\/\/[^\s)"']+)\)/g,(_,l,u)=>fmtFileLink(l,u))
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,(_,l,u)=>`<a href="${u}" target="_blank" rel="noopener noreferrer">${l}</a>`);
+  return o.replace(/\x00C(\d+)\x00/g,(_,i)=>codes[+i]);
+}
+function fmtMd(src){
+  const lines=(src||'').replace(/\r\n/g,'\n').split('\n');
+  let out='',i=0;
+  while(i<lines.length){
+    const ln=lines[i],tr=ln.trim();
+    if(tr.startsWith('```')){
+      const lang=tr.slice(3).trim().toLowerCase();i++;let buf=[];
+      while(i<lines.length&&!lines[i].trim().startsWith('```')){buf.push(lines[i]);i++;}
+      i++;
+      if(lang==='math'||lang==='latex'||lang==='tex')out+=`<div class="math-blk">${fmtTex(buf.join('\n'))}</div>`;
+      else if(lang==='svg'||(buf.join('').trim().startsWith('<svg'))){
+        const uri=svgDataUri(buf.join('\n'));
+        out+=uri?`<div class="svg-card"><img src="${uri}" alt="diagram"></div>`:`<pre><code>${esc(buf.join('\n'))}</code></pre>`;
+      }
+      else out+=`<pre><div class="code-hdr"><span>${esc(lang||'code')}</span><button class="btn copy-btn" onclick="navigator.clipboard.writeText(this.parentElement.nextElementSibling.textContent);toast('Copied code')">Copy</button></div><code>${esc(buf.join('\n'))}</code></pre>`;
+      continue;
+    }
+    if(tr.startsWith('$$')||tr.startsWith('\\[')){
+      const cl=tr.startsWith('$$')?'$$':'\\]';
+      if(tr.length>2&&tr.endsWith(cl)){out+=`<div class="math-blk">${fmtTex(tr.slice(2,-2))}</div>`;i++;continue;}
+      let buf=[tr.slice(2)];i++;
+      while(i<lines.length&&!lines[i].trim().endsWith(cl)){buf.push(lines[i]);i++;}
+      if(i<lines.length){buf.push(lines[i].trim().slice(0,-2));i++;}
+      out+=`<div class="math-blk">${fmtTex(buf.join(' '))}</div>`;continue;
+    }
+    if(tr.includes('|')&&i+1<lines.length&&/^\|?[\s:-]+\|[\s|:-]*$/.test(lines[i+1].trim())){
+      const cells=r=>r.trim().replace(/^\||\|$/g,'').split('|').map(c=>c.trim());
+      const hdr=cells(ln);i+=2;let rows='';
+      while(i<lines.length&&lines[i].trim().includes('|')){rows+=`<tr>${cells(lines[i]).map(c=>`<td>${fmtIn(c)}</td>`).join('')}</tr>`;i++;}
+      out+=`<table><thead><tr>${hdr.map(c=>`<th>${fmtIn(c)}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table>`;continue;
+    }
+    if(!tr){i++;continue;}
+    const hm=tr.match(/^(#{1,4})\s+(.+)$/);
+    if(hm){const lv=hm[1].length+1;out+=`<h${lv}>${fmtIn(hm[2])}</h${lv}>`;i++;continue;}
+    if(/^[-*]\s+/.test(tr)){
+      let items='';while(i<lines.length&&/^[-*]\s+/.test(lines[i].trim())){items+=`<li>${fmtIn(lines[i].trim().replace(/^[-*]\s+/,''))}</li>`;i++;}
+      out+=`<ul>${items}</ul>`;continue;
+    }
+    out+=`<p>${fmtIn(ln)}</p>`;i++;
+  }
+  return out;
+}
+async function loadMeta(){
+  const m=await api('/api/meta');
+  if(m.version)document.getElementById('ver').textContent='v'+m.version;
+  if(m.default_repo){defaultWt=m.default_repo;if(!curWt)curWt=defaultWt;}
+  const ms=document.getElementById('model-sel');
+  if(Array.isArray(m.models)&&m.models.length){
+    const def=(m.active_model||'default').split('/').pop();
+    ms.innerHTML=`<option value="">Model: ${esc(def)}</option>`+m.models.map(x=>`<option value="${esc(x)}">${esc(x)}</option>`).join('');
+  }
+  renderInspector();
+}
+function setFilter(f){filter=f;document.getElementById('f-all').className=f==='all'?'active':'';document.getElementById('f-act').className=f==='active'?'active':'';document.getElementById('f-dif').className=f==='diff'?'active':'';renderList();}
+function toggleAllRepos(){allRepos=!allRepos;const b=document.getElementById('scope-btn');b.textContent=allRepos?'All repos':'Repo';b.classList.toggle('active',allRepos);loadList();}
+function renderList(){
+  const q=(document.getElementById('q').value||'').trim().toLowerCase();
+  const byParent={};
+  for(const s of sessions){if(s.parent_sid)(byParent[s.parent_sid]=byParent[s.parent_sid]||[]).push(s);}
+  const roots=sessions.filter(s=>!s.parent_sid||!sessions.some(p=>p.sid===s.parent_sid));
+  const match=s=>{
+    if(filter==='active'&&s.status!=='running'&&s.status!=='approval')return false;
+    if(filter==='diff'&&s.status!=='dirty')return false;
+    if(q&&!`${s.label} ${s.branch||''} ${s.sid}`.toLowerCase().includes(q))return false;
+    return true;
+  };
+  const row=(s,child=false)=>{
+    const cls='b-'+(s.status||'settled');
+    const tag=s.status==='approval'?'wait':s.status==='running'?'run':s.status==='dirty'?'diff':'ok';
+    return `<div class="sitem ${child?'child':''} ${s.sid===curSid?'active':''}" data-sid="${esc(s.sid)}" onclick="openSid(this.dataset.sid)">
+      <div class="srow"><span class="badge ${esc(cls)}">${tag}</span><span class="slabel">${child?'↳ ':''}${esc(s.label)}</span><button class="arch-btn" data-sid="${esc(s.sid)}" title="Archive thread" onclick="event.stopPropagation();archiveSid(this.dataset.sid)">×</button></div>
+      <div class="ssub">${esc(s.branch||'main')} · t${s.turns} · ${esc(s.age)}</div>
+    </div>`;
+  };
+  let html='';
+  for(const r of roots){
+    const kids=(byParent[r.sid]||[]);
+    if(!match(r)&&!kids.some(match))continue;
+    html+=row(r,false);
+    for(const k of kids)if(match(k))html+=row(k,true);
+  }
+  document.getElementById('slist').innerHTML=html||'<div class="ssub" style="padding:12px">No matching threads</div>';
+}
+async function loadList(){
+  const d=await api('/api/sessions'+(allRepos?'?all=1':''));
+  if(!d.sessions)return;
+  if(!defaultWt&&d.default_repo)defaultWt=d.default_repo;
+  if(!curWt&&defaultWt)curWt=defaultWt;
+  sessions=d.sessions;
+  maybeNotify(sessions);
+  renderList();
+  if(!curSid&&!draftNew&&sessions.length)openSid(sessions[0].sid);
+}
+async function openSid(sid,resetScroll=false){draftNew=false;newWt=false;syncWtUi();if(sid!==curSid)forceTail=true;if(resetScroll)forceTail=true;curSid=sid;detail=await api('/api/session/'+sid);curWt=detail.worktree||curWt;render();renderList();}
+function openParent(){if(detail&&detail.parent_sid)openSid(detail.parent_sid,true);}
+function newThread(){draftNew=true;curSid='';curWt=defaultWt;forceTail=true;lastHtml='';detail={messages:[],pending:[],todos:[],children:[],usage:{},diff:'',branch:'new',worktree:defaultWt,running:false};syncWtUi();setTab('chat');renderList();}
+function toggleNewWt(){if(curSid)return toast('Click + New first to start an isolated worktree thread');newWt=!newWt;syncWtUi();}
+function syncWtUi(){const b=document.getElementById('wt-toggle'),inp=document.getElementById('wt-slug');b.style.display=curSid?'none':'inline-flex';b.classList.toggle('active',newWt);inp.style.display=(!curSid&&newWt)?'inline-block':'none';}
+function prefillCmd(p){const inp=document.getElementById('inp');if(p==='/review --fix'){inp.value=p;}else{inp.value=p+inp.value.replace(/^\/goal\s+/,'');}inp.focus();}
+function setTab(t){tab=t;lastHtml='';document.getElementById('t-chat').className=t==='chat'?'active':'';document.getElementById('t-diff').className=t==='diff'?'active':'';render();}
+function renderDiffView(rawDiff){
+  if(!rawDiff||!rawDiff.trim())return '<div class="empty">Working tree clean.</div>';
+  const chunks=rawDiff.split(/(?=^diff --git )/m).filter(Boolean);
+  const files=chunks.map((c,idx)=>{
+    const m=c.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    const name=m?m[2]:`patch-${idx+1}`;
+    let ins=0,del=0;
+    for(const l of c.split('\n')){if(l.startsWith('+')&&!l.startsWith('+++'))ins++;else if(l.startsWith('-')&&!l.startsWith('---'))del++;}
+    return{idx,name,ins,del,raw:c};
+  });
+  const nav=`<div class="diff-nav">${files.map(f=>`<button class="diff-chip" onclick="document.getElementById('df-${f.idx}').scrollIntoView({behavior:'smooth'})"><span>${esc(f.name.split('/').pop())}</span><span class="d-add">+${f.ins}</span><span class="d-del">-${f.del}</span></button>`).join('')}</div>`;
+  const secs=files.map(f=>{
+    const lines=f.raw.split('\n').map(l=>{
+      const c=l.startsWith('+')?'d-add':l.startsWith('-')?'d-del':l.startsWith('@@')?'d-hunk':'';
+      return `<span class="${c}">${esc(l)}</span>`;
+    }).join('\n');
+    const abs=`${(curWt||defaultWt||'').replace(/\/$/,'')}/${f.name}`;
+    return `<div class="diff-sec" id="df-${f.idx}"><div class="diff-hdr"><a class="file-lnk" href="${esc(ideUri(abs,''))}">${esc(f.name)}</a><span><span class="d-add">+${f.ins}</span> <span class="d-del">-${f.del}</span></span></div><pre class="diff">${lines}</pre></div>`;
+  }).join('');
+  return nav+secs;
+}
+function renderInspector(){
+  const wt=(detail&&detail.worktree)||curWt||defaultWt||'';
+  document.getElementById('env-wt').textContent=wt||'—';
+  document.getElementById('open-ed').href=ideUri(wt,'');
+  const todos=(detail&&detail.todos)||[];
+  const done=todos.filter(t=>t.status==='completed').length;
+  document.getElementById('todo-ttl').textContent=todos.length?`Plan progress (${done}/${todos.length})`:'Plan progress';
+  document.getElementById('todo-list').innerHTML=todos.length?todos.map(t=>{
+    const g=t.status==='completed'?'✓':t.status==='in_progress'?'●':'○';
+    return `<div class="todo-row ${t.status==='completed'?'todo-done':''}"><span>${g}</span><span>${esc(t.content)}</span></div>`;
+  }).join(''):'No active checklist';
+  const kids=(detail&&detail.children)||[];
+  document.getElementById('sub-list').innerHTML=kids.length?kids.map(k=>`<div class="sitem child" style="margin:0 0 4px;padding:8px" data-sid="${esc(k.sid)}" onclick="openSid(this.dataset.sid)"><div class="srow"><span class="badge b-settled">${esc(k.role||'sub')}</span><span class="slabel">${esc(k.task||k.sid)}</span></div><div class="ssub">t${k.turns||0} · ${k.tool_count||0} tools</div></div>`).join(''):'None in this thread';
+  const u=(detail&&detail.usage)||{};
+  const inp=u.input_tokens||0,out=u.output_tokens||0,cached=u.cached_input_tokens||0;
+  const pct=inp>0?Math.min(100,Math.round((cached*100)/inp)):0;
+  const fmtK=n=>n>=1000?(n/1000).toFixed(1)+'k':String(n);
+  document.getElementById('usage-kv').textContent=`${fmtK(inp)} in · ${fmtK(out)} out · cache ${pct}%`;
+  document.getElementById('cache-bar').style.width=pct+'%';
+}
+function render(){
+  if(!detail)return;
+  const pBtn=document.getElementById('parent-btn');
+  pBtn.style.display=detail.parent_sid?'inline-flex':'none';
+  document.getElementById('stitle').textContent=detail.title||(curSid?curSid.slice(0,12):'New thread');
+  document.getElementById('smeta').textContent=[detail.branch,detail.model,detail.running?'running…':''].filter(Boolean).join(' · ');
+  document.getElementById('stop-btn').style.display=detail.running?'inline-flex':'none';
+  renderInspector();
+  const p=document.getElementById('pane');
+  const nearBottom=forceTail||(p.scrollHeight-p.scrollTop-p.clientHeight<56);
+  if(tab==='diff'){
+    const next=renderDiffView(detail.diff||'');
+    if(next!==lastHtml){const prevTop=p.scrollTop;p.innerHTML=next;lastHtml=next;p.scrollTop=prevTop;}
+    return;
+  }
+  let html=(detail.pending||[]).map(a=>`<div class="approval"><div><strong>Approve ${esc(a.name)}?</strong><div class="ssub">${esc(JSON.stringify(a.args))}</div></div><div class="approval-actions"><button class="btn primary" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,true)">Allow</button><button class="btn" data-id="${esc(a.id)}" onclick="approve(this.dataset.id,false)">Deny</button></div></div>`).join('');
+  html+=(detail.messages||[]).filter(m=>m.role!=='system').map(m=>{
+    const txt=typeof m.content==='string'?m.content:Array.isArray(m.content)?m.content.map(x=>x.text||'[image]').join(' '):JSON.stringify(m.content);
+    const rCls=m.role==='assistant'?'assistant':m.role==='user'?'user':'tool';
+    if(m.role==='tool')return `<div class="msg tool">↳ ${esc(txt.slice(0,400))}</div>`;
+    return `<div class="msg ${rCls}">${m.role==='assistant'?fmtMd(txt):esc(txt)}</div>`;
+  }).join('');
+  const finalHtml=html||'<div class="empty">No messages yet.</div>';
+  if(finalHtml!==lastHtml){
+    const prevTop=p.scrollTop;
+    p.innerHTML=finalHtml;
+    lastHtml=finalHtml;
+    p.scrollTop=nearBottom?p.scrollHeight:prevTop;
+  }else if(forceTail){
+    p.scrollTop=p.scrollHeight;
+  }
+  forceTail=false;
+}
+function renderAttachments(){
+  const row=document.getElementById('att-row');
+  row.style.display=images.length?'flex':'none';
+  row.innerHTML=images.map((im,i)=>`<span class="att-pill">${esc(im.label)} <button class="arch-btn" style="opacity:1;width:16px;height:16px" onclick="images.splice(${i},1);renderAttachments()">×</button></span>`).join('');
+}
+function addImageFile(f){
+  if(!f||!f.type.startsWith('image/')||f.size>8*1024*1024)return;
+  const rd=new FileReader();
+  rd.onload=()=>{images.push({label:f.name||'image.png',url:rd.result});renderAttachments();};
+  rd.readAsDataURL(f);
+}
+async function sendPrompt(){
+  const inp=document.getElementById('inp');const text=inp.value.trim();if(!text)return;
+  if(text==='/review'||text==='/review --fix'){toast('Use CLI/TUI for /review or ask twig to review diff');}
+  inp.value='';forceTail=true;
+  const role=document.getElementById('role-sel').value;
+  const model=document.getElementById('model-sel').value;
+  const effort=document.getElementById('effort-sel').value;
+  const slug=(!curSid&&newWt)?(document.getElementById('wt-slug').value.trim()||text.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,24)||'task'):'';
+  const imgs=images.splice(0,images.length);renderAttachments();
+  const r=await api('/api/send',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,new_worktree_slug:slug,role,model,effort,prompt:text,images:imgs})});
+  if(r.error)return toast(r.error);
+  if(r.sid){draftNew=false;newWt=false;curSid=r.sid;if(r.worktree)curWt=r.worktree;syncWtUi();setTimeout(()=>openSid(curSid,true),250);}
+}
+async function cancelRun(){if(!curSid)return;const r=await api('/api/cancel',{method:'POST',body:JSON.stringify({sid:curSid})});toast(r.stopped?'Stopped active turn':'No active process');setTimeout(()=>openSid(curSid),300);}
+async function archiveSid(sid){const r=await api('/api/archive',{method:'POST',body:JSON.stringify({sid})});if(r.error)return toast(r.error);toast('Archived thread');if(curSid===sid)newThread();loadList();}
+async function approve(id,allow){await api('/api/approve',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt,id,allow})});toast(allow?'Approved':'Denied');openSid(curSid);}
+async function commitNow(){if(!curSid)return;const r=await api('/api/commit',{method:'POST',body:JSON.stringify({sid:curSid,worktree:curWt})});toast(r.summary||r.error||'Committed');openSid(curSid);}
+const inpEl=document.getElementById('inp');
+inpEl.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendPrompt();}});
+inpEl.addEventListener('paste',e=>{for(const it of(e.clipboardData?.items||[]))if(it.type.startsWith('image/'))addImageFile(it.getAsFile());});
+document.body.addEventListener('dragover',e=>e.preventDefault());
+document.body.addEventListener('drop',e=>{e.preventDefault();for(const f of(e.dataTransfer?.files||[]))addImageFile(f);});
+loadMeta();loadList();setInterval(()=>{loadList();if(curSid)openSid(curSid);},2000);
+</script>
+</body>
+</html>

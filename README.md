@@ -66,7 +66,15 @@ curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.sh
 irm https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.ps1 | iex
 ```
 
-> Verifies SHA-256 checksums (`sha256sum`, `shasum`, or `openssl`) against release digests on [`SEMANTICx/twig-dist`](https://github.com/SEMANTICx/twig-dist) and installs to `~/.local/bin/twig` (or `%LOCALAPPDATA%\twig\bin`). Pin a release via `TWIG_VERSION=v0.2.0`.
+> Verifies SHA-256 checksums (`sha256sum`, `shasum`, or `openssl`) against release digests on [`SEMANTICx/twig-dist`](https://github.com/SEMANTICx/twig-dist) and installs to `~/.local/bin/twig` (or `%LOCALAPPDATA%\twig\bin`). Pin a release via `TWIG_VERSION=v0.2.1`.
+
+### Updating `twig`
+
+```bash
+twig update --check            # Check whether a newer prebuilt release is available
+twig update                    # Download, verify SHA-256, and atomically replace twig in-place
+twig update --version v0.2.1   # Pin or roll back to a specific release tag
+```
 
 ### 2. Build from Source
 
@@ -162,6 +170,7 @@ twig exec --check "cargo test --quiet" --json "Fix off-by-one bounds bug in pars
 
 | Shortcut / Command | Action |
 |---|---|
+| **Mouse Single-Click / `/open`** | **Click-to-Jump Links & `path:line`**: click any URL, `[n]` link footnote, `file://#L12`, or `src/foo.rs:42` in the TUI (or run `/open [n\|url\|path:line]`) to open in browser or `cursor://` / `vscode://` / `zed://` (`TWIG_FILE_OPENER`) |
 | **Mouse Left-Drag** | **Native Highlight & Auto-Copy**: drag directly across any CJK/ASCII text to highlight and copy via OSC 52 + system clipboard (`Ctrl+C` copies & clears without interrupting; `Alt+M` toggles mouse capture) |
 | `/agent` (`v` in `^T`/`↓`, `Tab`, `Esc`) | **Live Subagent Thread Switcher**: enter any running/completed subagent's live stream (`v`/`→`), `Tab` cycle parallel agents, `Enter` chat directly with that child session, `Esc` return to main |
 | `Shift+Tab` | **3-Mode Permission Cycle**: `Auto-Accept Edits` (default) ⇄ `◈ Plan Mode` (read-only) ⇄ `🔒 Review Edits` (diff approval before every edit) |
@@ -311,7 +320,9 @@ twig skill doctor                       # Enforce frontmatter, <=500-line cap, a
 
 ```text
 twig chat [repo] [sid] [--plain]                 Interactive borderless TUI
-twig web [--port 3426] [--bind 127.0.0.1]        Browser & mobile HTTP cockpit (--repo / --token)
+twig web [--port 3426] [--bind 127.0.0.1]        3-pane browser & mobile cockpit (Inbox + File-Indexed Diff + Environment Inspector)
+twig update [--check] [--force] [--version TAG]  SHA-256-verified in-place binary self-updater
+twig guide                                       Print complete version-matched CLI, subagent, hook & RCI reference guide
 twig exec [flags] "<prompt>"                     Headless single-shot execution (--role/--model/--check/--json/--events)
 twig session <list|search|show|spawn|send|diff|apply|archive|gc>
 twig verify [record] <journal.jsonl> <program>   Black-box differential oracle recording & gating (--min-cases >= 1)
@@ -336,6 +347,7 @@ twig doctor / twig selfcheck / twig config [init]
 | `TWIG_MODEL` | *(saved `/model`)* | Override active model (`cli:codex`, `cli:agy`, `cli:claude`, `cli:gemini`, or gateway model ID) |
 | `TWIG_ROLES` | *(saved `/roles`)* | JSON per-role map (`code`, `plan`, `advisor`, `reviewer`, `scout`) |
 | `TWIG_EFFORT` | *(saved `/effort`)* | Reasoning effort (`off`, `low`, `medium`, `high`, `xhigh`) |
+| `TWIG_FILE_OPENER` | *(auto-detected)* | Editor URI scheme for clicked `file://` & `path:line` targets (`cursor`, `vscode`, `windsurf`, `zed`, `system`) |
 | `TWIG_CONFIG` | `~/.config/twig/harness.json` | Custom `HarnessConfig` JSON path (`isolation`, `network`, `max_turns`, etc.) |
 | `TWIG_SKILLS_DIR` / `TWIG_SKILLS_VAULT` | XDG / AppData defaults | Active global skills dir / zero-cost cold vault dir |
 | `TWIG_WORKERS` / `TWIG_WALL_SECS` | `4` / `300` | Parallelism & wall-clock timeout for `twig eval` |

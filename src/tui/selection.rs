@@ -24,10 +24,13 @@ pub struct TextSelection {
     dragging: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum MouseSelectAction {
     None,
     Scroll(i32),
     Copied(String),
+    OpenLinkRef(usize),
+    OpenTarget(String),
 }
 
 impl TextSelection {
@@ -87,8 +90,9 @@ impl TextSelection {
                         return MouseSelectAction::Copied(text);
                     }
                 }
+                let hit = screen.and_then(|buf| detect_clickable_at(buf, pos));
                 self.clear();
-                MouseSelectAction::None
+                hit.unwrap_or(MouseSelectAction::None)
             }
             _ => MouseSelectAction::None,
         }
@@ -193,6 +197,147 @@ impl TextSelection {
     }
 }
 
+fn row_string_with_col_map(buf: &Buffer, y: u16) -> (String, Vec<usize>) {
+    let area = buf.area;
+    let right = area.x.saturating_add(area.width);
+    let mut text = String::new();
+    let mut col_to_byte = vec![0usize; area.width as usize];
+    let mut x = area.x;
+    while x < right {
+        let start_b = text.len();
+        let sym = buf[(x, y)].symbol();
+        let w = UnicodeWidthStr::width(sym).max(1) as u16;
+        text.push_str(if sym.is_empty() { " " } else { sym });
+        for off in 0..w {
+            let idx = (x + off).saturating_sub(area.x) as usize;
+            if idx < col_to_byte.len() {
+                col_to_byte[idx] = start_b;
+            }
+        }
+        x = x.saturating_add(w);
+    }
+    (text, col_to_byte)
+}
+
+fn is_token_delim(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '(' | ')' | '<' | '>' | '"' | '\'' | '`' | ',' | ';' | '│' | '┌' | '┐' | '└' | '┘')
+}
+
+fn looks_like_file_target(tok: &str) -> bool {
+    let clean = tok.trim_matches(|c: char| matches!(c, '[' | ']' | ':' | '.'));
+    if clean.is_empty()
+        || clean.starts_with("http://")
+        || clean.starts_with("https://")
+        || clean.starts_with('/') && !clean.contains('.')
+    {
+        return false;
+    }
+    if clean.starts_with("file://") {
+        return true;
+    }
+    let path_part = clean
+        .split('#')
+        .next()
+        .unwrap_or(clean)
+        .split(':')
+        .next()
+        .unwrap_or(clean);
+    let Some((_, ext)) = path_part.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty()
+        && ext.len() <= 8
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && (path_part.contains('/')
+            || clean.contains(':')
+            || clean.contains("#L")
+            || matches!(
+                ext,
+                "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "md" | "json" | "toml" | "yaml" | "yml" | "html" | "css" | "sh" | "c" | "h" | "cpp"
+            ))
+}
+
+fn parse_bracket_ref(s: &str) -> Option<usize> {
+    let inner = s.strip_prefix('[')?.strip_suffix(']')?;
+    let n = inner.parse::<usize>().ok()?;
+    (1..=999).contains(&n).then_some(n)
+}
+
+fn detect_clickable_at(buf: &Buffer, pos: CellPos) -> Option<MouseSelectAction> {
+    let area = buf.area;
+    if pos.row < area.y
+        || pos.row >= area.y.saturating_add(area.height)
+        || pos.col < area.x
+        || pos.col >= area.x.saturating_add(area.width)
+    {
+        return None;
+    }
+    let (line, col_map) = row_string_with_col_map(buf, pos.row);
+    let rel_col = (pos.col - area.x) as usize;
+    let byte_idx = *col_map.get(rel_col)?;
+    if byte_idx >= line.len() {
+        return None;
+    }
+
+    // 1. Check if user clicked inside `[n]` directly, OR clicked an underlined `[label]` followed by `[n]` on the same line!
+    let left_br = line[..=byte_idx].rfind('[');
+    let right_br = line[byte_idx..].find(']').map(|o| byte_idx + o);
+    if let (Some(l), Some(r)) = (left_br, right_br) {
+        if r > l && r - l <= 5 {
+            if let Some(n) = parse_bracket_ref(&line[l..=r]) {
+                return Some(MouseSelectAction::OpenLinkRef(n));
+            }
+        }
+    }
+    if buf[(pos.col, pos.row)]
+        .modifier
+        .contains(Modifier::UNDERLINED)
+    {
+        let tail = &line[byte_idx..];
+        let mut scan = 0usize;
+        while let Some(open_off) = tail[scan..].find('[') {
+            let s = scan + open_off;
+            let Some(close_off) = tail[s..].find(']') else {
+                break;
+            };
+            let candidate = &tail[s..=s + close_off];
+            if let Some(n) = parse_bracket_ref(candidate) {
+                return Some(MouseSelectAction::OpenLinkRef(n));
+            }
+            scan = s + close_off + 1;
+        }
+    }
+
+    // 2. Extract contiguous non-delimiter token around `byte_idx`.
+    let start = line[..byte_idx]
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| is_token_delim(c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let end = line[byte_idx..]
+        .char_indices()
+        .find(|&(_, c)| is_token_delim(c))
+        .map(|(i, _)| byte_idx + i)
+        .unwrap_or(line.len());
+    let token = line[start..end].trim_end_matches(['.', ',', ';', ')']);
+    if token.is_empty() {
+        return None;
+    }
+    if let Some(n) = parse_bracket_ref(token) {
+        return Some(MouseSelectAction::OpenLinkRef(n));
+    }
+    if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("file://")
+    {
+        return Some(MouseSelectAction::OpenTarget(token.to_owned()));
+    }
+    if looks_like_file_target(token) {
+        let cleaned = token.trim_matches(['[', ']']);
+        return Some(MouseSelectAction::OpenTarget(cleaned.to_owned()));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,12 +384,45 @@ mod tests {
             _ => panic!("expected Copied on mouse up"),
         }
 
-        // Single click without drag clears selection instead of copying
-        sel.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 0), Some(&clean));
-        assert!(matches!(
-            sel.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 0), Some(&clean)),
+        // Single click on plain non-link words clears selection instead of copying or opening
+        sel.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 1), Some(&clean));
+        assert_eq!(
+            sel.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 5, 1), Some(&clean)),
             MouseSelectAction::None
-        ));
+        );
         assert!(!sel.has_range());
+
+        // Single click on URLs, `[n]` link footnotes, underlined labels, or `path:line` opens target!
+        let mut link_buf = Buffer::empty(Rect::new(0, 0, 72, 3));
+        link_buf.set_string(
+            0,
+            0,
+            "See ",
+            Style::default(),
+        );
+        link_buf.set_string(
+            4,
+            0,
+            "policy.rs",
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        );
+        link_buf.set_string(13, 0, " [1] and src/web.rs:214", Style::default());
+        link_buf.set_string(0, 1, "  [1] https://github.com/SEMANTICx/twig", Style::default());
+
+        sel.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 0), Some(&link_buf));
+        assert_eq!(
+            sel.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 0), Some(&link_buf)),
+            MouseSelectAction::OpenLinkRef(1)
+        );
+        sel.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 25, 0), Some(&link_buf));
+        assert_eq!(
+            sel.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 25, 0), Some(&link_buf)),
+            MouseSelectAction::OpenTarget("src/web.rs:214".into())
+        );
+        sel.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 12, 1), Some(&link_buf));
+        assert_eq!(
+            sel.on_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 12, 1), Some(&link_buf)),
+            MouseSelectAction::OpenTarget("https://github.com/SEMANTICx/twig".into())
+        );
     }
 }

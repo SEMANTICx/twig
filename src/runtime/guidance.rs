@@ -163,6 +163,16 @@ pub struct SkillIndex {
 const HEADER_BYTES: u64 = 16_384;
 const MAX_SKILL_BYTES: u64 = 262_144;
 const MAX_SKILLS: usize = 1024;
+const BUILTIN_TWIG_GUIDE: &str = include_str!("../guide.md");
+
+/// Version-matched reference guide for `twig guide` and `skill(name="twig")`.
+pub fn builtin_guide_markdown() -> String {
+    format!(
+        "<!-- twig v{} built-in reference -->\n{}",
+        env!("CARGO_PKG_VERSION"),
+        BUILTIN_TWIG_GUIDE
+    )
+}
 
 impl SkillIndex {
     /// One directory level, matching `<name>/SKILL.md` and standalone Markdown.
@@ -402,6 +412,11 @@ impl SkillIndex {
     }
 
     pub fn load(&self, name: &str) -> io::Result<String> {
+        if matches!(name, "twig" | "twig-guide" | "twig-cli")
+            && !self.entries.iter().any(|e| e.name == name)
+        {
+            return Ok(builtin_guide_markdown());
+        }
         let metadata = self
             .entries
             .iter()
@@ -741,6 +756,13 @@ impl SkillStore {
         }
         push_dir(&self.global_dir, "global");
         push_dir(&self.vault_dir, "vault");
+        if seen.insert("twig".to_owned()) {
+            out.push((
+                "twig".to_owned(),
+                "builtin".to_owned(),
+                "Complete version-matched twig CLI, subagent, hook & RCI guide".to_owned(),
+            ));
+        }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -810,6 +832,9 @@ impl SkillStore {
             let raw_body = read_bounded(&canon, MAX_SKILL_BYTES).map_err(|e| e.to_string())?;
             let body = append_bundled_files_hint(name, &canon, raw_body);
             return Ok((body, scope));
+        }
+        if sub_file.is_none() && matches!(name, "twig" | "twig-guide" | "twig-cli") {
+            return Ok((builtin_guide_markdown(), "builtin"));
         }
         Err(format!("unknown skill {name:?}"))
     }

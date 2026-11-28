@@ -288,6 +288,14 @@ fn main() {
 
     match cmd {
         "--version" | "version" => println!("twig {}", env!("CARGO_PKG_VERSION")),
+        "guide" => print!("{}", twig::playbook::builtin_guide_markdown()),
+        "update" | "self-update" => match twig::cli::run_self_update(&args[1..]) {
+            Ok(code) => std::process::exit(code),
+            Err(e) => {
+                eprintln!("twig update: {e}");
+                std::process::exit(1);
+            }
+        },
         "selfcheck" => selfcheck(),
         "exec" => match twig::cli::run_headless_exec(&args[1..]) {
             Ok(code) => std::process::exit(code),
@@ -755,13 +763,15 @@ fn main() {
 
         _ => {
             println!(
-                "twig 0.2.0 — a thin agent harness\n\n\
+                "twig {} — a thin agent harness\n\n\
                  usage:\n  \
                  twig chat [repo] [sid] [--plain] interactive TUI (/cmd, @file, $skill, !shell)\n  \
                  twig web [--port 3426] [--bind H] browser/mobile thread & diff cockpit\n  \
                  twig exec [flags] \"<prompt>\"   headless single-shot run (--role/--model/--resume/--json/--events)\n  \
                  twig session <list|search|show|spawn|send|diff|apply|archive|gc>  session CLI\n  \
                  twig verify <journal.jsonl> <program> [args...]  clean-room differential replay gate\n  \
+                 twig update [--check] [--force] self-update binary from SEMANTICx/twig-dist (SHA-256 verified)\n  \
+                 twig guide                     print complete version-matched reference for humans & agents\n  \
                  twig serve [worktree] [runs]   JSON-RPC over stdio\n  \
                  twig selfcheck                 offline checks (no network)\n  \
                  twig doctor                    check config/state paths and dependencies\n  \
@@ -779,8 +789,9 @@ fn main() {
                  twig subagent [repo] [role]    isolated role subagent\n  \
                  twig review [repo] <diff>      fresh read-only independent reviewer\n\n\
                  env: TWIG_BASE_URL (default http://127.0.0.1:3425/v1), TWIG_API_KEY, TWIG_MODEL,\n       \
-                 TWIG_ROLES, TWIG_CONFIG, TWIG_SKILLS_DIR, TWIG_SKILLS_VAULT,\n       \
-                 TWIG_WORKERS (4), TWIG_WALL_SECS (300)"
+                 TWIG_ROLES, TWIG_FILE_OPENER (cursor|vscode|zed|system), TWIG_CONFIG,\n       \
+                 TWIG_SKILLS_DIR, TWIG_SKILLS_VAULT, TWIG_WORKERS (4), TWIG_WALL_SECS (300)",
+                env!("CARGO_PKG_VERSION")
             );
         }
     }

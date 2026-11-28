@@ -723,17 +723,12 @@ pub fn format_session_transcript(sid: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// Detailed session snapshot for `twig web` cockpit (`messages`, `pending`, `diff`, live `Lease` state).
+/// Detailed session snapshot for `twig web` cockpit (`messages`, `pending`, `diff`, `todos`, `usage`, `children`, live `Lease` state).
 pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -> Result<Value, String> {
     if !paths::valid_session(sid) {
         return Err("invalid session id".into());
     }
-    let path = paths::state_dir()
-        .join("sessions")
-        .join(format!("{sid}.jsonl"));
-    if !path.exists() {
-        return Err("session not found".into());
-    }
+    let path = locate_session_jsonl(sid).ok_or_else(|| "session not found".to_owned())?;
     let rows = read_jsonl_lenient(&path).map_err(|e| e.to_string())?;
     let snap = recover_session(&rows, None);
     let worktree = snap
@@ -750,12 +745,22 @@ pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -
         })
         .unwrap_or_default();
     let running = in_flight || crate::record::Lease::is_locked(&path.with_extension("lock"));
+    let usage = crate::llm::summarize_usage(&rows);
+    let children = load_child_threads(sid, None);
     Ok(json!({
         "sid": sid,
+        "title": snap.title,
+        "role": snap.role.unwrap_or_else(|| "code".into()),
+        "parent_sid": snap.parent_sid,
         "worktree": worktree,
         "branch": snap.branch.unwrap_or_default(),
         "model": snap.model.unwrap_or_default(),
+        "effort": snap.saved_effort,
+        "plan": snap.plan_mode,
         "running": running,
+        "todos": snap.todos,
+        "usage": usage,
+        "children": children,
         "messages": snap.messages,
         "pending": snap.pending,
         "diff": diff,

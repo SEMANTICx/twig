@@ -967,6 +967,26 @@ impl App {
                     self.transcript.search_open_with(&q);
                     Action::None
                 }
+                SlashCommand::OpenLink(opt) => {
+                    let resolved = match opt.as_deref() {
+                        None => self.active_transcript_mut().resolve_link_ref(None),
+                        Some(s) => {
+                            let clean = s.trim_matches(['[', ']']);
+                            if let Ok(n) = clean.parse::<usize>() {
+                                self.active_transcript_mut().resolve_link_ref(Some(n))
+                            } else {
+                                Some(s.to_owned())
+                            }
+                        }
+                    };
+                    match resolved {
+                        Some(target) => Action::OpenTarget(target),
+                        None => {
+                            self.flash("No links found in transcript — pass `/open <url|path:line>`");
+                            Action::None
+                        }
+                    }
+                }
                 SlashCommand::CopyCode => match self.active_transcript_mut().copy_latest_code_block() {
                     Ok((text, msg)) => {
                         self.flash(msg);

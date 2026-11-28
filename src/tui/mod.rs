@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use self::client::{
     build_turn_params, chat_plain, copy_to_clipboard, detect_git_branch, edit_in_external_editor,
-    notify_osc99, shorten_home, LocalWorkers, ServeClient, TerminalGuard,
+    notify_osc99, open_target_in_os, shorten_home, LocalWorkers, ServeClient, TerminalGuard,
 };
 use self::composer::{Composer, SlashCommand};
 use self::overlays::{ApprovalKeyResult, ApprovalQueue, OverlayPicker, PickerOutcome};
@@ -139,6 +139,7 @@ enum Action {
     ToggleMouse,
     OpenEditor,
     CopyCode(String),
+    OpenTarget(String),
     Slash(SlashCommand),
     Quit,
 }
@@ -899,6 +900,15 @@ impl App {
                 self.flash(format!("Copied selection ({} chars)", text.chars().count()));
                 Action::CopyCode(text)
             }
+            MouseSelectAction::OpenLinkRef(idx) => {
+                if let Some(url) = self.active_transcript_mut().resolve_link_ref(Some(idx)) {
+                    Action::OpenTarget(url)
+                } else {
+                    self.flash(format!("Link [{idx}] not found in current view"));
+                    Action::None
+                }
+            }
+            MouseSelectAction::OpenTarget(target) => Action::OpenTarget(target),
         }
     }
 
@@ -1564,6 +1574,10 @@ impl App {
                 }
             }
             Action::CopyCode(block) => copy_to_clipboard(&block),
+            Action::OpenTarget(target) => match open_target_in_os(&self.repo_raw, &target) {
+                Ok(msg) => self.flash(msg),
+                Err(e) => self.flash(e),
+            },
             Action::Quit => return Ok(true),
         }
         Ok(false)

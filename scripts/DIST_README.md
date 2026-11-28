@@ -17,7 +17,17 @@ curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.sh
 Pin a specific version or custom install directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.sh | TWIG_VERSION=v0.2.0 sh
+curl -fsSL https://raw.githubusercontent.com/SEMANTICx/twig-dist/main/install.sh | TWIG_VERSION=v0.2.1 sh
+```
+
+### Self-Updating
+
+Once installed, update in-place at any time with SHA-256 verification:
+
+```bash
+twig update --check            # Check for newer releases
+twig update                    # Download, verify SHA-256, and atomically update binary
+twig update --version v0.2.1   # Pin or roll back to a specific tag
 ```
 
 ### Windows (PowerShell)
@@ -59,10 +69,13 @@ twig doctor
 # 2. Launch interactive TUI inside any Git repository
 twig chat
 
-# 3. Launch browser / mobile HTTP cockpit
+# 3. Launch 3-pane browser / mobile cockpit (Inbox + File-Indexed Diff + Environment Inspector)
 twig web --port 3426
 
-# 4. Run non-interactive single-shot execution with an acceptance check
+# 4. Print complete version-matched CLI & agent reference guide
+twig guide
+
+# 5. Run non-interactive single-shot execution with an acceptance check
 twig exec --check "cargo test" "Fix failing edge case and verify"
 ```
 

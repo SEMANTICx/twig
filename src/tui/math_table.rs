@@ -32,13 +32,35 @@ impl LinkRegistry {
             let idx = self.flushed + 1;
             let url = self.urls[self.flushed].clone();
             self.flushed += 1;
+            let shown = format_footnote_target(&url);
             out.push(Line::from(vec![
                 Span::styled(format!("  [{idx}] "), Style::default().fg(ACCENT)),
-                Span::styled(url, Style::default().fg(MUTED)),
+                Span::styled(shown, Style::default().fg(MUTED).add_modifier(Modifier::UNDERLINED)),
             ]));
         }
         out
     }
+
+    pub(super) fn into_urls(self) -> Vec<String> {
+        self.urls
+    }
+}
+
+fn format_footnote_target(url: &str) -> String {
+    if let Some(local) = url.strip_prefix("file://") {
+        if let Some((path_part, anchor)) = local.split_once('#') {
+            let line = anchor
+                .trim_start_matches(['L', 'l'])
+                .split('-')
+                .next()
+                .unwrap_or("");
+            if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
+                return format!("{path_part}:{line}");
+            }
+        }
+        return local.to_owned();
+    }
+    url.to_owned()
 }
 
 pub(super) fn format_link_suffix(
@@ -55,6 +77,16 @@ pub(super) fn format_link_suffix(
             None => (local, None),
         };
         let base = path_part.rsplit('/').next().unwrap_or(path_part);
+        if let Some(reg) = links {
+            let idx = reg.register(url);
+            let extra = match anchor {
+                Some(a) if !label.contains('#') && !label.contains(':') => format!(" (#{a}) [{idx}]"),
+                _ if label.contains(base) => format!(" [{idx}]"),
+                Some(a) => format!(" ({base}#{a}) [{idx}]"),
+                None => format!(" ({base}) [{idx}]"),
+            };
+            return Some(Span::styled(extra, Style::default().fg(ACCENT)));
+        }
         if label.contains(base) {
             return anchor.map(|a| Span::styled(format!(" (#{a})"), Style::default().fg(MUTED)));
         }

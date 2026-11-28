@@ -186,6 +186,26 @@ fn parse_inline_inner(
     spans
 }
 
+/// Extract deduplicated `[label](url)` targets from `text` in the exact 1-based `[n]` order
+/// assigned by `render_markdown`, so clicking `[n]` or running `/open n` resolves intact URLs.
+pub fn extract_markdown_links(text: &str) -> Vec<String> {
+    let mut reg = super::math_table::LinkRegistry::default();
+    let mut in_fence = false;
+    for raw_line in text.split('\n') {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let _ = parse_inline_inner(trimmed, Style::default(), Some(&mut reg), 0);
+    }
+    let _ = reg.drain_footnotes();
+    reg.into_urls()
+}
+
 /// Render streaming assistant markdown into wrapped styled Ratatui lines.
 pub fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
     let width = max_width.max(12);

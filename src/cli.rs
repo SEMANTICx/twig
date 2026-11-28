@@ -644,3 +644,197 @@ pub fn run_verify_cli(args: &[String]) -> i32 {
     }
     if verdict.ok { 0 } else { 1 }
 }
+
+fn current_release_target() -> Result<(&'static str, &'static str), String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok(("x86_64-unknown-linux-musl", "tar.gz")),
+        ("linux", "aarch64") => Ok(("aarch64-unknown-linux-gnu", "tar.gz")),
+        ("macos", "aarch64") => Ok(("aarch64-apple-darwin", "tar.gz")),
+        ("macos", "x86_64") => Ok(("x86_64-apple-darwin", "tar.gz")),
+        ("windows", "x86_64") => Ok(("x86_64-pc-windows-msvc", "zip")),
+        (os, arch) => Err(format!("precompiled self-update is not available for {os}/{arch}; build via `cargo install --git https://github.com/SEMANTICx/twig`")),
+    }
+}
+
+fn fetch_latest_dist_tag(dist_repo: &str) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{dist_repo}/releases/latest");
+    let resp = ureq::get(&url)
+        .set("User-Agent", concat!("twig/", env!("CARGO_PKG_VERSION")))
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("query {url}: {e}"))?;
+    let raw = resp
+        .into_string()
+        .map_err(|e| format!("read release JSON: {e}"))?;
+    let val: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse release JSON: {e}"))?;
+    val["tag_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no latest release tag found on {dist_repo}"))
+}
+
+fn verify_file_sha256(archive: &Path, sha_file: &Path) -> Result<(), String> {
+    let expected = std::fs::read_to_string(sha_file)
+        .map_err(|e| format!("read {}: {e}", sha_file.display()))?
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("invalid SHA-256 digest in {}", sha_file.display()));
+    }
+    let computed = if let Ok(o) = Command::new("sha256sum").arg(archive).output() {
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_ascii_lowercase())
+    } else {
+        None
+    }
+    .or_else(|| {
+        Command::new("shasum")
+            .args(["-a", "256"])
+            .arg(archive)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("").to_ascii_lowercase())
+    })
+    .or_else(|| {
+        Command::new("openssl")
+            .args(["dgst", "-sha256"])
+            .arg(archive)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().last().unwrap_or("").to_ascii_lowercase())
+    })
+    .ok_or("no SHA-256 verifier found (install sha256sum, shasum, or openssl)")?;
+
+    if computed != expected {
+        return Err(format!(
+            "SHA-256 checksum mismatch (expected {expected}, got {computed})"
+        ));
+    }
+    Ok(())
+}
+
+fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", concat!("twig/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .map_err(|e| format!("download {url}: {e}"))?;
+    let mut reader = resp.into_reader();
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    std::io::copy(&mut reader, &mut file).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    file.flush().map_err(|e| e.to_string())
+}
+
+/// Self-update `twig` binary in-place from `SEMANTICx/twig-dist` (`twig update [--check] [--force] [--version vX.Y.Z]`).
+pub fn run_self_update(args: &[String]) -> Result<i32, String> {
+    let check_only = args.iter().any(|a| a == "--check" || a == "-c");
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
+    let pinned = args
+        .iter()
+        .position(|a| a == "--version" || a == "-v")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| std::env::var("TWIG_VERSION").ok().filter(|s| !s.is_empty()));
+    let dist_repo = std::env::var("TWIG_REPO").unwrap_or_else(|_| "SEMANTICx/twig-dist".into());
+    let cur_tag = concat!("v", env!("CARGO_PKG_VERSION"));
+    let target_tag = match pinned {
+        Some(t) if t.starts_with('v') => t,
+        Some(t) => format!("v{t}"),
+        None => fetch_latest_dist_tag(&dist_repo)?,
+    };
+
+    if check_only {
+        if target_tag == cur_tag {
+            println!("twig is up to date ({cur_tag})");
+        } else {
+            println!("update available: {cur_tag} -> {target_tag} (run `twig update` to install)");
+        }
+        return Ok(0);
+    }
+    if target_tag == cur_tag && !force {
+        println!("twig is already at {cur_tag} (pass `--force` to reinstall)");
+        return Ok(0);
+    }
+
+    let (target, ext) = current_release_target()?;
+    let pkg = format!("twig-{target_tag}-{target}");
+    let base_url = format!("https://github.com/{dist_repo}/releases/download/{target_tag}");
+    let tmp_dir = std::env::temp_dir().join(format!("twig-selfupdate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("tempdir: {e}"))?;
+
+    let res = (|| -> Result<(), String> {
+        let archive_path = tmp_dir.join(format!("{pkg}.{ext}"));
+        let sha_path = tmp_dir.join(format!("{pkg}.{ext}.sha256"));
+        println!("Downloading {pkg}.{ext} from {dist_repo}...");
+        download_to_file(&format!("{base_url}/{pkg}.{ext}"), &archive_path)?;
+        download_to_file(&format!("{base_url}/{pkg}.{ext}.sha256"), &sha_path)?;
+        verify_file_sha256(&archive_path, &sha_path)?;
+
+        let bin_name = if cfg!(windows) { "twig.exe" } else { "twig" };
+        if ext == "zip" {
+            let status = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "Expand-Archive -Path '{}' -DestinationPath '{}' -Force",
+                        archive_path.display(),
+                        tmp_dir.display()
+                    ),
+                ])
+                .status()
+                .map_err(|e| format!("Expand-Archive: {e}"))?;
+            if !status.success() {
+                return Err("Expand-Archive failed".into());
+            }
+        } else {
+            let status = Command::new("tar")
+                .arg("-C")
+                .arg(&tmp_dir)
+                .arg("-xzf")
+                .arg(&archive_path)
+                .status()
+                .map_err(|e| format!("tar extract: {e}"))?;
+            if !status.success() {
+                return Err("tar extract failed".into());
+            }
+        }
+
+        let unpacked = tmp_dir.join(&pkg).join(bin_name);
+        if !unpacked.is_file() {
+            return Err(format!("unpacked binary missing at {}", unpacked.display()));
+        }
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let exe_dir = exe.parent().ok_or("cannot resolve binary parent directory")?;
+        let staged = exe_dir.join(format!(".{bin_name}.update-{}", std::process::id()));
+        std::fs::copy(&unpacked, &staged)
+            .map_err(|e| format!("stage update in {}: {e}", exe_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+        }
+        #[cfg(windows)]
+        {
+            let old = exe.with_extension("old.exe");
+            let _ = std::fs::remove_file(&old);
+            let _ = std::fs::rename(&exe, &old);
+        }
+        std::fs::rename(&staged, &exe).map_err(|e| {
+            let _ = std::fs::remove_file(&staged);
+            format!("activate {}: {e}", exe.display())
+        })?;
+        println!("Updated twig {cur_tag} -> {target_tag} ({})", exe.display());
+        Ok(())
+    })();
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    res.map(|()| 0)
+}

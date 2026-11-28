@@ -809,6 +809,136 @@ pub fn copy_to_clipboard(text: &str) {
     }
 }
 
+fn spawn_detached_opener(target: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(target);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", target]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(target);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn detect_file_opener_scheme() -> &'static str {
+    if let Ok(v) = std::env::var("TWIG_FILE_OPENER") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "cursor" => return "cursor",
+            "vscode" | "code" => return "vscode",
+            "windsurf" => return "windsurf",
+            "zed" => return "zed",
+            "none" | "copy" => return "copy",
+            "system" | "xdg" => return "system",
+            _ => {}
+        }
+    }
+    if std::env::var_os("CURSOR_TRACE_ID").is_some() {
+        return "cursor";
+    }
+    if std::env::var_os("VSCODE_IPC_HOOK_CLI").is_some() {
+        return "vscode";
+    }
+    if std::env::var_os("ZED_TERM").is_some() {
+        return "zed";
+    }
+    match std::env::var("TERM_PROGRAM")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cursor" => "cursor",
+        "vscode" => "vscode",
+        "windsurf" => "windsurf",
+        "zed" => "zed",
+        _ => "system",
+    }
+}
+
+/// Open a clicked or `/open` target (`https://...`, `file:///path#L42`, or `src/foo.rs:42[:col]`)
+/// using the OS browser or Codex-style `file_opener` (`cursor://`, `vscode://`, `zed://`, or system).
+pub fn open_target_in_os(repo: &str, raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches(['"', '\'', '<', '>']);
+    if trimmed.is_empty() {
+        return Err("empty link target".into());
+    }
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("mailto:")
+    {
+        if std::env::var_os("SSH_CONNECTION").is_some() {
+            copy_to_clipboard(trimmed);
+        }
+        return match spawn_detached_opener(trimmed) {
+            Ok(()) => Ok(format!("Opened {trimmed}")),
+            Err(_) => {
+                copy_to_clipboard(trimmed);
+                Ok(format!("Copied URL to clipboard: {trimmed}"))
+            }
+        };
+    }
+
+    let local_spec = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    let (raw_path, range) = parse_path_and_line_range(local_spec);
+    let candidate = Path::new(raw_path);
+    let resolved = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        Path::new(repo).join(candidate)
+    };
+    let canon = resolved
+        .canonicalize()
+        .map_err(|_| format!("target not found: {trimmed}"))?;
+    let abs = canon.display().to_string();
+    let line = range.map(|(s, _)| s);
+    let scheme = detect_file_opener_scheme();
+    if scheme == "copy" {
+        let loc = line.map(|l| format!("{abs}:{l}")).unwrap_or(abs);
+        copy_to_clipboard(&loc);
+        return Ok(format!("Copied {loc}"));
+    }
+    let uri_or_path = match scheme {
+        "cursor" | "vscode" | "windsurf" | "zed" => {
+            let slash_abs = if abs.starts_with('/') {
+                abs.clone()
+            } else {
+                format!("/{abs}")
+            };
+            match line {
+                Some(l) => format!("{scheme}://file{slash_abs}:{l}:1"),
+                None => format!("{scheme}://file{slash_abs}"),
+            }
+        }
+        _ => abs.clone(),
+    };
+    let label = match line {
+        Some(l) => format!("{}:{l}", shorten_home(&abs)),
+        None => shorten_home(&abs),
+    };
+    match spawn_detached_opener(&uri_or_path) {
+        Ok(()) => Ok(format!("Opened {label}")),
+        Err(_) => {
+            copy_to_clipboard(&label);
+            Ok(format!("Copied path to clipboard: {label}"))
+        }
+    }
+}
+
 fn encode_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);

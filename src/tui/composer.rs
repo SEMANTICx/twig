@@ -71,6 +71,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/deny ", "deny pending tool call by ID"),
     ("/expand", "toggle expanded/collapsed tool outputs (Ctrl+O)"),
     ("/find ", "search transcript history (Ctrl+F)"),
+    ("/open ", "open URL, [n] link footnote, or path:line in browser/editor"),
     ("/copy", "copy latest assistant code block (Alt+Y)"),
     ("/editor", "compose prompt in $EDITOR (Ctrl+G)"),
     ("/mouse", "toggle mouse capture for native text select (Alt+M)"),
@@ -163,6 +164,7 @@ pub enum SlashCommand {
     ResolveApproval { id: String, allow: bool },
     ToggleExpand,
     OpenFind(String),
+    OpenLink(Option<String>),
     CopyCode,
     OpenEditor,
     ToggleMouse,
@@ -262,6 +264,7 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
         "/cancel" => Some(SlashCommand::Cancel),
         "/expand" => Some(SlashCommand::ToggleExpand),
         "/find" => Some(SlashCommand::OpenFind(String::new())),
+        "/open" => Some(SlashCommand::OpenLink(None)),
         "/copy" => Some(SlashCommand::CopyCode),
         "/editor" => Some(SlashCommand::OpenEditor),
         "/mouse" => Some(SlashCommand::ToggleMouse),
@@ -477,6 +480,10 @@ pub fn parse_slash(trimmed: &str, plan_mode: bool) -> Option<SlashCommand> {
     }
     if let Some(arg) = trimmed.strip_prefix("/find ") {
         return Some(SlashCommand::OpenFind(arg.trim().to_owned()));
+    }
+    if let Some(arg) = trimmed.strip_prefix("/open ") {
+        let a = arg.trim();
+        return Some(SlashCommand::OpenLink((!a.is_empty()).then(|| a.to_owned())));
     }
     if let Some(arg) = trimmed.strip_prefix("/steer ") {
         let a = arg.trim();

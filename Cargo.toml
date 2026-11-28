@@ -1,6 +1,6 @@
 [package]
 name = "twig"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A thin, high-discipline coding-agent harness in Rust with a borderless TUI, tiered policy, isolated subagents, and curated skills."
 license = "MIT"

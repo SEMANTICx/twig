@@ -13,7 +13,7 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use super::highlight::{highlight_search, style_output_line, DiffGutterState};
-use super::markdown::{extract_code_blocks, render_markdown};
+use super::markdown::{extract_code_blocks, extract_markdown_links, render_markdown};
 use super::theme::{
     breathing_star, clip_width, display_width, fmt_elapsed_compact, horizontal_pad,
     render_welcome_card, streaming_caret, summarize_tool_args, title_tool_name, tool_glyph,
@@ -1402,6 +1402,21 @@ impl Transcript {
         if cur_x < area.x + area.width {
             frame.set_cursor_position((cur_x, area.y));
         }
+    }
+
+    /// Resolve a 1-based `[n]` link footnote (or latest link when `None`) from assistant replies.
+    pub fn resolve_link_ref(&self, idx: Option<usize>) -> Option<String> {
+        for cell in self.cells.iter().rev() {
+            if let Cell::Assistant(md) = cell {
+                let urls = extract_markdown_links(md);
+                match idx {
+                    Some(n) if n >= 1 && n <= urls.len() => return Some(urls[n - 1].clone()),
+                    None if !urls.is_empty() => return urls.last().cloned(),
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 
     /// Format the full transcript as clean Markdown for `/export`.
