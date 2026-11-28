@@ -16,9 +16,9 @@ use super::client::{
     EVOLVE_PROMPT,
 };
 use super::composer::{parse_slash, SlashCommand};
-use super::markdown::{format_status_notice, FooterMode};
-use super::overlays::{summarize_tool_args, title_tool_name, OverlayPicker};
+use super::overlays::OverlayPicker;
 use super::strips::{parse_todos, BtwCard, SubagentEntry, SubagentStatus, TodoEntry};
+use super::theme::{format_status_notice, summarize_tool_args, title_tool_name, FooterMode};
 use super::transcript::NoticeKind;
 use crate::llm::Llm;
 use super::{Action, App};
@@ -1816,7 +1816,7 @@ fn apply_child_stream_event(tr: &mut super::transcript::Transcript, ev: &Value) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::markdown::MotionMode;
+    use crate::tui::theme::MotionMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
 

@@ -16,9 +16,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use super::markdown::{
-    display_width, wrap_plain, ACCENT, ACCENT_PEAK, BASH_MODE_COLOR, IVORY, MEMORY_MODE_COLOR,
-    MUTED, STONE, SURFACE_HI,
+use super::theme::{
+    clip_width, display_width, horizontal_pad, wrap_plain, ACCENT, ACCENT_PEAK, BASH_MODE_COLOR,
+    IVORY, MEMORY_MODE_COLOR, MUTED, ON_ACCENT_FG, STONE, SURFACE_HI,
 };
 
 /// Codex & Claude Code parity slash command catalog.
@@ -1050,15 +1050,7 @@ impl Composer {
     }
 
     pub fn desired_height(&self, total_width: usize, max_rows: u16) -> u16 {
-        let pad_x = if total_width >= 120 {
-            4
-        } else if total_width >= 80 {
-            3
-        } else if total_width >= 56 {
-            2
-        } else {
-            1
-        };
+        let pad_x = horizontal_pad(total_width);
         let text_w = total_width.saturating_sub(pad_x * 2 + 4).max(12);
         let lines = wrap_plain(&self.text, text_w);
         (lines.len() as u16 + 2).clamp(3, max_rows.max(3))
@@ -1077,15 +1069,7 @@ impl Composer {
         if area.height < 3 || area.width < 10 {
             return;
         }
-        let pad_x: u16 = if area.width >= 120 {
-            4
-        } else if area.width >= 80 {
-            3
-        } else if area.width >= 56 {
-            2
-        } else {
-            1
-        };
+        let pad_x = horizontal_pad(area.width as usize) as u16;
         let pad_str = " ".repeat(pad_x as usize);
         let rule_len = area.width.saturating_sub(pad_x * 2) as usize;
         let is_bash = self.text.starts_with('!');
@@ -1226,7 +1210,7 @@ impl Composer {
         }
         let popup_w = composer_area.width.saturating_sub(2) as usize;
         let sel_bg = ACCENT;
-        let sel_fg = Color::Rgb(22, 19, 17);
+        let sel_fg = ON_ACCENT_FG;
         let cmd_pad = if popup_w < 44 { 10 } else { 14 };
 
         let rows: Vec<Line<'static>> = match popup {
@@ -1243,10 +1227,7 @@ impl Composer {
                         let marker = if active { " › " } else { "   " };
                         let cmd_col = format!("{:<width$}", cmd.trim_end(), width = cmd_pad);
                         let used = display_width(marker) + display_width(&cmd_col);
-                        let desc_clipped: String = desc
-                            .chars()
-                            .take(popup_w.saturating_sub(used + 1))
-                            .collect();
+                        let desc_clipped = clip_width(desc, popup_w.saturating_sub(used + 1));
                         let pad = popup_w.saturating_sub(used + display_width(&desc_clipped));
                         Line::from(vec![
                             Span::styled(
@@ -1290,10 +1271,7 @@ impl Composer {
                         let bg = if active { sel_bg } else { Color::Reset };
                         let marker = if active { " › ◇ " } else { "   ◇ " };
                         let used = display_width(marker);
-                        let clipped: String = path
-                            .chars()
-                            .take(popup_w.saturating_sub(used + 1))
-                            .collect();
+                        let clipped = clip_width(path, popup_w.saturating_sub(used + 1));
                         let pad = popup_w.saturating_sub(used + display_width(&clipped));
                         Line::from(vec![
                             Span::styled(
@@ -1337,10 +1315,7 @@ impl Composer {
                         let tag = if scope == "vault" { " [vault] " } else { " " };
                         let name_col = format!("{name}{tag}");
                         let used = display_width(marker) + display_width(&name_col);
-                        let desc_clipped: String = desc
-                            .chars()
-                            .take(popup_w.saturating_sub(used + 1))
-                            .collect();
+                        let desc_clipped = clip_width(desc, popup_w.saturating_sub(used + 1));
                         let pad = popup_w.saturating_sub(used + display_width(&desc_clipped));
                         Line::from(vec![
                             Span::styled(

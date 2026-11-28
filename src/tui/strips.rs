@@ -13,9 +13,9 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use serde_json::Value;
 
-use super::markdown::{
-    clip_str, display_width, fmt_elapsed_compact, wrap_plain, MotionMode, ACCENT, ACCENT_PEAK,
-    AMBER, BASH_MODE_COLOR, HAIRLINE, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE,
+use super::theme::{
+    clip_width, display_width, fmt_elapsed_compact, horizontal_pad, wrap_plain, MotionMode, ACCENT,
+    ACCENT_PEAK, AMBER, BASH_MODE_COLOR, HAIRLINE, IVORY, MUTED, ROSE, SAGE, STONE, SURFACE,
 };
 
 #[derive(Debug, Clone)]
@@ -63,15 +63,7 @@ pub fn render_todo_strip(frame: &mut Frame, area: Rect, todos: &[TodoEntry], run
         return;
     }
     let width = area.width as usize;
-    let pad_x = if width >= 120 {
-        4
-    } else if width >= 80 {
-        3
-    } else if width >= 56 {
-        2
-    } else {
-        1
-    };
+    let pad_x = horizontal_pad(width);
     let pad = " ".repeat(pad_x);
     let done = todos.iter().filter(|t| t.is_completed()).count();
     let total = todos.len();
@@ -145,7 +137,7 @@ pub fn render_todo_strip(frame: &mut Frame, area: Rect, todos: &[TodoEntry], run
         rows.push(Line::from(vec![
             Span::raw(format!("{pad}  ")),
             Span::styled(format!("{glyph} "), Style::default().fg(color)),
-            Span::styled(clip_str(&item.content, inner), Style::default().fg(text_col)),
+            Span::styled(clip_width(&item.content, inner), Style::default().fg(text_col)),
         ]));
     }
     frame.render_widget(Paragraph::new(rows), area);
@@ -245,15 +237,7 @@ pub fn render_subagent_strip(
         return;
     }
     let width = area.width as usize;
-    let pad_x = if width >= 120 {
-        4
-    } else if width >= 80 {
-        3
-    } else if width >= 56 {
-        2
-    } else {
-        1
-    };
+    let pad_x = horizontal_pad(width);
     let pad = " ".repeat(pad_x);
     let running = visible
         .iter()
@@ -381,7 +365,7 @@ pub fn render_subagent_strip(
         };
         let live_suffix = if entry.status == SubagentStatus::Running {
             entry.activity.as_deref().map(|act| {
-                let compact_act = clip_str(act, task_cap.min(34));
+                let compact_act = clip_width(act, task_cap.min(34));
                 let tc = if entry.tool_count > 0 {
                     format!(
                         " · {} tool{}",
@@ -411,13 +395,13 @@ pub fn render_subagent_strip(
         let summary_text = if entry.status == SubagentStatus::Failed {
             let clean_task = compact_subagent_task(&entry.task, task_cap);
             match &entry.error {
-                Some(err) => clip_str(&format!("[{err}] {clean_task}"), task_cap),
+                Some(err) => clip_width(&format!("[{err}] {clean_task}"), task_cap),
                 None => clean_task,
             }
         } else if live_suffix.is_some() && task_budget < 12 {
             String::new()
         } else {
-            clip_str(
+            clip_width(
                 &compact_subagent_task(&entry.task, task_budget.max(12)),
                 task_budget.max(12),
             )
@@ -486,7 +470,8 @@ pub fn btw_card_height(card: Option<&BtwCard>, width: usize) -> u16 {
     let Some(c) = card else {
         return 0;
     };
-    let inner_w = width.saturating_sub(10).max(16);
+    let pad_x = horizontal_pad(width);
+    let inner_w = width.saturating_sub(pad_x * 2 + 4).max(10);
     let body_rows = match &c.answer {
         None => 1,
         Some(ans) => wrap_plain(ans.trim(), inner_w).len().clamp(1, 6),
@@ -499,19 +484,11 @@ pub fn render_btw_card(frame: &mut Frame, area: Rect, card: &BtwCard) {
         return;
     }
     let width = area.width as usize;
-    let pad_x = if width >= 120 {
-        4
-    } else if width >= 80 {
-        3
-    } else if width >= 56 {
-        2
-    } else {
-        1
-    };
+    let pad_x = horizontal_pad(width);
     let pad = " ".repeat(pad_x);
     let card_w = width.saturating_sub(pad_x * 2).max(12);
     let q_cap = card_w.saturating_sub(28).max(8);
-    let head = format!("✦ /btw · {} ", clip_str(&card.question, q_cap));
+    let head = format!("✦ /btw · {} ", clip_width(&card.question, q_cap));
     let tail_hint = " Esc/Space dismiss ";
     let fill = card_w.saturating_sub(display_width(&head) + display_width(tail_hint) + 2);
     let mut rows = vec![Line::from(vec![
@@ -583,15 +560,7 @@ pub fn render_queued_strip(frame: &mut Frame, area: Rect, queued: &VecDeque<Stri
         return;
     }
     let width = area.width as usize;
-    let pad_x = if width >= 120 {
-        4
-    } else if width >= 80 {
-        3
-    } else if width >= 56 {
-        2
-    } else {
-        1
-    };
+    let pad_x = horizontal_pad(width);
     let pad = " ".repeat(pad_x);
     let max_rows = area.height as usize;
     let total = queued.len();
@@ -615,7 +584,7 @@ pub fn render_queued_strip(frame: &mut Frame, area: Rect, queued: &VecDeque<Stri
                 Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(" {} ", clip_str(&one_line, cap)),
+                format!(" {} ", clip_width(&one_line, cap)),
                 Style::default().fg(IVORY).bg(SURFACE),
             ),
             Span::styled(hint, Style::default().fg(MUTED)),

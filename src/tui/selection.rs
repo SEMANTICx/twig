@@ -6,11 +6,10 @@
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
-const SEL_BG: Color = Color::Rgb(228, 209, 167);
-const SEL_FG: Color = Color::Rgb(28, 32, 34);
+use super::theme::{SEL_BG, SEL_FG};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CellPos {
@@ -199,6 +198,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::layout::Rect;
+    use ratatui::style::Color;
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {

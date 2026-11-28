@@ -1,17 +1,11 @@
 //! Zero-dependency GFM pipe-table layout engine and Unicode LaTeX mathematical
 //! pretty-printer for terminal TUI rendering (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`).
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const ACCENT: Color = Color::Rgb(215, 119, 87);
-const ACCENT_PEAK: Color = Color::Rgb(248, 206, 178);
-const AMBER: Color = Color::Rgb(232, 177, 98);
-const SAGE: Color = Color::Rgb(128, 192, 138);
-const IVORY: Color = Color::Rgb(242, 238, 232);
-const MUTED: Color = Color::Rgb(168, 160, 150);
-const HAIRLINE: Color = Color::Rgb(128, 119, 110);
+use super::theme::{ACCENT, ACCENT_PEAK, AMBER, HAIRLINE, IVORY, MUTED, SAGE};
 
 #[derive(Default)]
 pub(super) struct LinkRegistry {

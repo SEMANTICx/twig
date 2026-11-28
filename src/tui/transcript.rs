@@ -6,19 +6,108 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 use serde_json::Value;
 
-use super::markdown::{
-    breathing_star, clip_str, display_width, extract_code_blocks, fmt_elapsed_compact,
-    highlight_search, render_markdown, render_welcome_card, streaming_caret, style_output_line,
-    tool_glyph, wrap_plain, DiffGutterState, MotionMode, SmoothScroll, ACCENT, AMBER,
-    IVORY, MUTED, ROSE, SAGE, STONE, SURFACE,
+use super::highlight::{highlight_search, style_output_line, DiffGutterState};
+use super::markdown::{extract_code_blocks, render_markdown};
+use super::theme::{
+    breathing_star, clip_width, display_width, fmt_elapsed_compact, horizontal_pad,
+    render_welcome_card, streaming_caret, summarize_tool_args, title_tool_name, tool_glyph,
+    wrap_plain, MotionMode, ACCENT, AMBER, IVORY, MUTED, ON_ACCENT_FG, ROSE, SAGE, STONE, SURFACE,
 };
-use super::overlays::{summarize_tool_args, title_tool_name};
+
+struct SmoothScroll {
+    pos: f64,
+    target: f64,
+    max: usize,
+    auto_follow: bool,
+}
+
+impl SmoothScroll {
+    fn new() -> Self {
+        Self {
+            pos: 0.0,
+            target: 0.0,
+            max: 0,
+            auto_follow: true,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pos = 0.0;
+        self.target = 0.0;
+        self.max = 0;
+        self.auto_follow = true;
+    }
+
+    fn follow_tail(&mut self) {
+        self.auto_follow = true;
+        self.target = self.max as f64;
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        let base = if delta < 0 && self.auto_follow {
+            self.pos.min(self.target)
+        } else {
+            self.target
+        };
+        let next = (base + delta as f64).clamp(0.0, self.max as f64);
+        self.target = next;
+        if delta < 0 {
+            self.auto_follow = false;
+        } else if delta > 0 && next >= self.max as f64 {
+            self.auto_follow = true;
+        }
+    }
+
+    fn jump_to(&mut self, line: usize) {
+        self.auto_follow = false;
+        self.target = (line as f64).min(self.max as f64);
+    }
+
+    fn sync_bounds(&mut self, max_scroll: usize, motion: MotionMode) {
+        self.max = max_scroll;
+        let max_f = max_scroll as f64;
+        if self.auto_follow {
+            self.target = max_f;
+            if motion == MotionMode::Reduced || (max_f - self.pos).abs() > 24.0 {
+                self.pos = max_f;
+            }
+        } else {
+            self.target = self.target.min(max_f);
+            self.pos = self.pos.min(max_f);
+        }
+    }
+
+    fn step(&mut self, dt_secs: f32, motion: MotionMode) {
+        let diff = self.target - self.pos;
+        if motion == MotionMode::Reduced || diff.abs() < 0.25 {
+            self.pos = self.target;
+            return;
+        }
+        let factor = 1.0 - (-(dt_secs.clamp(0.004, 0.1) as f64) * 18.0).exp();
+        self.pos += diff * factor;
+        if (self.target - self.pos).abs() < 0.25 {
+            self.pos = self.target;
+        }
+    }
+
+    fn is_animating(&self, motion: MotionMode) -> bool {
+        motion == MotionMode::Animated && (self.target - self.pos).abs() >= 0.25
+    }
+
+    fn current_offset(&self) -> usize {
+        self.pos.round().clamp(0.0, self.max as f64) as usize
+    }
+
+    fn show_tail_badge(&self) -> bool {
+        !self.auto_follow && self.current_offset() < self.max
+    }
+}
 
 pub struct RenderOpts<'a> {
     pub repo_path: &'a str,
@@ -496,15 +585,7 @@ impl Transcript {
             return render_welcome_card(repo_path, env_summary, width);
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let pad_x: usize = if width >= 120 {
-            4
-        } else if width >= 80 {
-            3
-        } else if width >= 56 {
-            2
-        } else {
-            1
-        };
+        let pad_x = horizontal_pad(width);
         let left_margin = " ".repeat(pad_x);
         let inner = width.saturating_sub(pad_x * 2).max(14);
         let prose_w = inner.saturating_sub(2).max(14);
@@ -690,7 +771,7 @@ impl Transcript {
                     if !tool.summary.is_empty() {
                         header.push(Span::styled("(", Style::default().fg(MUTED)));
                         header.push(Span::styled(
-                            clip_str(&tool.summary, summary_cap),
+                            clip_width(&tool.summary, summary_cap),
                             Style::default().fg(if is_edit_tool { IVORY } else { STONE }),
                         ));
                         header.push(Span::styled(")", Style::default().fg(MUTED)));
@@ -763,7 +844,7 @@ impl Transcript {
                                 .copied()
                                 .unwrap_or("");
                             let clipped =
-                                clip_str(first_preview.trim(), inner.saturating_sub(34).min(96));
+                                clip_width(first_preview.trim(), inner.saturating_sub(34).min(96));
                             let mut spans = vec![
                                 Span::raw(left_margin.clone()),
                                 Span::styled("  ⎿  ", Style::default().fg(MUTED)),
@@ -1094,7 +1175,7 @@ impl Transcript {
             ];
             if !t.summary.is_empty() {
                 spans.push(Span::styled(
-                    format!("({})", clip_str(&t.summary, sum_cap)),
+                    format!("({})", clip_width(&t.summary, sum_cap)),
                     Style::default().fg(MUTED),
                 ));
             }
@@ -1229,7 +1310,7 @@ impl Transcript {
             frame.render_widget(
                 Paragraph::new(badge).style(
                     Style::default()
-                        .fg(Color::Rgb(24, 20, 18))
+                        .fg(ON_ACCENT_FG)
                         .bg(ACCENT)
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -1344,6 +1425,20 @@ fn count_diff_changes(diff_text: &str) -> (usize, usize) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn smooth_scroll_eases_gradually_and_snaps_in_reduced_motion() {
+        let mut scroll = SmoothScroll::new();
+        scroll.sync_bounds(40, MotionMode::Animated);
+        scroll.scroll_by(-20);
+        assert!(scroll.is_animating(MotionMode::Animated));
+        scroll.step(0.016, MotionMode::Animated);
+        let mid = scroll.current_offset();
+        assert!(mid < 40 && mid > 20, "expected intermediate ease, got {mid}");
+
+        scroll.step(0.016, MotionMode::Reduced);
+        assert_eq!(scroll.current_offset(), 20);
+    }
 
     #[test]
     fn export_markdown_formats_conversation_and_tools() {

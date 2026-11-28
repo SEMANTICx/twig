@@ -9,12 +9,14 @@
 
 mod client;
 mod composer;
+mod highlight;
 mod markdown;
 mod math_table;
 mod overlays;
 mod selection;
 mod slash;
 mod strips;
+mod theme;
 mod transcript;
 
 use std::io::{self, IsTerminal};
@@ -28,7 +30,7 @@ use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
@@ -39,19 +41,18 @@ use self::client::{
     notify_osc99, shorten_home, LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
 };
 use self::composer::{Composer, SlashCommand};
-use self::markdown::{
-    active_rule_color, breathing_star, fmt_elapsed_compact, render_footer, shimmer_is_sweeping,
-    summary_shimmer, FooterMode, FooterView, MotionMode, ACCENT, AMBER, BASH_MODE_COLOR, HAIRLINE,
-    HAIRLINE_FOCUS, IVORY, MUTED,
-};
-use self::overlays::{
-    title_tool_name, ApprovalKeyResult, ApprovalQueue, OverlayPicker, PickerOutcome,
-};
+use self::overlays::{ApprovalKeyResult, ApprovalQueue, OverlayPicker, PickerOutcome};
 use self::selection::{MouseSelectAction, TextSelection};
 use self::strips::{
     btw_card_height, queued_strip_height, render_btw_card, render_queued_strip,
     render_subagent_strip, render_todo_strip, subagent_strip_height, todo_strip_height, BtwCard,
     SubagentEntry, SubagentStatus, TodoEntry,
+};
+use self::theme::{
+    active_rule_color, breathing_star, fmt_elapsed_compact, horizontal_pad, render_footer,
+    shimmer_is_sweeping, summary_shimmer, title_tool_name, FooterMode, FooterView, MotionMode,
+    ACCENT, AMBER, BASH_MODE_COLOR, HAIRLINE, HAIRLINE_FOCUS, IVORY, MUTED, ON_ACCENT_FG,
+    SUBAGENT_BANNER_BG,
 };
 use self::transcript::{NoticeKind, RenderOpts, Transcript};
 use crate::llm::{Llm, Provider};
@@ -1041,12 +1042,12 @@ impl App {
                 .filter(|s| s.tool_count > 0)
                 .map(|s| format!(" · {} tools", s.tool_count))
                 .unwrap_or_default();
-            let banner_bg = Color::Rgb(28, 36, 40);
+            let banner_bg = SUBAGENT_BANNER_BG;
             let banner_line = Line::from(vec![
                 Span::styled(
                     format!(" ◈ Subagent [{role}] "),
                     Style::default()
-                        .fg(Color::Rgb(20, 20, 20))
+                        .fg(ON_ACCENT_FG)
                         .bg(BASH_MODE_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
@@ -1107,15 +1108,7 @@ impl App {
         }
 
         if activity_h > 0 {
-            let act_pad = if area.width >= 120 {
-                "    "
-            } else if area.width >= 80 {
-                "   "
-            } else if area.width >= 56 {
-                "  "
-            } else {
-                " "
-            };
+            let act_pad = " ".repeat(horizontal_pad(area.width as usize));
             let pretty_elapsed = fmt_elapsed_compact(run_elapsed.as_secs());
             let mut spans = vec![
                 Span::raw(act_pad),

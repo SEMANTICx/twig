@@ -12,12 +12,13 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use crate::runtime::session::SessionInfo;
-use super::markdown::{
-    clip_str, display_width, fmt_elapsed_compact, wrap_plain, DiffGutterState, ACCENT, ACCENT_PEAK,
-    AMBER, BASH_MODE_COLOR, IVORY, MEMORY_MODE_COLOR, MUTED, ROSE, SAGE, STONE, SURFACE,
-    SURFACE_HI,
-};
+use super::highlight::DiffGutterState;
 use super::strips::{compact_subagent_task, SubagentEntry, SubagentStatus};
+use super::theme::{
+    clip_width, display_width, fmt_elapsed_compact, summarize_tool_args, title_tool_name,
+    wrap_plain, ACCENT, ACCENT_PEAK, AMBER, BASH_MODE_COLOR, IVORY, MEMORY_MODE_COLOR, MUTED,
+    ON_ACCENT_FG, ROSE, SAGE, STONE, SURFACE, SURFACE_HI,
+};
 
 #[derive(Debug, Clone)]
 struct PendingApproval {
@@ -237,7 +238,7 @@ fn build_approval_preview(name: &str, args: &Value, max_w: usize) -> Vec<Line<'s
             let mut lines = vec![Line::from(vec![
                 Span::styled("  ✎ ", Style::default().fg(ACCENT)),
                 Span::styled(
-                    clip_str(path, w.saturating_sub(4)),
+                    clip_width(path, w.saturating_sub(4)),
                     Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
                 ),
             ])];
@@ -257,12 +258,12 @@ fn build_approval_preview(name: &str, args: &Value, max_w: usize) -> Vec<Line<'s
             let mut lines = vec![Line::from(vec![
                 Span::styled("  + ", Style::default().fg(SAGE)),
                 Span::styled(
-                    clip_str(path, w.saturating_sub(4)),
+                    clip_width(path, w.saturating_sub(4)),
                     Style::default().fg(IVORY).add_modifier(Modifier::BOLD),
                 ),
             ])];
             for raw in body.lines().take(4) {
-                let shown = clip_str(raw, w.saturating_sub(4));
+                let shown = clip_width(raw, w.saturating_sub(4));
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(shown, Style::default().fg(STONE).bg(SURFACE)),
@@ -322,7 +323,7 @@ fn render_approval_panel(
         let bg = if active { SURFACE_HI } else { Color::Reset };
         let marker = if active { " ▸ " } else { "   " };
         let fg = if active { IVORY } else { STONE };
-        let shown = clip_str(label, inner_w.saturating_sub(display_width(marker)));
+        let shown = clip_width(label, inner_w.saturating_sub(display_width(marker)));
         let pad = inner_w.saturating_sub(display_width(marker) + display_width(&shown));
         Line::from(vec![
             Span::raw(if compact { " " } else { "  " }),
@@ -369,7 +370,7 @@ fn render_approval_panel(
     let mut rows = vec![
         Line::from(Span::styled(rule.clone(), Style::default().fg(AMBER))),
         Line::from(Span::styled(
-            clip_str(&title, area.width as usize),
+            clip_width(&title, area.width as usize),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         )),
     ];
@@ -771,6 +772,74 @@ impl OverlayPicker {
     }
 }
 
+fn selected_window(total: usize, max_rows: usize, sel: usize) -> (usize, usize, usize) {
+    let clamped_sel = sel.min(total.saturating_sub(1));
+    let cap = max_rows.max(1);
+    let start = clamped_sel.saturating_sub(cap.saturating_sub(1));
+    let end = (start + cap).min(total);
+    (clamped_sel, start, end)
+}
+
+fn render_picker_frame(
+    frame: &mut Frame,
+    area: Rect,
+    rule_color: Color,
+    header: Line<'static>,
+    body: Vec<Line<'static>>,
+) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+    let rule = format!(" {}", "─".repeat(area.width.saturating_sub(2) as usize));
+    let mut rows = Vec::with_capacity(body.len() + 3);
+    rows.push(Line::from(Span::styled(
+        rule.clone(),
+        Style::default().fg(rule_color),
+    )));
+    rows.push(header);
+    rows.extend(body);
+    rows.push(Line::from(Span::styled(
+        rule,
+        Style::default().fg(rule_color),
+    )));
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+fn picker_row(
+    row_w: usize,
+    is_sel: bool,
+    accent_color: Color,
+    mut middle: Vec<Span<'static>>,
+) -> Line<'static> {
+    let bg = if is_sel { accent_color } else { Color::Reset };
+    let marker = if is_sel { " › " } else { "   " };
+    let mut used = display_width(marker);
+    for sp in &middle {
+        used += display_width(sp.content.as_ref());
+    }
+    let pad = row_w.saturating_sub(used);
+    let mut spans = Vec::with_capacity(middle.len() + 3);
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        marker,
+        Style::default()
+            .fg(if is_sel { ON_ACCENT_FG } else { accent_color })
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.append(&mut middle);
+    spans.push(Span::styled(" ".repeat(pad), Style::default().bg(bg)));
+    Line::from(spans)
+}
+
+fn filtered_models<'a>(all: &'a [String], filter: &str) -> Vec<&'a str> {
+    let q = filter.trim().to_lowercase();
+    all.iter()
+        .map(String::as_str)
+        .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
+        .collect()
+}
+
 fn render_tasks_picker(
     frame: &mut Frame,
     area: Rect,
@@ -782,43 +851,33 @@ fn render_tasks_picker(
     if area.height < 4 || area.width < 20 {
         return;
     }
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
     let total = subagents.len() + tasks.len();
-    let sel = sel.min(total.saturating_sub(1));
-
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(BASH_MODE_COLOR))),
-        Line::from(Span::styled(
-            format!(
-                "  Subagents ({}) & Tasks ({})  (↑/↓ · v view live · Enter trace · x kill · Esc)",
-                subagents.len(),
-                tasks.len()
-            ),
-            Style::default().fg(BASH_MODE_COLOR).add_modifier(Modifier::BOLD),
-        )),
-    ];
-
+    let header = Line::from(Span::styled(
+        format!(
+            "  Subagents ({}) & Tasks ({})  (↑/↓ · v view live · Enter trace · x kill · Esc)",
+            subagents.len(),
+            tasks.len()
+        ),
+        Style::default()
+            .fg(BASH_MODE_COLOR)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let mut body = Vec::new();
     if total == 0 {
-        rows.push(Line::from(Span::styled(
+        body.push(Line::from(Span::styled(
             "   (no active subagents or background tasks — press Ctrl+B during a bash run to detach)",
             Style::default().fg(MUTED),
         )));
     } else {
         let reserve_detail = if expanded { 3usize } else { 0usize };
-        let max_list = (area.height.saturating_sub(3) as usize)
-            .saturating_sub(reserve_detail)
-            .max(1);
-        let start = sel.saturating_sub(max_list.saturating_sub(1));
-        let end = (start + max_list).min(total);
+        let max_list = (area.height.saturating_sub(3) as usize).saturating_sub(reserve_detail);
+        let (sel, start, end) = selected_window(total, max_list, sel);
         let mut selected_detail: Option<String> = None;
 
         for idx in start..end {
             let is_sel = idx == sel;
             let bg = if is_sel { BASH_MODE_COLOR } else { Color::Reset };
-            let marker = if is_sel { " › " } else { "   " };
             let (badge, badge_col, label, detail) = if idx < subagents.len() {
                 let s = &subagents[idx];
                 let dur = s
@@ -886,33 +945,28 @@ fn render_tasks_picker(
             if is_sel {
                 selected_detail = Some(detail);
             }
-            let used = display_width(marker) + display_width(badge);
-            let shown = clip_str(&label, row_w.saturating_sub(used + 2));
-            let pad = row_w.saturating_sub(used + display_width(&shown));
-            rows.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { BASH_MODE_COLOR })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    badge,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { badge_col })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    shown,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { IVORY })
-                        .bg(bg),
-                ),
-                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            ]));
+            let used = 3 + display_width(badge);
+            let shown = clip_width(&label, row_w.saturating_sub(used + 2));
+            body.push(picker_row(
+                row_w,
+                is_sel,
+                BASH_MODE_COLOR,
+                vec![
+                    Span::styled(
+                        badge,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { badge_col })
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        shown,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                            .bg(bg),
+                    ),
+                ],
+            ));
         }
 
         if expanded {
@@ -922,7 +976,7 @@ fn render_tasks_picker(
                     .flat_map(|line| wrap_plain(line, row_w.saturating_sub(6)))
                     .take(3)
                 {
-                    rows.push(Line::from(vec![
+                    body.push(Line::from(vec![
                         Span::styled("    ⎿  ", Style::default().fg(MUTED)),
                         Span::styled(seg, Style::default().fg(STONE).bg(SURFACE)),
                     ]));
@@ -930,154 +984,113 @@ fn render_tasks_picker(
             }
         }
     }
-    rows.push(Line::from(Span::styled(
-        rule,
-        Style::default().fg(BASH_MODE_COLOR),
-    )));
-    frame.render_widget(Paragraph::new(rows), area);
+    render_picker_frame(frame, area, BASH_MODE_COLOR, header, body);
 }
 
 fn render_memory_picker(frame: &mut Frame, area: Rect, note: &str, sel: usize) {
     if area.height < 4 || area.width < 20 {
         return;
     }
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
     let choices = [
         ("1. Project memory", ".twig/preferences.md (shared with this repo)"),
         ("2. Global memory ", "~/.config/twig/preferences.md (all repos)"),
     ];
-    let mut rows = vec![
-        Line::from(Span::styled(
-            rule.clone(),
-            Style::default().fg(MEMORY_MODE_COLOR),
-        )),
-        Line::from(vec![
-            Span::styled(
-                "  ♯ Save memory: ",
-                Style::default()
-                    .fg(MEMORY_MODE_COLOR)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                clip_str(note, row_w.saturating_sub(18)),
-                Style::default().fg(IVORY),
-            ),
-        ]),
-    ];
-    for (idx, (k, desc)) in choices.iter().enumerate() {
-        let is_sel = idx == sel;
-        let bg = if is_sel { MEMORY_MODE_COLOR } else { Color::Reset };
-        let marker = if is_sel { " › " } else { "   " };
-        let text = format!("{k}  ·  {desc}");
-        let shown = clip_str(&text, row_w.saturating_sub(display_width(marker) + 1));
-        let pad = row_w.saturating_sub(display_width(marker) + display_width(&shown));
-        rows.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                marker,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { MEMORY_MODE_COLOR })
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                shown,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { IVORY })
-                    .bg(bg)
-                    .add_modifier(if is_sel {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        ]));
-    }
-    rows.push(Line::from(Span::styled(
-        rule,
-        Style::default().fg(MEMORY_MODE_COLOR),
-    )));
-    frame.render_widget(Paragraph::new(rows), area);
+    let header = Line::from(vec![
+        Span::styled(
+            "  ♯ Save memory: ",
+            Style::default()
+                .fg(MEMORY_MODE_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            clip_width(note, row_w.saturating_sub(18)),
+            Style::default().fg(IVORY),
+        ),
+    ]);
+    let body = choices
+        .iter()
+        .enumerate()
+        .map(|(idx, (k, desc))| {
+            let is_sel = idx == sel;
+            let bg = if is_sel { MEMORY_MODE_COLOR } else { Color::Reset };
+            let shown = clip_width(&format!("{k}  ·  {desc}"), row_w.saturating_sub(4));
+            picker_row(
+                row_w,
+                is_sel,
+                MEMORY_MODE_COLOR,
+                vec![Span::styled(
+                    shown,
+                    Style::default()
+                        .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                        .bg(bg)
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )],
+            )
+        })
+        .collect();
+    render_picker_frame(frame, area, MEMORY_MODE_COLOR, header, body);
 }
 
 fn render_effort_picker(frame: &mut Frame, area: Rect, active: Option<&str>, sel: usize) {
     if area.height < 4 || area.width < 20 {
         return;
     }
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
     let current = active.unwrap_or("off");
-
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
-        Line::from(Span::styled(
-            "  Reasoning effort  (↑/↓ select · Enter apply · Esc cancel)",
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    for (idx, (level, desc)) in EFFORT_LEVELS.iter().enumerate() {
-        let is_sel = idx == sel;
-        let bg = if is_sel { ACCENT } else { Color::Reset };
-        let marker = if is_sel { " › " } else { "   " };
-        let col = format!("{level:<8}");
-        let badge = if *level == current { "  (active)" } else { "" };
-        let used = display_width(marker) + display_width(&col) + display_width(badge);
-        let d = clip_str(desc, row_w.saturating_sub(used + 2));
-        let pad = row_w.saturating_sub(used + display_width(&d));
-        rows.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                marker,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { ACCENT })
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                col,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { IVORY })
-                    .bg(bg)
-                    .add_modifier(if is_sel {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(
-                d,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { STONE })
-                    .bg(bg),
-            ),
-            Span::styled(
-                badge,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { SAGE })
-                    .bg(bg),
-            ),
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        ]));
-    }
-    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
-    frame.render_widget(Paragraph::new(rows), area);
-}
-
-
-fn filtered_models<'a>(all: &'a [String], filter: &str) -> Vec<&'a str> {
-    let q = filter.trim().to_lowercase();
-    all.iter()
-        .map(String::as_str)
-        .filter(|m| q.is_empty() || m.to_lowercase().contains(&q))
-        .collect()
+    let header = Line::from(Span::styled(
+        "  Reasoning effort  (↑/↓ select · Enter apply · Esc cancel)",
+        Style::default()
+            .fg(ACCENT_PEAK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let body = EFFORT_LEVELS
+        .iter()
+        .enumerate()
+        .map(|(idx, (level, desc))| {
+            let is_sel = idx == sel;
+            let bg = if is_sel { ACCENT } else { Color::Reset };
+            let col = format!("{level:<8}");
+            let badge = if *level == current { "  (active)" } else { "" };
+            let used = 3 + display_width(&col) + display_width(badge);
+            let d = clip_width(desc, row_w.saturating_sub(used + 2));
+            picker_row(
+                row_w,
+                is_sel,
+                ACCENT,
+                vec![
+                    Span::styled(
+                        col,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                            .bg(bg)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        d,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { STONE })
+                            .bg(bg),
+                    ),
+                    Span::styled(
+                        badge,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { SAGE })
+                            .bg(bg),
+                    ),
+                ],
+            )
+        })
+        .collect();
+    render_picker_frame(frame, area, ACCENT, header, body);
 }
 
 fn render_model_picker(
@@ -1092,16 +1105,8 @@ fn render_model_picker(
         return;
     }
     let items = filtered_models(all, filter);
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
-    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
-    let sel = sel.min(items.len().saturating_sub(1));
-    let start = sel.saturating_sub(max_rows.saturating_sub(1));
-    let end = (start + max_rows).min(items.len());
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
-
-    let header = if filter.is_empty() {
+    let header_text = if filter.is_empty() {
         format!(
             "  Select model ({} via magpie · type to filter · Enter apply)",
             all.len()
@@ -1109,64 +1114,58 @@ fn render_model_picker(
     } else {
         format!("  Select model  filter: {filter}  ({} matches)", items.len())
     };
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
-        Line::from(Span::styled(
-            header,
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    if items.is_empty() {
-        rows.push(Line::from(Span::styled(
+    let header = Line::from(Span::styled(
+        header_text,
+        Style::default()
+            .fg(ACCENT_PEAK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let body = if items.is_empty() {
+        vec![Line::from(Span::styled(
             "   (no matching models)",
             Style::default().fg(MUTED),
-        )));
+        ))]
     } else {
-        for (offset, name) in items[start..end].iter().enumerate() {
-            let is_sel = start + offset == sel;
-            let is_current = *name == active_model;
-            let bg = if is_sel { ACCENT } else { Color::Reset };
-            let marker = if is_sel { " › " } else { "   " };
-            let badge = if is_current { "  (active)" } else { "" };
-            let used = display_width(marker) + display_width(badge);
-            let label = clip_str(name, row_w.saturating_sub(used + 2));
-            let pad = row_w.saturating_sub(used + display_width(&label));
-            rows.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { ACCENT })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { IVORY })
-                        .bg(bg)
-                        .add_modifier(if is_sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    badge,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { SAGE })
-                        .bg(bg),
-                ),
-                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            ]));
-        }
-    }
-    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
-    frame.render_widget(Paragraph::new(rows), area);
+        let (sel, start, end) =
+            selected_window(items.len(), area.height.saturating_sub(3) as usize, sel);
+        items[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, name)| {
+                let is_sel = start + offset == sel;
+                let bg = if is_sel { ACCENT } else { Color::Reset };
+                let badge = if *name == active_model { "  (active)" } else { "" };
+                let used = 3 + display_width(badge);
+                let label = clip_width(name, row_w.saturating_sub(used + 2));
+                picker_row(
+                    row_w,
+                    is_sel,
+                    ACCENT,
+                    vec![
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                                .bg(bg)
+                                .add_modifier(if is_sel {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        ),
+                        Span::styled(
+                            badge,
+                            Style::default()
+                                .fg(if is_sel { ON_ACCENT_FG } else { SAGE })
+                                .bg(bg),
+                        ),
+                    ],
+                )
+            })
+            .collect()
+    };
+    render_picker_frame(frame, area, ACCENT, header, body);
 }
-
 
 fn render_resume_picker(
     frame: &mut Frame,
@@ -1178,169 +1177,141 @@ fn render_resume_picker(
     if area.height < 4 || area.width < 20 {
         return;
     }
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
-    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
-    let sel = sel.min(sessions.len().saturating_sub(1));
-    let start = sel.saturating_sub(max_rows.saturating_sub(1));
-    let end = (start + max_rows).min(sessions.len());
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
     let scope = if all_repos { "all repos" } else { "current repo" };
-
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
-        Line::from(Span::styled(
-            format!("  Resume session [{scope}]  (↑/↓ select · Enter open · a toggle scope · Esc cancel)"),
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    if sessions.is_empty() {
-        rows.push(Line::from(Span::styled(
+    let header = Line::from(Span::styled(
+        format!("  Resume session [{scope}]  (↑/↓ select · Enter open · a toggle scope · Esc cancel)"),
+        Style::default()
+            .fg(ACCENT_PEAK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let body = if sessions.is_empty() {
+        vec![Line::from(Span::styled(
             "   (no sessions in scope — press 'a' to toggle all repos)",
             Style::default().fg(MUTED),
-        )));
+        ))]
     } else {
-        for (offset, s) in sessions[start..end].iter().enumerate() {
-            let active = start + offset == sel;
-            let bg = if active { ACCENT } else { Color::Reset };
-            let marker = if active { " › " } else { "   " };
-            let (inbox_tag, inbox_color) = match s.status.as_str() {
-                "approval" => ("▲ wait ", AMBER),
-                "running" => ("● run  ", ACCENT),
-                "dirty" => ("● diff ", ACCENT_PEAK),
-                _ => ("✓ ok   ", SAGE),
-            };
-            let age_col = format!("{:<8}", s.age);
-            let short_sid: String = s.sid.chars().take(8).collect();
-            let br = s
-                .branch
-                .as_deref()
-                .filter(|b| !b.is_empty())
-                .map(|b| format!(" · {b}"))
-                .unwrap_or_default();
-            let meta = format!("  t{}{br} · {short_sid}", s.turns);
-            let used = display_width(marker)
-                + display_width(inbox_tag)
-                + display_width(&age_col)
-                + display_width(&meta);
-            let label = clip_str(&s.label, row_w.saturating_sub(used + 2));
-            let pad = row_w.saturating_sub(used + display_width(&label));
-            rows.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(if active { sel_fg } else { ACCENT })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    inbox_tag,
-                    Style::default()
-                        .fg(if active { sel_fg } else { inbox_color })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    age_col,
-                    Style::default()
-                        .fg(if active { sel_fg } else { MUTED })
-                        .bg(bg),
-                ),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(if active { sel_fg } else { IVORY })
-                        .bg(bg)
-                        .add_modifier(if active {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    meta,
-                    Style::default()
-                        .fg(if active { sel_fg } else { STONE })
-                        .bg(bg),
-                ),
-                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            ]));
-        }
-    }
-    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
-    frame.render_widget(Paragraph::new(rows), area);
+        let (sel, start, end) =
+            selected_window(sessions.len(), area.height.saturating_sub(3) as usize, sel);
+        sessions[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, s)| {
+                let active = start + offset == sel;
+                let bg = if active { ACCENT } else { Color::Reset };
+                let (inbox_tag, inbox_color) = match s.status.as_str() {
+                    "approval" => ("▲ wait ", AMBER),
+                    "running" => ("● run  ", ACCENT),
+                    "dirty" => ("● diff ", ACCENT_PEAK),
+                    _ => ("✓ ok   ", SAGE),
+                };
+                let age_col = format!("{:<8}", s.age);
+                let short_sid: String = s.sid.chars().take(8).collect();
+                let br = s
+                    .branch
+                    .as_deref()
+                    .filter(|b| !b.is_empty())
+                    .map(|b| format!(" · {b}"))
+                    .unwrap_or_default();
+                let meta = format!("  t{}{br} · {short_sid}", s.turns);
+                let used =
+                    3 + display_width(inbox_tag) + display_width(&age_col) + display_width(&meta);
+                let label = clip_width(&s.label, row_w.saturating_sub(used + 2));
+                picker_row(
+                    row_w,
+                    active,
+                    ACCENT,
+                    vec![
+                        Span::styled(
+                            inbox_tag,
+                            Style::default()
+                                .fg(if active { ON_ACCENT_FG } else { inbox_color })
+                                .bg(bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            age_col,
+                            Style::default()
+                                .fg(if active { ON_ACCENT_FG } else { MUTED })
+                                .bg(bg),
+                        ),
+                        Span::styled(
+                            label,
+                            Style::default()
+                                .fg(if active { ON_ACCENT_FG } else { IVORY })
+                                .bg(bg)
+                                .add_modifier(if active {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        ),
+                        Span::styled(
+                            meta,
+                            Style::default()
+                                .fg(if active { ON_ACCENT_FG } else { STONE })
+                                .bg(bg),
+                        ),
+                    ],
+                )
+            })
+            .collect()
+    };
+    render_picker_frame(frame, area, ACCENT, header, body);
 }
-
 
 fn render_rewind_picker(frame: &mut Frame, area: Rect, turns: &[String], sel: usize) {
     if area.height < 4 || area.width < 20 {
         return;
     }
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
-    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
-    let sel = sel.min(turns.len().saturating_sub(1));
-    let start = sel.saturating_sub(max_rows.saturating_sub(1));
-    let end = (start + max_rows).min(turns.len());
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
-
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
-        Line::from(Span::styled(
-            "  Rewind to turn  (Enter chat only · r chat + restore files · f fork · Esc cancel)",
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    for (offset, prompt) in turns[start..end].iter().enumerate() {
-        let idx = start + offset;
-        let is_sel = idx == sel;
-        let bg = if is_sel { ACCENT } else { Color::Reset };
-        let marker = if is_sel { " › " } else { "   " };
-        let num = format!("#{:<3}", idx + 1);
-        let one_line = prompt.replace('\n', " ");
-        let used = display_width(marker) + display_width(&num);
-        let label = clip_str(&one_line, row_w.saturating_sub(used + 2));
-        let pad = row_w.saturating_sub(used + display_width(&label));
-        rows.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                marker,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { ACCENT })
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                num,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { MUTED })
-                    .bg(bg),
-            ),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(if is_sel { sel_fg } else { IVORY })
-                    .bg(bg)
-                    .add_modifier(if is_sel {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-        ]));
-    }
-    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
-    frame.render_widget(Paragraph::new(rows), area);
+    let header = Line::from(Span::styled(
+        "  Rewind to turn  (Enter chat only · r chat + restore files · f fork · Esc cancel)",
+        Style::default()
+            .fg(ACCENT_PEAK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let (sel, start, end) =
+        selected_window(turns.len(), area.height.saturating_sub(3) as usize, sel);
+    let body = turns[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, prompt)| {
+            let idx = start + offset;
+            let is_sel = idx == sel;
+            let bg = if is_sel { ACCENT } else { Color::Reset };
+            let num = format!("#{:<3}", idx + 1);
+            let one_line = prompt.replace('\n', " ");
+            let used = 3 + display_width(&num);
+            let label = clip_width(&one_line, row_w.saturating_sub(used + 2));
+            picker_row(
+                row_w,
+                is_sel,
+                ACCENT,
+                vec![
+                    Span::styled(
+                        num,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { MUTED })
+                            .bg(bg),
+                    ),
+                    Span::styled(
+                        label,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                            .bg(bg)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ],
+            )
+        })
+        .collect();
+    render_picker_frame(frame, area, ACCENT, header, body);
 }
-
 
 fn render_history_picker(
     frame: &mut Frame,
@@ -1353,16 +1324,8 @@ fn render_history_picker(
         return;
     }
     let items = filtered_models(all, filter);
-    let rule_len = area.width.saturating_sub(2) as usize;
-    let rule = format!(" {}", "─".repeat(rule_len));
-    let max_rows = (area.height.saturating_sub(3) as usize).max(1);
-    let sel = sel.min(items.len().saturating_sub(1));
-    let start = sel.saturating_sub(max_rows.saturating_sub(1));
-    let end = (start + max_rows).min(items.len());
     let row_w = area.width.saturating_sub(2) as usize;
-    let sel_fg = Color::Rgb(22, 19, 17);
-
-    let header = if filter.is_empty() {
+    let header_text = if filter.is_empty() {
         format!(
             "  Prompt history ({} saved · type to search · Enter fill)",
             all.len()
@@ -1373,103 +1336,46 @@ fn render_history_picker(
             items.len()
         )
     };
-    let mut rows = vec![
-        Line::from(Span::styled(rule.clone(), Style::default().fg(ACCENT))),
-        Line::from(Span::styled(
-            header,
-            Style::default()
-                .fg(ACCENT_PEAK)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    if items.is_empty() {
-        rows.push(Line::from(Span::styled(
+    let header = Line::from(Span::styled(
+        header_text,
+        Style::default()
+            .fg(ACCENT_PEAK)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let body = if items.is_empty() {
+        vec![Line::from(Span::styled(
             "   (no matching prompts)",
             Style::default().fg(MUTED),
-        )));
+        ))]
     } else {
-        for (offset, entry) in items[start..end].iter().enumerate() {
-            let is_sel = start + offset == sel;
-            let bg = if is_sel { ACCENT } else { Color::Reset };
-            let marker = if is_sel { " › " } else { "   " };
-            let one_line = entry.replace('\n', " ↵ ");
-            let label = clip_str(&one_line, row_w.saturating_sub(display_width(marker) + 2));
-            let pad = row_w.saturating_sub(display_width(marker) + display_width(&label));
-            rows.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { ACCENT })
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(if is_sel { sel_fg } else { IVORY })
-                        .bg(bg)
-                        .add_modifier(if is_sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(" ".repeat(pad), Style::default().bg(bg)),
-            ]));
-        }
-    }
-    rows.push(Line::from(Span::styled(rule, Style::default().fg(ACCENT))));
-    frame.render_widget(Paragraph::new(rows), area);
-}
-
-
-pub fn title_tool_name(name: &str) -> String {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => "Tool".into(),
-    }
-}
-
-pub fn summarize_tool_args(name: &str, args: &Value) -> String {
-    if name == "todo" {
-        let n = args["items"].as_array().map_or(0, Vec::len);
-        return format!("{n} items");
-    }
-    if name == "mcp" {
-        let srv = args["server"].as_str().unwrap_or("");
-        let action = args["action"].as_str().unwrap_or("call");
-        let target = args["prompt"]
-            .as_str()
-            .or_else(|| args["uri"].as_str())
-            .or_else(|| args["tool"].as_str())
-            .unwrap_or(action);
-        return clip_str(&format!("{srv}/{target}"), 92);
-    }
-    if name == "task" {
-        let action = args["action"].as_str().unwrap_or("list");
-        let detail = args["command"]
-            .as_str()
-            .or_else(|| args["id"].as_str())
-            .unwrap_or("");
-        let summary = if detail.is_empty() {
-            action.to_owned()
-        } else {
-            format!("{action} {detail}")
-        };
-        return clip_str(&summary.replace('\n', " "), 92);
-    }
-    let raw = match name {
-        "bash" => args["command"].as_str().unwrap_or(""),
-        "read" | "edit" | "write" => args["path"].as_str().unwrap_or(""),
-        "outline" => args["path"].as_str().unwrap_or("."),
-        "apply_patch" => "patch",
-        "grep" | "glob" => args["pattern"].as_str().unwrap_or(""),
-        "skill" => args["name"].as_str().unwrap_or("list"),
-        "subagent" => args["task"].as_str().unwrap_or(""),
-        "papercut" => args["component"].as_str().unwrap_or(""),
-        _ => "",
+        let (sel, start, end) =
+            selected_window(items.len(), area.height.saturating_sub(3) as usize, sel);
+        items[start..end]
+            .iter()
+            .enumerate()
+            .map(|(offset, entry)| {
+                let is_sel = start + offset == sel;
+                let bg = if is_sel { ACCENT } else { Color::Reset };
+                let one_line = entry.replace('\n', " ↵ ");
+                let label = clip_width(&one_line, row_w.saturating_sub(5));
+                picker_row(
+                    row_w,
+                    is_sel,
+                    ACCENT,
+                    vec![Span::styled(
+                        label,
+                        Style::default()
+                            .fg(if is_sel { ON_ACCENT_FG } else { IVORY })
+                            .bg(bg)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    )],
+                )
+            })
+            .collect()
     };
-    clip_str(&raw.replace('\n', " "), 92)
+    render_picker_frame(frame, area, ACCENT, header, body);
 }
