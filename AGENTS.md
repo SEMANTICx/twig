@@ -3,38 +3,30 @@
 `twig` is a thin, high-discipline coding-agent harness written in Rust.
 **magpie provides the models; twig provides the loop, tools, policy, verifier, TUI, and tamper-evident record.**
 
-## Architecture
+## 7-Layer Downward Architecture (Enforced by `tests/architecture.rs`)
 
-- `src/main.rs` — CLI entrypoint (`chat`, `exec`, `session`, `serve`, `selfcheck`, `doctor`, `config`, `skill`, `eval`, `improve`, `automate`, `subagent`, `review`, `record`, `classify`, `playbooks`, `decisions`).
-- `src/config.rs` — `HarnessConfig` (`harness.json` tunable surface + XDG paths + shared `IGNORED_DIRS`). Optimizer may only touch `harness.json`, never source code or judges.
-- `src/llm/` — OpenAI-compatible SSE client (`Provider`), persistent per-role model & effort routing (`~/.config/twig/roles.json` for `plan`, `advisor`, `code`, `scout`, `reviewer` with `model.txt` fallback), usage/cache tracking.
-- `src/runtime/` — Core daemon & execution loop:
-  - `mod.rs` — JSON-RPC stdio server (`Daemon`), frozen system prompt for KV-cache stability + tail `<system-reminder>` injection, `turn`, `/rewind` (chat + Git worktree code), `/fork`, `/btw`, `/operator`, `/roles`, `skill.manage`, `mcp.list`, `tasks.list`, `mode.set`.
-  - `session.rs` — Single-pass session recovery, deduplicated repo instruction loading (`AGENTS.md` else `CLAUDE.md`, `.twig/preferences.md`, `.twig/rules/<family>.md`), non-intrusive `GIT_INDEX_FILE` worktree snapshots, repo-scoped session scanner/search, `twig exec` & `twig session` runners, and optional `herdr` status socket broadcasts.
-  - `turn.rs` — Single-round-trip multi-tool turn loop + parallel `Tier::Auto` read-only and `subagent` batching + mid-turn steering + repetition breaker.
-  - `tools/` (`mod.rs` + `fs.rs`) — Worktree-confined structured tools (`outline` structural symbol map, `read` with line numbers + `artifact:<file>` + `session:<sid>` + lazy subdirectory `AGENTS.md`/`CLAUDE.md`, `edit` with resume-aware Read-Before-Edit `mtime` guard & 4-level progressive indentation matching, `write`, multi-file `apply_patch`, `grep`, `glob`, `bash`, `task` with `send` stdin, resumable `subagent`, `skill`, `mcp`, `todo`, `papercut`) + `.twig/project.json` `post_edit_check` / `check_on_change` hooks.
-  - `guidance.rs` — Playbooks, progressive-disclosure `SkillIndex` (Top-5 local pre-ranker when >15 skills), and 3-tier `SkillStore` (`.twig/skills` > `~/.config/twig/skills`, cold vault `~/.local/share/twig-skills-vault`), plus `$skill-name` zero-RTT invocation.
-  - `policy.rs` — 3-tier shell classifier (`Auto` / `Audit` / `Deny`) with outside-worktree path downgrade and catastrophic-wildcard prevention.
-  - `guard.rs` — Progress/stall detector (warns, narrows to read-only, aborts) and failing-call loop breaker.
-  - `context.rs` — Two-stage context compaction: deterministic zero-LLM `Microcompact` (`artifact:tool-<id>.txt`) followed by lossless-archived LLM `Autocompact`.
-  - `subagent.rs`, `tasks.rs`, `mcp.rs` — Resumable isolated Git worktree subagents hydrated from parent uncommitted changes (`code`, `test`, `scout`, `advisor`, `reviewer`, plus `cli:codex`/`cli:claude`/`cli:gemini` external CLI bridge, diff receipts & two-tier `/review`), interactive async background tasks, and MCP stdio client.
-- `src/exec/` — Bounded Unix-socket shell runner with automatic zombie/FD reclamation + optional Linux `bwrap` namespace isolation.
-- `src/tui/` — Borderless warm-terracotta Ratatui TUI (`mod.rs`, `slash.rs`, `overlays.rs`, `client.rs`, `composer.rs`, `transcript.rs`, `markdown.rs`).
-- `src/eval/`, `src/verify.rs`, `src/record.rs`, `src/automation/` — Evaluation suite, differential verifier, lazy BLAKE3 hash-chained JSONL journal (zero empty-file clutter), unattended GitHub automation.
+1. **L1 · Foundation** (`src/config.rs`, `src/record.rs`, `src/control.rs`) — `HarnessConfig` (`harness.json` tunable surface + XDG paths + `IGNORED_DIRS`), lazy BLAKE3 hash-chained `.jsonl` `Record` (`verify_chain` / `verify_rows`) + kernel `flock` `Lease`, and `Control` cancellation/approval gate.
+2. **L2 · Execution & Sandbox** (`src/exec/`) — Bounded Unix-socket shell runner with process-group reaping (`run_process_cancellable`) and Linux `bwrap` namespace isolation (`bwrap_userns_usable`).
+3. **L3 · Model & CLI Bridges** (`src/llm/`) — OpenAI-compatible SSE client (`Provider`), typed `ConfigOp`, role routing (`roles.json`), and canonical external CLI runner bridge (`llm::cli` for `cli:codex`/`claude`/`agy`/`gemini`).
+4. **L4 · Differential Verifier** (`src/verify.rs`) — Oracle journal equivalence verifier (`gate`).
+5. **L5 · Session & Agent Runtime** (`src/runtime/`):
+   - `mod.rs` & `rpc.rs` — `Daemon` JSON-RPC dispatcher + stdio framing (`serve_stdio_loop`), frozen system prompt + tail `<system-reminder>` injection.
+   - `session.rs` & `git_ops.rs` — Canonical `SessionSnapshot` ledger recovery/scanner/search/archive, `paused` vs crash-interrupted approval distinction, `GIT_INDEX_FILE` snapshots, uncommitted worktree hydration, and confined Git patch application.
+   - `turn.rs`, `policy.rs`, `guard.rs`, `context.rs` — Multi-tool turn loop + parallel `Tier::Auto` and `subagent` batching, 3-tier shell policy, progress/stall guard, and 2-stage context compaction.
+   - `tools/` (`mod.rs`, `fs.rs`, `code_intel.rs`, `inspect.rs`, `lsp.rs`) — Worktree-confined tools (`outline` symbols/xrefs/deps/LSP, `read` text/binary/Wasm/HAR/artifacts, Read-Before-Edit `edit`, `write`, `apply_patch`, `grep`, `glob`, `bash`, `task`, `subagent`, `skill`, `mcp`, `todo`, `papercut`).
+   - `guidance.rs`, `blackboard.rs`, `subagent.rs`, `workflows.rs`, `tasks.rs`, `mcp.rs` — Playbooks & 3-tier `SkillStore`, RCI role-card blackboard primitives, `SubagentConfig::for_repo` & `SubagentPool`, `/review` + `/walkthrough` + `/dual-plan` workflows, async tasks, and MCP stdio registry.
+6. **L6 · Evaluation & Automation** (`src/eval/`, `src/automation/`) — Eval suite, ablation checks, RCI session harvest/distillation, and unattended GitHub issue/PR automation.
+7. **L7 · Interfaces** (`src/tui/`, `src/web.rs`, `src/cli.rs`, `src/main.rs`) — Borderless warm-terracotta Ratatui TUI (`theme.rs` leaf SSOT, `highlight.rs`, `markdown.rs`, `math_table.rs`, `transcript.rs`, `composer.rs`, `overlays.rs`, `strips.rs`, `selection.rs`, `client.rs`, `slash.rs`, `mod.rs` with `PendingRpc`), mobile/desktop Web Cockpit, headless CLI handlers, and thin `main.rs` dispatcher.
 
-## TUI Design Rules
+## TUI & Engineering Invariants
 
-- **Zero 4-sided box borders**: pure typography, hairline rules (`─`), full-width accent selection bar, warm terracotta palette.
-- **Zero redundancy across Welcome / Composer / Footer**:
-  - Welcome header shows repo path + live loaded environment summary (`skills`, `instructions`, `mcp`, `sandbox`).
-  - Composer placeholder owns input prefixes (`/ command · @ file · $ skill · ! shell`).
-  - Footer owns live dynamic state (`repo (branch) +N -M · model effort · ctx % · tokens · badges`).
+- **Single Source of Truth**: Every `Color::Rgb` token, `horizontal_pad`, and cell-width-safe `clip_width` lives exclusively in leaf `src/tui/theme.rs` (zero `super::*` imports, zero 4-sided box borders).
+- **Deep Modules**: Every `src/**/*.rs` file stays `<= 1,650` lines (`tests/architecture.rs`) and hides more complexity than it exports (`deslop-please: ok`).
 
 ## Quality Gates (Run Before Every Commit)
 
-1. **Zero unnecessary Cargo dependencies** — keep the crate lean.
-2. **Design & hygiene lint**: `deslop-please` MUST output `deslop-please: ok` (no allowlist workarounds, every file `< 2000` lines, no field leaks, no shallow modules, no module cycles).
-3. **Compiler lint**: `cargo clippy --all-targets -- -D warnings` (0 warnings).
-4. **Offline smoke check**: `cargo run --quiet -- selfcheck` (`all checks passed`).
-5. **Full test suite**: `cargo test --no-fail-fast` (6 tests exercise nested Linux `bwrap` user namespaces and require host namespace capability).
-6. **Release install** (when shipping locally): `cargo build --release && install -Dm755 target/release/twig ~/.local/bin/twig`.
+1. `deslop-please` -> `deslop-please: ok` (zero allowlist workarounds, shallow modules, field leaks, or cycles).
+2. `cargo clippy --all-targets -- -D warnings` (0 warnings).
+3. `cargo run --quiet -- selfcheck` (`all checks passed`).
+4. `cargo test --no-fail-fast` (includes `tests/architecture.rs` and Linux `bwrap` isolation suites).
+5. Release install: `cargo build --release && install -Dm755 target/release/twig ~/.local/bin/twig`.

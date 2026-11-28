@@ -1412,51 +1412,49 @@ impl Transcript {
         model: &str,
         repo_path: &str,
     ) -> String {
+        use std::fmt::Write as _;
         let heading = title
             .map(|t| format!("# {t}"))
             .unwrap_or_else(|| "# twig session export".to_owned());
+        let session_id = if sid.is_empty() { "unknown" } else { sid };
         let mut out = format!(
-            "{heading}\n\n- **Session:** `{}`\n- **Model:** `{model}`\n- **Workspace:** `{repo_path}`\n\n---\n\n",
-            if sid.is_empty() { "unknown" } else { sid }
+            "{heading}\n\n- **Session:** `{session_id}`\n- **Model:** `{model}`\n- **Workspace:** `{repo_path}`\n\n---\n\n"
         );
         for cell in &self.cells {
             match cell {
                 Cell::User(text) => {
-                    out.push_str("## User\n\n");
-                    out.push_str(text.trim_end());
-                    out.push_str("\n\n");
+                    let _ = write!(out, "## User\n\n{}\n\n", text.trim_end());
                 }
                 Cell::Steering(text) => {
-                    out.push_str(&format!("> **Steering:** {}\n\n", text.trim()));
+                    let _ = write!(out, "> **Steering:** {}\n\n", text.trim());
                 }
                 Cell::Reasoning { text, .. } => {
-                    out.push_str("<details>\n<summary>Thinking</summary>\n\n");
-                    out.push_str(text.trim_end());
-                    out.push_str("\n\n</details>\n\n");
+                    let _ = write!(
+                        out,
+                        "<details>\n<summary>Thinking</summary>\n\n{}\n\n</details>\n\n",
+                        text.trim_end()
+                    );
                 }
                 Cell::Assistant(text) => {
-                    out.push_str("## Assistant\n\n");
-                    out.push_str(text.trim_end());
-                    out.push_str("\n\n");
+                    let _ = write!(out, "## Assistant\n\n{}\n\n", text.trim_end());
                 }
                 Cell::Tool(tool) => {
                     let exit = tool
                         .exit_code
                         .map(|c| format!(" (exit {c})"))
                         .unwrap_or_default();
-                    out.push_str(&format!(
+                    let _ = write!(
+                        out,
                         "### Tool: {} `{}`{exit}\n\n",
                         title_tool_name(&tool.name),
                         tool.summary
-                    ));
+                    );
                     if !tool.output.trim().is_empty() {
-                        out.push_str("```text\n");
-                        out.push_str(tool.output.trim_end());
-                        out.push_str("\n```\n\n");
+                        let _ = write!(out, "```text\n{}\n```\n\n", tool.output.trim_end());
                     }
                 }
                 Cell::Notice { text, .. } => {
-                    out.push_str(&format!("> *{}*\n\n", text.trim()));
+                    let _ = write!(out, "> *{}*\n\n", text.trim());
                 }
             }
         }
@@ -1543,6 +1541,14 @@ mod tests {
         assert_eq!(t.len(), 3);
     }
 
+    fn render_joined(t: &Transcript, width: usize) -> String {
+        t.build_lines(width, "~/twig", "", false, Duration::from_secs(1), MotionMode::Reduced)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn renders_1cell_bullets_collapses_prior_thinking_and_formats_tables() {
         let mut t = Transcript::new();
@@ -1559,20 +1565,7 @@ mod tests {
         t.push_assistant("   \n".into());
         t.push_assistant("| 日期 | 天气 |\n|---|---|\n| 11-27 | 晴 $19^\\circ$ |".into());
 
-        // Collapsed (default): hides tool output & empty ghost replies, keeps Request (❯) & Result (◆) distinct.
-        let collapsed: String = t
-            .build_lines(
-                72,
-                "~/twig",
-                "",
-                false,
-                Duration::from_secs(1),
-                MotionMode::Reduced,
-            )
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let collapsed = render_joined(&t, 72);
         assert!(
             !collapsed.contains('\u{23fa}'),
             "must not emit wide emoji U+23FA: {collapsed}"
@@ -1586,21 +1579,8 @@ mod tests {
         assert!(!collapsed.contains("First check wttr.in"));
         assert!(collapsed.contains('┌') && collapsed.contains("19°"));
 
-        // Expanded (`Ctrl+O`): reveals full tool output & prior reasoning.
         t.toggle_expand();
-        let expanded: String = t
-            .build_lines(
-                72,
-                "~/twig",
-                "",
-                false,
-                Duration::from_secs(1),
-                MotionMode::Reduced,
-            )
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let expanded = render_joined(&t, 72);
         assert!(expanded.contains("raw curl output line"));
         assert!(expanded.contains("First check wttr.in"));
     }
@@ -1631,19 +1611,7 @@ mod tests {
                 .into(),
         );
 
-        let lines = t.build_lines(
-            76,
-            "~/twig",
-            "",
-            false,
-            Duration::from_secs(1),
-            MotionMode::Reduced,
-        );
-        let joined: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let joined = render_joined(&t, 76);
         assert!(
             joined.contains("▸ 2 tools (1 read · 1 search"),
             "folded multi-tool trace: {joined}"
