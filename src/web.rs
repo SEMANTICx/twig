@@ -17,7 +17,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::config::{paths, HarnessConfig};
+use crate::exec::{run_process, shell_command};
 use crate::llm::{cli, Llm, Provider};
+use crate::runtime::guidance::SkillStore;
+use crate::runtime::policy::{Policy, Tier};
 use crate::runtime::session::{archive_session, scan_sessions};
 use crate::runtime::workflows::build_goal_prompt;
 use crate::runtime::Daemon;
@@ -199,6 +202,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
 
     let resp_json: Result<Value, String> = match (method, path) {
         ("GET", "/api/meta") => Ok(collect_meta(state)),
+        ("GET", "/api/files") => Ok(list_worktree_files(query, &state.default_repo)),
         ("GET", "/api/sessions") => {
             let all = query.split('&').any(|kv| kv == "all=1");
             let running: std::collections::HashSet<String> = state
@@ -244,6 +248,12 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("POST", "/api/commit") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| commit_session_worktree(&req, &state.default_repo)),
+        ("POST", "/api/rpc") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| dispatch_session_rpc(&req, &state.default_repo)),
+        ("POST", "/api/shell") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| run_quick_shell(&req, &state.default_repo)),
         _ => Err(format!("not found: {method} {path}")),
     };
 
@@ -308,6 +318,12 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
+    let skills: Vec<Value> = SkillStore::default_for(Some(&state.default_repo))
+        .catalog_for_autocomplete()
+        .into_iter()
+        .take(80)
+        .map(|(name, scope, desc)| json!({"name": name, "scope": scope, "desc": desc}))
+        .collect();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "default_repo": state.default_repo.display().to_string(),
@@ -315,7 +331,59 @@ fn collect_meta(state: &Arc<WebState>) -> Value {
         "active_model": active_model,
         "effort": provider.effort(),
         "models": models,
+        "skills": skills,
     })
+}
+
+fn url_decode_simple(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn list_worktree_files(query: &str, default_repo: &Path) -> Value {
+    let wt = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("wt="))
+        .map(url_decode_simple)
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+    let files: Vec<String> = Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| !l.is_empty() && !crate::runtime::policy::is_sensitive_secret_path(l))
+                .take(800)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "files": files })
 }
 
 fn inspect_session_detail(sid: &str, state: &Arc<WebState>) -> Result<Value, String> {
@@ -586,6 +654,59 @@ fn commit_session_worktree(req: &Value, default_repo: &Path) -> Result<Value, St
     let runs = paths::state_dir().join("sessions");
     let mut daemon = Daemon::new(&provider, &wt, &runs, sid, &cfg)?;
     daemon.dispatch("git.commit", &json!({"hint": hint}), &mut |_| {})
+}
+
+fn dispatch_session_rpc(req: &Value, default_repo: &Path) -> Result<Value, String> {
+    let method = req["method"].as_str().ok_or("method required")?;
+    if !matches!(
+        method,
+        "session.rename" | "session.btw" | "session.fork" | "session.compact"
+    ) {
+        return Err(format!("unsupported web rpc method {method:?}"));
+    }
+    let sid = req["sid"].as_str().filter(|s| !s.is_empty()).ok_or("sid required")?;
+    let wt = req["worktree"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+    let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+    let (cfg, _) = HarnessConfig::resolve()?;
+    let provider = Provider::new();
+    let runs = paths::state_dir().join("sessions");
+    let mut daemon = Daemon::new(&provider, &wt, &runs, sid, &cfg)?;
+    daemon.dispatch(method, &params, &mut |_| {})
+}
+
+fn run_quick_shell(req: &Value, default_repo: &Path) -> Result<Value, String> {
+    let command = req["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("command required")?;
+    let tier = Policy::new().classify(command);
+    if tier == Tier::Deny {
+        return Err(
+            "refused by policy: destructive, secret-reading, or control-plane command requires interactive TUI approval"
+                .into(),
+        );
+    }
+    let wt = req["worktree"]
+        .as_str()
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+    let mut cmd = shell_command(command);
+    cmd.current_dir(&wt);
+    let out = run_process(&mut cmd, &[], Duration::from_secs(20), 65_536)
+        .map_err(|e| format!("shell exec: {e}"))?;
+    Ok(json!({
+        "exit_code": out.exit_code.unwrap_or(-1),
+        "timed_out": out.timed_out,
+        "tier": tier.as_str(),
+        "stdout": String::from_utf8_lossy(&out.stdout),
+        "stderr": String::from_utf8_lossy(&out.stderr),
+    }))
 }
 
 #[cfg(test)]
