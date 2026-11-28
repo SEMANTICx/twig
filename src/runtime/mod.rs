@@ -137,24 +137,6 @@ impl<'a> Daemon<'a> {
         let (record, rows) =
             Record::open_with_rows(runs_dir.join(format!("{sid}.jsonl")), sid.clone())
                 .map_err(|e| e.to_string())?;
-        let title = rows
-            .iter()
-            .rev()
-            .find(|r| r["kind"] == "session.renamed")
-            .and_then(|r| r["title"].as_str())
-            .map(str::to_owned);
-        let plan_mode = rows
-            .iter()
-            .rev()
-            .find(|r| r["kind"] == "mode.changed")
-            .and_then(|r| r["plan"].as_bool())
-            .unwrap_or(false);
-        let todos = rows
-            .iter()
-            .rev()
-            .find(|r| r["kind"] == "todo.updated")
-            .and_then(|r| r["items"].as_array().cloned())
-            .unwrap_or_default();
         let recovered = recover_session(&rows, default_check);
         let guard =
             Guard::new(&worktree, cfg.max_turns, cfg.stall_turns, 3).ignoring([runs_dir.clone()]);
@@ -163,21 +145,23 @@ impl<'a> Daemon<'a> {
             context.add_constraint(c);
         }
         let policy = Policy::new();
-        for row in &rows {
-            if row["kind"] == "policy.allowed" {
-                if let Some(pat) = row["pattern"].as_str() {
-                    policy.allow_for_session(pat);
-                }
-            }
+        for pat in &recovered.allowed_patterns {
+            policy.allow_for_session(pat);
         }
         let mut tools =
             Tools::with_config(&worktree, cfg).with_session_context(runs_dir.join("artifacts"), &sid);
         tools.restore_read_stamps(&rows);
-        tools.apply_plan_mode(plan_mode);
+        let _ = tools.configure_mode(recovered.plan_mode, recovered.gate_edits);
         let initial_effort = std::env::var("TWIG_EFFORT")
             .ok()
             .and_then(|v| crate::llm::normalize_effort(&v).ok())
-            .unwrap_or_else(|| llm.effort());
+            .unwrap_or_else(|| {
+                if recovered.has_saved_effort {
+                    recovered.saved_effort.clone()
+                } else {
+                    llm.effort()
+                }
+            });
         if initial_effort != llm.effort() {
             llm.set_effort(initial_effort.as_deref());
         }
@@ -191,14 +175,14 @@ impl<'a> Daemon<'a> {
             stop_hook,
             model_override: None,
             effort: initial_effort,
-            title,
-            plan_mode,
+            title: recovered.title,
+            plan_mode: recovered.plan_mode,
             operator_mode: recovered.operator_mode,
             study_mode: recovered.study_mode,
             had_checkpoint: recovered.had_checkpoint,
             snapshots: recovered.snapshots,
             frozen_system: None,
-            todos,
+            todos: recovered.todos,
             tools,
             system: cfg.system.clone(),
             worktree,
@@ -287,7 +271,7 @@ impl<'a> Daemon<'a> {
                 self.record
                     .append(
                         "approval.requested",
-                        json!({"id": call.id, "name": call.name, "args": call.args}),
+                        json!({"id": call.id, "name": call.name, "args": call.args, "paused": !self.interactive}),
                     )
                     .map_err(|e| e.to_string())?;
                 let ev = json!({
@@ -587,9 +571,17 @@ impl<'a> Daemon<'a> {
                         .append("session.renamed", json!({"title": format!("{title} (fork)")}))
                         .map_err(|e| e.to_string())?;
                 }
-                if self.plan_mode {
+                if self.plan_mode || self.tools.gates_edits() {
                     forked
-                        .append("mode.changed", json!({"plan": true}))
+                        .append(
+                            "mode.changed",
+                            json!({"plan": self.plan_mode, "gate_edits": self.tools.gates_edits()}),
+                        )
+                        .map_err(|e| e.to_string())?;
+                }
+                if self.effort.is_some() {
+                    forked
+                        .append("effort.changed", json!({"effort": self.effort}))
                         .map_err(|e| e.to_string())?;
                 }
                 if !self.todos.is_empty() {

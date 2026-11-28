@@ -83,51 +83,136 @@ pub(super) fn append_repo_instructions(worktree: &Path, active_model: &str, syst
     }
 }
 
-pub(super) struct RecoveredState {
+pub(super) struct SessionSnapshot {
+    pub title: Option<String>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub parent_sid: Option<String>,
+    pub role: Option<String>,
+    pub model: Option<String>,
+    pub plan_mode: bool,
+    pub gate_edits: bool,
+    pub operator_mode: bool,
+    pub study_mode: bool,
+    pub has_saved_effort: bool,
+    pub saved_effort: Option<String>,
+    pub todos: Vec<Value>,
+    pub allowed_patterns: Vec<String>,
+    pub tool_count: u32,
     pub messages: Vec<Value>,
     pub pending: Vec<Value>,
     pub constraints: Vec<String>,
     pub check: Option<Check>,
     pub snapshots: Vec<String>,
-    pub operator_mode: bool,
-    pub study_mode: bool,
     pub had_checkpoint: bool,
 }
 
-/// Single-pass O(N) session recovery from the append-only hash-chained record.
-pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> RecoveredState {
-    let check = rows
-        .iter()
-        .rev()
-        .find(|r| r["kind"] == "acceptance.configured")
-        .and_then(|r| serde_json::from_value(r["check"].clone()).ok())
-        .or(default_check);
+fn read_jsonl_lenient(path: &Path) -> std::io::Result<Vec<Value>> {
+    let file = std::fs::File::open(path)?;
+    Ok(BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+        .collect())
+}
 
-    let operator_mode = rows
-        .iter()
-        .rev()
-        .find(|r| r["kind"] == "operator.changed")
-        .and_then(|r| r["enabled"].as_bool())
-        .unwrap_or(false);
-
-    let study_mode = rows
-        .iter()
-        .rev()
-        .find(|r| r["kind"] == "study.changed")
-        .and_then(|r| r["enabled"].as_bool())
-        .unwrap_or(false);
+/// Canonical single-pass O(N) session state & ledger reconstruction shared across
+/// `Daemon::new`, `scan_sessions`, `search_sessions`, `format_session_transcript`,
+/// `load_child_threads`, `read_session_worktree`, and `web` session inspection.
+pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> SessionSnapshot {
+    let mut title: Option<String> = None;
+    let mut worktree: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut parent_sid: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut plan_mode = false;
+    let mut gate_edits = false;
+    let mut operator_mode = false;
+    let mut study_mode = false;
+    let mut has_saved_effort = false;
+    let mut saved_effort: Option<String> = None;
+    let mut todos: Vec<Value> = Vec::new();
+    let mut allowed_patterns: Vec<String> = Vec::new();
+    let mut check: Option<Check> = None;
+    let mut tool_count = 0u32;
 
     let mut snapshots = Vec::new();
     let mut constraints = Vec::new();
     let mut has_result = HashSet::new();
     let mut resolved_recovered = HashSet::new();
     let mut resolved_any = HashSet::new();
-    let mut requested: HashMap<String, (String, Value)> = HashMap::new();
+    let mut requested: HashMap<String, (String, Value, bool)> = HashMap::new();
     let mut started: HashMap<String, (String, Value)> = HashMap::new();
 
     for row in rows {
         let kind = row["kind"].as_str().unwrap_or("");
         match kind {
+            "session.meta" => {
+                if let Some(w) = row["worktree"].as_str().filter(|s| !s.is_empty()) {
+                    worktree = Some(w.to_owned());
+                }
+                if let Some(b) = row["branch"].as_str().filter(|s| !s.is_empty()) {
+                    branch = Some(b.to_owned());
+                }
+                if parent_sid.is_none() {
+                    parent_sid = row["parent_sid"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+                }
+                if let Some(r) = row["role"].as_str().filter(|s| !s.is_empty()) {
+                    role = Some(r.to_owned());
+                }
+                if let Some(m) = row["model"].as_str().filter(|s| !s.is_empty()) {
+                    model = Some(m.to_owned());
+                }
+            }
+            "session.forked" if parent_sid.is_none() => {
+                parent_sid = row["from"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+            }
+            "session.renamed" => {
+                if let Some(t) = row["title"].as_str().filter(|s| !s.is_empty()) {
+                    title = Some(t.to_owned());
+                }
+            }
+            "mode.changed" => {
+                if let Some(p) = row["plan"].as_bool() {
+                    plan_mode = p;
+                }
+                if let Some(g) = row["gate_edits"].as_bool() {
+                    gate_edits = g;
+                }
+            }
+            "operator.changed" => {
+                if let Some(e) = row["enabled"].as_bool() {
+                    operator_mode = e;
+                }
+            }
+            "study.changed" => {
+                if let Some(e) = row["enabled"].as_bool() {
+                    study_mode = e;
+                }
+            }
+            "effort.changed" => {
+                has_saved_effort = true;
+                saved_effort = row["effort"]
+                    .as_str()
+                    .and_then(|s| crate::llm::normalize_effort(s).ok().flatten());
+            }
+            "todo.updated" => {
+                if let Some(arr) = row["items"].as_array() {
+                    todos = arr.clone();
+                }
+            }
+            "policy.allowed" => {
+                if let Some(pat) = row["pattern"].as_str().filter(|s| !s.is_empty()) {
+                    allowed_patterns.push(pat.to_owned());
+                }
+            }
+            "acceptance.configured" => {
+                if let Ok(c) = serde_json::from_value::<Check>(row["check"].clone()) {
+                    check = Some(c);
+                }
+            }
             "turn.snapshot" => {
                 if let Some(tree) = row["tree"].as_str() {
                     snapshots.push(tree.to_owned());
@@ -165,12 +250,14 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> R
                         .or(row["tool"].as_str())
                         .unwrap_or("bash")
                         .to_owned();
+                    let paused = row["paused"].as_bool().unwrap_or(false);
                     requested
                         .entry(id.to_owned())
-                        .or_insert((name, row["args"].clone()));
+                        .or_insert((name, row["args"].clone(), paused));
                 }
             }
             "tool.started" => {
+                tool_count = tool_count.saturating_add(1);
                 if let Some(id) = row["id"].as_str() {
                     let name = row["tool"]
                         .as_str()
@@ -188,6 +275,7 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> R
 
     let mut pending = Vec::new();
     let mut unknown_ids = HashSet::new();
+    let mut paused_ids = HashSet::new();
     let mut seen_pending = HashSet::new();
     for row in rows {
         let id = row["id"].as_str().unwrap_or("");
@@ -204,19 +292,26 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> R
         if !started_without_result && !unresolved_approval {
             continue;
         }
-        unknown_ids.insert(id.to_owned());
+        let is_clean_pause = !started_without_result
+            && unresolved_approval
+            && requested.get(id).is_some_and(|(_, _, paused)| *paused);
+        if is_clean_pause {
+            paused_ids.insert(id.to_owned());
+        } else {
+            unknown_ids.insert(id.to_owned());
+        }
         if requested.contains_key(id) && seen_pending.insert(id.to_owned()) {
             let (name, args) = requested
                 .get(id)
-                .or_else(|| started.get(id))
-                .cloned()
+                .map(|(n, a, _)| (n.clone(), a.clone()))
+                .or_else(|| started.get(id).cloned())
                 .unwrap_or_else(|| ("bash".into(), Value::Null));
             pending.push(json!({
                 "ev": "approval.requested",
                 "id": id,
                 "name": name,
                 "args": args,
-                "recovered": true
+                "recovered": !is_clean_pause
             }));
         }
     }
@@ -298,6 +393,9 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> R
                     next += 1;
                 }
                 for cid in expected {
+                    if paused_ids.contains(&cid) {
+                        continue;
+                    }
                     if emitted_replies.insert(cid.clone()) {
                         let content = recorded_outputs.get(&cid).cloned().unwrap_or_else(|| {
                             if unknown_ids.contains(&cid) {
@@ -321,14 +419,31 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> R
         idx += 1;
     }
 
-    RecoveredState {
+    if messages.is_empty() && checkpoint.is_some() {
+        todos.clear();
+    }
+
+    SessionSnapshot {
+        title,
+        worktree,
+        branch,
+        parent_sid,
+        role,
+        model,
+        plan_mode,
+        gate_edits,
+        operator_mode,
+        study_mode,
+        has_saved_effort,
+        saved_effort,
+        todos,
+        allowed_patterns,
+        tool_count,
         messages,
         pending,
         constraints,
-        check,
+        check: check.or(default_check),
         snapshots,
-        operator_mode,
-        study_mode,
         had_checkpoint: checkpoint.is_some(),
     }
 }
@@ -571,84 +686,39 @@ pub fn scan_sessions(repo_filter: Option<&Path>, limit: usize) -> Vec<SessionInf
     out
 }
 
+fn message_plain_text(msg: &Value) -> Option<String> {
+    msg["content"].as_str().map(str::to_owned).or_else(|| {
+        msg["content"]
+            .as_array()
+            .and_then(|arr| arr.iter().find_map(|p| p["text"].as_str()))
+            .map(str::to_owned)
+    })
+}
+
 fn inspect_session_file(path: &Path, mtime: SystemTime, now: SystemTime) -> Option<SessionInfo> {
     let sid = path.file_stem()?.to_str()?.to_owned();
-    let file = std::fs::File::open(path).ok()?;
-    let mut title: Option<String> = None;
-    let mut first_user: Option<String> = None;
-    let mut worktree: Option<String> = None;
-    let mut branch: Option<String> = None;
-    let mut parent_sid: Option<String> = None;
-    let mut role: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut turns = 0usize;
-    let mut pending_approvals = HashSet::new();
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        match row["kind"].as_str() {
-            Some("session.meta") => {
-                if let Some(w) = row["worktree"].as_str().filter(|s| !s.is_empty()) {
-                    worktree = Some(w.to_owned());
-                }
-                if let Some(b) = row["branch"].as_str().filter(|s| !s.is_empty()) {
-                    branch = Some(b.to_owned());
-                }
-                if parent_sid.is_none() {
-                    parent_sid = row["parent_sid"].as_str().map(str::to_owned);
-                }
-                if let Some(r) = row["role"].as_str().filter(|s| !s.is_empty()) {
-                    role = Some(r.to_owned());
-                }
-                if let Some(m) = row["model"].as_str().filter(|s| !s.is_empty()) {
-                    model = Some(m.to_owned());
-                }
-            }
-            Some("approval.requested") => {
-                if let Some(id) = row["id"].as_str() {
-                    pending_approvals.insert(id.to_owned());
-                }
-            }
-            Some("approval.resolved") | Some("tool.result") => {
-                if let Some(id) = row["id"].as_str() {
-                    pending_approvals.remove(id);
-                }
-            }
-            Some("session.forked") if parent_sid.is_none() => {
-                parent_sid = row["from"].as_str().map(str::to_owned);
-            }
-            Some("session.renamed") => {
-                if let Some(t) = row["title"].as_str() {
-                    title = Some(t.to_owned());
-                }
-            }
-            Some("message") => match row["message"]["role"].as_str() {
-                Some("user") if first_user.is_none() => {
-                    let text = row["message"]["content"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            row["message"]["content"]
-                                .as_array()
-                                .and_then(|arr| arr.iter().find_map(|p| p["text"].as_str()))
-                                .map(str::to_owned)
-                        });
-                    if let Some(c) = text {
-                        let one: String = c.replace('\n', " ").trim().chars().take(72).collect();
-                        if !one.is_empty() {
-                            first_user = Some(one);
-                        }
-                    }
-                }
-                Some("assistant") => turns += 1,
-                _ => {}
-            },
-            _ => {}
-        }
-    }
-    let label = title
+    let rows = read_jsonl_lenient(path).ok()?;
+    let snap = recover_session(&rows, None);
+    let first_user = snap
+        .messages
+        .iter()
+        .find(|m| m["role"] == "user")
+        .and_then(message_plain_text)
+        .map(|c| {
+            c.replace('\n', " ")
+                .trim()
+                .chars()
+                .take(72)
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    let turns = snap
+        .messages
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .count();
+    let label = snap
+        .title
         .or(first_user)
         .unwrap_or_else(|| "(empty session)".to_owned());
     let secs = now.duration_since(mtime).unwrap_or_default().as_secs();
@@ -661,19 +731,22 @@ fn inspect_session_file(path: &Path, mtime: SystemTime, now: SystemTime) -> Opti
     } else {
         format!("{}d ago", secs / 86_400)
     };
-    let status = if !pending_approvals.is_empty() {
+    let is_locked = crate::record::Lease::is_locked(&path.with_extension("lock"));
+    let status = if !snap.pending.is_empty() {
         "approval".to_owned()
+    } else if is_locked {
+        "running".to_owned()
     } else {
         "settled".to_owned()
     };
     Some(SessionInfo {
         sid,
         label,
-        worktree,
-        branch,
-        parent_sid,
-        role,
-        model,
+        worktree: snap.worktree,
+        branch: snap.branch,
+        parent_sid: snap.parent_sid,
+        role: snap.role,
+        model: snap.model,
         turns,
         age,
         status,
@@ -722,43 +795,13 @@ pub fn search_sessions(query: &str, repo_filter: Option<&Path>, limit: usize) ->
         let Some(sid) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
             continue;
         };
-        let Ok(file) = std::fs::File::open(&path) else {
+        let Ok(rows) = read_jsonl_lenient(&path) else {
             continue;
         };
-        let mut session_repo: Option<String> = None;
-        let mut matched_snippets: Vec<String> = Vec::new();
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(row) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if row["kind"] == "session.meta" && session_repo.is_none() {
-                session_repo = row["worktree"].as_str().map(str::to_owned);
-            }
-            if row["kind"] == "message" {
-                let role = row["message"]["role"].as_str().unwrap_or("msg");
-                if let Some(content) = row["message"]["content"].as_str() {
-                    if content.to_lowercase().contains(&q) {
-                        let snippet: String = content
-                            .lines()
-                            .find(|l| l.to_lowercase().contains(&q))
-                            .unwrap_or(content)
-                            .trim()
-                            .chars()
-                            .take(140)
-                            .collect();
-                        matched_snippets.push(format!("[{role}] {snippet}"));
-                        if matched_snippets.len() >= 3 {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if matched_snippets.is_empty() {
-            continue;
-        }
+        let snap = recover_session(&rows, None);
         if let Some(ref want_repo) = filter_canon {
-            let ok = session_repo
+            let ok = snap
+                .worktree
                 .as_deref()
                 .and_then(|w| Path::new(w).canonicalize().ok())
                 .is_some_and(|w| &w == want_repo);
@@ -766,9 +809,32 @@ pub fn search_sessions(query: &str, repo_filter: Option<&Path>, limit: usize) ->
                 continue;
             }
         }
+        let mut matched_snippets: Vec<String> = Vec::new();
+        for msg in &snap.messages {
+            let role = msg["role"].as_str().unwrap_or("msg");
+            if let Some(content) = message_plain_text(msg) {
+                if content.to_lowercase().contains(&q) {
+                    let snippet: String = content
+                        .lines()
+                        .find(|l| l.to_lowercase().contains(&q))
+                        .unwrap_or(&content)
+                        .trim()
+                        .chars()
+                        .take(140)
+                        .collect();
+                    matched_snippets.push(format!("[{role}] {snippet}"));
+                    if matched_snippets.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        if matched_snippets.is_empty() {
+            continue;
+        }
         hits.push(json!({
             "sid": sid,
-            "worktree": session_repo,
+            "worktree": snap.worktree,
             "matches": matched_snippets,
         }));
     }
@@ -782,59 +848,102 @@ pub fn format_session_transcript(sid: &str) -> Result<String, String> {
     if !paths::valid_session(trimmed) {
         return Err(format!("invalid session id {trimmed:?}"));
     }
-    let mut candidates = vec![paths::state_dir()
-        .join("sessions")
-        .join(format!("{trimmed}.jsonl"))];
-    let sub_root = paths::state_dir().join("subagents");
-    if let Ok(entries) = std::fs::read_dir(&sub_root) {
-        for e in entries.flatten() {
-            let p = e.path().join(format!("{trimmed}.jsonl"));
-            if p.exists() {
-                candidates.push(p);
-            }
-        }
-    }
-    let path = candidates
-        .into_iter()
-        .find(|p| p.exists())
+    let path = locate_session_jsonl(trimmed)
         .ok_or_else(|| format!("session {trimmed:?} not found"))?;
-    let file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let rows = read_jsonl_lenient(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let snap = recover_session(&rows, None);
     let mut out = String::new();
     out.push_str(&format!("# Session {trimmed}\n"));
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        match row["kind"].as_str() {
-            Some("session.meta") => {
-                out.push_str(&format!(
-                    "worktree: {} · branch: {} · role: {} · model: {}\n\n",
-                    row["worktree"].as_str().unwrap_or("-"),
-                    row["branch"].as_str().unwrap_or("-"),
-                    row["role"].as_str().unwrap_or("code"),
-                    row["model"].as_str().unwrap_or("-"),
-                ));
+    if snap.worktree.is_some() || snap.branch.is_some() || snap.role.is_some() || snap.model.is_some() {
+        out.push_str(&format!(
+            "worktree: {} · branch: {} · role: {} · model: {}\n\n",
+            snap.worktree.as_deref().unwrap_or("-"),
+            snap.branch.as_deref().unwrap_or("-"),
+            snap.role.as_deref().unwrap_or("code"),
+            snap.model.as_deref().unwrap_or("-"),
+        ));
+    }
+    for msg in &snap.messages {
+        let role = msg["role"].as_str().unwrap_or("msg");
+        if let Some(text) = message_plain_text(msg) {
+            if !text.trim().is_empty() {
+                out.push_str(&format!("## {role}\n{text}\n\n"));
             }
-            Some("message") => {
-                let role = row["message"]["role"].as_str().unwrap_or("msg");
-                if let Some(text) = row["message"]["content"].as_str() {
-                    if !text.trim().is_empty() {
-                        out.push_str(&format!("## {role}\n{text}\n\n"));
-                    }
-                }
-                if let Some(calls) = row["message"]["tool_calls"].as_array() {
-                    for c in calls {
-                        let name = c["function"]["name"].as_str().unwrap_or("tool");
-                        let args = c["function"]["arguments"].as_str().unwrap_or("{}");
-                        out.push_str(&format!("-> call {name}({args})\n"));
-                    }
-                    out.push('\n');
-                }
+        }
+        if let Some(calls) = msg["tool_calls"].as_array() {
+            for c in calls {
+                let name = c["function"]["name"].as_str().unwrap_or("tool");
+                let args = c["function"]["arguments"].as_str().unwrap_or("{}");
+                out.push_str(&format!("-> call {name}({args})\n"));
             }
-            _ => {}
+            out.push('\n');
         }
     }
     Ok(out)
+}
+
+/// Detailed session snapshot for `twig web` cockpit (`messages`, `pending`, `diff`, live `Lease` state).
+pub fn inspect_session_detail(sid: &str, default_repo: &Path, in_flight: bool) -> Result<Value, String> {
+    if !paths::valid_session(sid) {
+        return Err("invalid session id".into());
+    }
+    let path = paths::state_dir()
+        .join("sessions")
+        .join(format!("{sid}.jsonl"));
+    if !path.exists() {
+        return Err("session not found".into());
+    }
+    let rows = read_jsonl_lenient(&path).map_err(|e| e.to_string())?;
+    let snap = recover_session(&rows, None);
+    let worktree = snap
+        .worktree
+        .unwrap_or_else(|| default_repo.display().to_string());
+    let diff = Command::new("git")
+        .args(["-C", &worktree, "diff", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.chars().take(64_000).collect::<String>()
+        })
+        .unwrap_or_default();
+    let running = in_flight || crate::record::Lease::is_locked(&path.with_extension("lock"));
+    Ok(json!({
+        "sid": sid,
+        "worktree": worktree,
+        "branch": snap.branch.unwrap_or_default(),
+        "model": snap.model.unwrap_or_default(),
+        "running": running,
+        "messages": snap.messages,
+        "pending": snap.pending,
+        "diff": diff,
+    }))
+}
+
+/// Archive `<sid>.jsonl` into `<state_dir>/sessions/archive/` with session-ID confinement.
+pub fn archive_session(sid: &str) -> Result<String, String> {
+    archive_session_in(&paths::state_dir().join("sessions"), sid)
+}
+
+fn archive_session_in(sessions_dir: &Path, sid: &str) -> Result<String, String> {
+    let trimmed = sid.trim();
+    if !paths::valid_session(trimmed) {
+        return Err(format!("invalid session id {trimmed:?}"));
+    }
+    let src = sessions_dir.join(format!("{trimmed}.jsonl"));
+    if !src.exists() {
+        return Err(format!("session record not found: {}", src.display()));
+    }
+    let archive_dir = sessions_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir).map_err(|e| format!("create archive dir: {e}"))?;
+    let dst = archive_dir.join(format!("{trimmed}.jsonl"));
+    std::fs::rename(&src, &dst).map_err(|e| format!("archive session: {e}"))?;
+    let lock = sessions_dir.join(format!("{trimmed}.lock"));
+    if !crate::record::Lease::is_locked(&lock) {
+        let _ = std::fs::remove_file(lock);
+    }
+    Ok(dst.display().to_string())
 }
 
 /// Best-effort lightweight status broadcast for external multiplexer monitors (`herdr` / `tmux`).
@@ -963,25 +1072,9 @@ pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>)
         if !is_child {
             continue;
         }
-        let mut role = "scout".to_owned();
-        let mut model: Option<String> = None;
-        let mut tool_count = 0u32;
-        for row in &rows {
-            match row["kind"].as_str() {
-                Some("session.meta") => {
-                    if let Some(r) = row["role"].as_str().filter(|s| !s.is_empty()) {
-                        role = r.to_owned();
-                    }
-                    if let Some(m) = row["model"].as_str().filter(|s| !s.is_empty()) {
-                        model = Some(m.to_owned());
-                    }
-                }
-                Some("tool.started") => tool_count = tool_count.saturating_add(1),
-                _ => {}
-            }
-        }
-        let recovered = recover_session(&rows, None);
-        let task = recovered
+        let snap = recover_session(&rows, None);
+        let role = snap.role.unwrap_or_else(|| "scout".to_owned());
+        let task = snap
             .messages
             .iter()
             .find(|m| m["role"] == "user")
@@ -989,7 +1082,7 @@ pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>)
             .unwrap_or("")
             .trim()
             .to_owned();
-        let turns = recovered
+        let turns = snap
             .messages
             .iter()
             .filter(|m| m["role"] == "assistant")
@@ -998,11 +1091,11 @@ pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>)
             "id": sid,
             "sid": sid,
             "role": role,
-            "model": model,
+            "model": snap.model,
             "task": task,
             "turns": turns,
-            "tool_count": tool_count,
-            "messages": recovered.messages,
+            "tool_count": snap.tool_count,
+            "messages": snap.messages,
         }));
     }
     if matched.len() > 16 {
@@ -1013,18 +1106,8 @@ pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>)
 
 fn read_session_worktree(sid: &str) -> Option<String> {
     let path = locate_session_jsonl(sid)?;
-    let file = std::fs::File::open(path).ok()?;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if row["kind"] == "session.meta" {
-            if let Some(w) = row["worktree"].as_str().filter(|s| !s.is_empty()) {
-                return Some(w.to_owned());
-            }
-        }
-    }
-    None
+    let rows = read_jsonl_lenient(&path).ok()?;
+    recover_session(&rows, None).worktree
 }
 
 pub(super) fn load_session_patch(sid: &str, extra_artifacts: Option<&Path>) -> Result<String, String> {
@@ -1374,6 +1457,7 @@ pub fn run_session_cli(args: &[String]) -> Result<i32, String> {
                     let wt = s.worktree.as_deref().unwrap_or("-");
                     let badge = match s.status.as_str() {
                         "approval" => "[▲ wait]  ",
+                        "running" => "[● run]   ",
                         "dirty" => "[● diff]  ",
                         _ => "[✓ ok]    ",
                     };
@@ -1462,20 +1546,8 @@ pub fn run_session_cli(args: &[String]) -> Result<i32, String> {
         }
         "archive" => {
             let sid = args.get(1).ok_or("usage: twig session archive <SID>")?;
-            if !paths::valid_session(sid) {
-                return Err(format!("invalid session id {sid:?}"));
-            }
-            let sessions_dir = paths::state_dir().join("sessions");
-            let src = sessions_dir.join(format!("{sid}.jsonl"));
-            if !src.exists() {
-                return Err(format!("session not found: {}", src.display()));
-            }
-            let archive_dir = sessions_dir.join("archive");
-            std::fs::create_dir_all(&archive_dir).map_err(|e| e.to_string())?;
-            let dst = archive_dir.join(format!("{sid}.jsonl"));
-            std::fs::rename(&src, &dst).map_err(|e| e.to_string())?;
-            let _ = std::fs::remove_file(sessions_dir.join(format!("{sid}.lock")));
-            println!("{}", dst.display());
+            let dst = archive_session(sid)?;
+            println!("{dst}");
             Ok(0)
         }
         other => Err(format!(
@@ -1598,5 +1670,53 @@ mod tests {
         assert_eq!(threads[0]["task"], "Audit src/web.rs");
         assert_eq!(threads[0]["messages"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn paused_noninteractive_approval_executes_on_resume_while_crash_stays_unreplayed() {
+        let root = std::env::temp_dir().join(format!("twig-paused-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let runs = root.join("runs");
+        let llm = crate::llm::stub::StubLlm::new(vec![crate::llm::stub::StubLlm::with_tools(
+            "",
+            vec![crate::llm::stub::call(
+                "p1",
+                "bash",
+                json!({"command": "rm -rf /nonexistent-twig-gate && printf ran > marker.txt"}),
+            )],
+        )]);
+        {
+            let mut d1 =
+                crate::runtime::Daemon::new(&llm, &root, &runs, "paused1", &crate::config::HarnessConfig::default())
+                    .unwrap();
+            let out = d1
+                .dispatch("turn", &json!({"input": "run gated"}), &mut |_| {})
+                .unwrap();
+            assert_eq!(out["reason"], "awaiting_approval");
+        }
+        // Re-opening the session (as `twig web` or `twig exec --resume` does) preserves `recovered: false`
+        // because the pause was clean (`paused: true` with no `tool.started`), so allowing executes cleanly!
+        let mut d2 =
+            crate::runtime::Daemon::new(&llm, &root, &runs, "paused1", &crate::config::HarnessConfig::default())
+                .unwrap();
+        let resolved = d2
+            .dispatch("approval.resolve", &json!({"id": "p1", "allow": true}), &mut |_| {})
+            .unwrap();
+        assert_eq!(resolved["recovered"], false);
+        assert_eq!(std::fs::read_to_string(root.join("marker.txt")).unwrap(), "ran");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let arch_dir = std::env::temp_dir().join(format!("twig-archive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&arch_dir);
+        std::fs::create_dir_all(&arch_dir).unwrap();
+        std::fs::write(arch_dir.join("s1.jsonl"), "{}\n").unwrap();
+        std::fs::write(arch_dir.join("s1.lock"), "1").unwrap();
+        let dst = archive_session_in(&arch_dir, "s1").unwrap();
+        assert!(dst.ends_with("archive/s1.jsonl"));
+        assert!(!arch_dir.join("s1.jsonl").exists());
+        assert!(!arch_dir.join("s1.lock").exists());
+        assert!(arch_dir.join("archive/s1.jsonl").exists());
+        let _ = std::fs::remove_dir_all(&arch_dir);
     }
 }

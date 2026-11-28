@@ -54,12 +54,44 @@ impl Tools {
         }
     }
 
-    pub(crate) fn stamped_meta(&self, rel: &str) -> Option<(u128, u64)> {
-        if rel.starts_with("artifact:") || rel.starts_with("session:") {
-            return None;
+    pub(crate) fn outcome_stamps(
+        &self,
+        tool: &str,
+        args: &Value,
+    ) -> (Option<Value>, Option<Value>) {
+        if matches!(tool, "read" | "edit" | "write") {
+            let single = args
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|rel| !rel.starts_with("artifact:") && !rel.starts_with("session:"))
+                .and_then(|rel| self.resolve_existing_in_worktree(rel).ok())
+                .and_then(|(_, target)| self.read_stamps.get(&target).copied())
+                .map(|(ns, len)| serde_json::json!([ns.to_string(), len]));
+            return (single, None);
         }
-        let (_, target) = self.resolve_existing_in_worktree(rel).ok()?;
-        self.read_stamps.get(&target).copied()
+        if tool == "apply_patch" {
+            let mut map = serde_json::Map::new();
+            if let Some(patch_text) = args.get("patch").and_then(Value::as_str) {
+                if let Ok(ops) = parse_patch_ops(patch_text) {
+                    for op in ops {
+                        let rel_opt = match op {
+                            PatchOp::Add { path, .. } | PatchOp::Update { path, .. } => Some(path),
+                            PatchOp::Delete { .. } => None,
+                        };
+                        if let Some(rel) = rel_opt {
+                            if let Ok((_, target)) = self.resolve_existing_in_worktree(&rel) {
+                                if let Some(&(ns, len)) = self.read_stamps.get(&target) {
+                                    map.insert(rel, serde_json::json!([ns.to_string(), len]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let multi = (!map.is_empty()).then_some(Value::Object(map));
+            return (None, multi);
+        }
+        (None, None)
     }
 
     /// Re-hydrate `read_stamps` from recovered session `tool.result` rows only when the file
@@ -73,6 +105,29 @@ impl Tools {
             let Some(tool) = row["tool"].as_str() else {
                 continue;
             };
+            if tool == "apply_patch" {
+                if let Some(stamps) = row.get("stamps").and_then(Value::as_object) {
+                    for (rel, val) in stamps {
+                        let Ok((_, target)) = self.resolve_existing_in_worktree(rel) else {
+                            continue;
+                        };
+                        let Some((mtime_ns, len)) = file_stamp(&target) else {
+                            continue;
+                        };
+                        if let Some(arr) = val.as_array() {
+                            let rec_ns = arr
+                                .first()
+                                .and_then(Value::as_str)
+                                .and_then(|s| s.parse::<u128>().ok());
+                            let rec_len = arr.get(1).and_then(Value::as_u64);
+                            if rec_ns == Some(mtime_ns) && rec_len == Some(len) {
+                                self.read_stamps.insert(target, (mtime_ns, len));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if !matches!(tool, "read" | "edit" | "write") {
                 continue;
             }

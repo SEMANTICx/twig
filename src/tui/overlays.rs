@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use serde_json::Value;
 
-use super::client::SessionSummary;
+use crate::runtime::session::SessionInfo;
 use super::markdown::{
     clip_str, display_width, fmt_elapsed_compact, wrap_plain, DiffGutterState, ACCENT, ACCENT_PEAK,
     AMBER, BASH_MODE_COLOR, IVORY, MEMORY_MODE_COLOR, MUTED, ROSE, SAGE, STONE, SURFACE,
@@ -422,7 +422,7 @@ pub enum PickerOutcome {
 /// Borderless Codex-style interactive overlay picker shared by `/resume`, `/model`, `/effort`, `/rewind`, `Ctrl+R`, `Ctrl+T`, and `#` memory.
 pub enum OverlayPicker {
     Resume {
-        sessions: Vec<SessionSummary>,
+        sessions: Vec<SessionInfo>,
         all_repos: bool,
         sel: usize,
     },
@@ -458,7 +458,7 @@ pub enum OverlayPicker {
 }
 
 impl OverlayPicker {
-    pub fn resume(sessions: Vec<SessionSummary>, all_repos: bool) -> Self {
+    pub fn resume(sessions: Vec<SessionInfo>, all_repos: bool) -> Self {
         Self::Resume {
             sessions,
             all_repos,
@@ -1171,7 +1171,7 @@ fn render_model_picker(
 fn render_resume_picker(
     frame: &mut Frame,
     area: Rect,
-    sessions: &[SessionSummary],
+    sessions: &[SessionInfo],
     all_repos: bool,
     sel: usize,
 ) {
@@ -1209,6 +1209,7 @@ fn render_resume_picker(
             let marker = if active { " › " } else { "   " };
             let (inbox_tag, inbox_color) = match s.status.as_str() {
                 "approval" => ("▲ wait ", AMBER),
+                "running" => ("● run  ", ACCENT),
                 "dirty" => ("● diff ", ACCENT_PEAK),
                 _ => ("✓ ok   ", SAGE),
             };

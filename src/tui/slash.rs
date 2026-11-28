@@ -9,11 +9,11 @@ use ratatui::Terminal;
 use serde_json::{json, Value};
 
 use super::client::{
-    archive_session_file, edit_file_in_external_editor, ensure_memory_file, format_config_report,
-    format_init_report, format_mcp_report, format_tasks_report, format_verify_report,
-    init_project_files, list_sessions, load_image_data_url, paste_clipboard_image,
-    read_memory_preview, run_git_diff, write_export_file, LocalMsg, LocalWorkers, ServeClient,
-    ServerMsg, TerminalGuard, EVOLVE_PROMPT,
+    edit_file_in_external_editor, ensure_memory_file, format_config_report, format_init_report,
+    format_mcp_report, format_tasks_report, format_verify_report, init_project_files,
+    load_image_data_url, paste_clipboard_image, read_memory_preview, run_git_diff,
+    write_export_file, LocalMsg, LocalWorkers, ServeClient, ServerMsg, TerminalGuard,
+    EVOLVE_PROMPT,
 };
 use super::composer::{parse_slash, SlashCommand};
 use super::markdown::{format_status_notice, FooterMode};
@@ -985,11 +985,12 @@ impl App {
 
     pub(super) fn open_resume_picker(&mut self, all_repos: bool) {
         let sessions = if all_repos {
-            list_sessions(None)
+            crate::runtime::session::scan_sessions(None, 25)
         } else {
-            let scoped = list_sessions(Some(&self.repo_raw));
+            let scoped =
+                crate::runtime::session::scan_sessions(Some(std::path::Path::new(&self.repo_raw)), 25);
             if scoped.is_empty() {
-                let global = list_sessions(None);
+                let global = crate::runtime::session::scan_sessions(None, 25);
                 if !global.is_empty() {
                     self.overlay_picker = Some(OverlayPicker::resume(global, true));
                     return;
@@ -1247,7 +1248,7 @@ impl App {
             SlashCommand::ArchiveSession => {
                 let old_sid = self.sid.clone();
                 if self.replace_client(client, None) {
-                    match archive_session_file(&old_sid) {
+                    match crate::runtime::session::archive_session(&old_sid) {
                         Ok(dst) => {
                             let short: String = old_sid.chars().take(10).collect();
                             self.flash(format!("Archived {short}"));

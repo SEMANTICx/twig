@@ -93,33 +93,6 @@ pub fn notify_osc99(title: &str, body: &str) {
     let _ = stdout.flush();
 }
 
-#[derive(Debug, Clone)]
-pub struct SessionSummary {
-    pub sid: String,
-    pub label: String,
-    pub turns: usize,
-    pub age: String,
-    pub status: String,
-    pub branch: Option<String>,
-}
-
-/// Scan `~/.local/state/twig/sessions/*.jsonl` newest-first for `/resume`.
-/// When `repo_filter` is `Some`, only sessions bound to that repository are returned.
-pub fn list_sessions(repo_filter: Option<&str>) -> Vec<SessionSummary> {
-    let filter_path = repo_filter.map(Path::new);
-    crate::runtime::session::scan_sessions(filter_path, 25)
-        .into_iter()
-        .map(|s| SessionSummary {
-            sid: s.sid,
-            label: s.label,
-            turns: s.turns,
-            age: s.age,
-            status: s.status,
-            branch: s.branch,
-        })
-        .collect()
-}
-
 /// Run a local quick shell command (`!cmd`) directly in `repo` without spending LLM tokens.
 pub fn run_local_shell(repo: &str, cmd: &str) -> (String, Option<i32>, Duration) {
     let started = Instant::now();
@@ -510,31 +483,6 @@ pub fn init_project_files(repo: &str) -> Result<(Vec<String>, Vec<String>), Stri
         }
     }
     Ok((created, existing))
-}
-
-/// Archive `<sid>.jsonl` into `<state_dir>/sessions/archive/` and clean any stale lock file.
-pub fn archive_session_file(sid: &str) -> Result<String, String> {
-    archive_session_in_dir(&paths::state_dir().join("sessions"), sid)
-}
-
-fn archive_session_in_dir(sessions_dir: &Path, sid: &str) -> Result<String, String> {
-    let trimmed = sid.trim();
-    if trimmed.is_empty() {
-        return Err("no active session id to archive".into());
-    }
-    let src = sessions_dir.join(format!("{trimmed}.jsonl"));
-    if !src.exists() {
-        return Err(format!("session record not found: {}", src.display()));
-    }
-    let archive_dir = sessions_dir.join("archive");
-    std::fs::create_dir_all(&archive_dir).map_err(|e| format!("create archive dir: {e}"))?;
-    let dst = archive_dir.join(format!("{trimmed}.jsonl"));
-    std::fs::rename(&src, &dst).map_err(|e| format!("archive session: {e}"))?;
-    let lock = sessions_dir.join(format!("{trimmed}.lock"));
-    if lock.exists() {
-        let _ = std::fs::remove_file(lock);
-    }
-    Ok(dst.display().to_string())
 }
 
 /// Write exported transcript Markdown to a default or user-specified path under `repo`.
@@ -1713,22 +1661,6 @@ mod tests {
             std::fs::read_to_string(dir.join(".twig/preferences.md")).unwrap(),
             "custom prefs\n"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn archive_session_moves_jsonl_and_cleans_lock() {
-        let dir = std::env::temp_dir().join(format!("twig-archive-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("s1.jsonl"), "{}\n").unwrap();
-        std::fs::write(dir.join("s1.lock"), "1").unwrap();
-
-        let dst = archive_session_in_dir(&dir, "s1").unwrap();
-        assert!(dst.ends_with("archive/s1.jsonl"));
-        assert!(!dir.join("s1.jsonl").exists());
-        assert!(!dir.join("s1.lock").exists());
-        assert!(dir.join("archive/s1.jsonl").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

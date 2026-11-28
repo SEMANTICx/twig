@@ -789,23 +789,7 @@ impl Tools {
         let Some(items) = args.get("items").and_then(Value::as_array) else {
             return "invalid todo: expected items array".into();
         };
-        let mut normalized = Vec::new();
-        let mut completed = 0usize;
-        for item in items.iter().take(32) {
-            let content = item["content"].as_str().unwrap_or("").trim();
-            if content.is_empty() {
-                continue;
-            }
-            let status = match item["status"].as_str().unwrap_or("pending") {
-                "completed" => {
-                    completed += 1;
-                    "completed"
-                }
-                "in_progress" => "in_progress",
-                _ => "pending",
-            };
-            normalized.push(json!({"content": content, "status": status}));
-        }
+        let (normalized, completed) = normalize_todo_items(items);
         emit(json!({"ev": "todo.updated", "items": normalized}));
         self.last_exit_code = Some(0);
         if completed < normalized.len() {
@@ -909,6 +893,27 @@ impl Tools {
         }
         Ok(self.agent_pool.as_ref().unwrap().clone())
     }
+}
+
+pub(crate) fn normalize_todo_items(items: &[Value]) -> (Vec<Value>, usize) {
+    let mut normalized = Vec::new();
+    let mut completed = 0usize;
+    for item in items.iter().take(32) {
+        let content = item["content"].as_str().unwrap_or("").trim();
+        if content.is_empty() {
+            continue;
+        }
+        let status = match item["status"].as_str().unwrap_or("pending") {
+            "completed" => {
+                completed += 1;
+                "completed"
+            }
+            "in_progress" => "in_progress",
+            _ => "pending",
+        };
+        normalized.push(json!({"content": content, "status": status}));
+    }
+    (normalized, completed)
 }
 
 struct SubagentSpec<'a> {
@@ -1799,10 +1804,15 @@ mod tests {
         );
 
         // 4b. Session stamp recovery rejects files modified even 10ms after the recorded stamp.
-        let stamp_before = t.stamped_meta("src/engine.rs");
+        let (stamp_before, _) = t.outcome_stamps("read", &json!({"path": "src/engine.rs"}));
         assert!(stamp_before.is_none());
         let _ = t.run(&call("read", json!({"path": "src/engine.rs"})));
-        let (orig_ns, orig_len) = t.stamped_meta("src/engine.rs").unwrap();
+        let stamp_arr = t
+            .outcome_stamps("read", &json!({"path": "src/engine.rs"}))
+            .0
+            .unwrap();
+        let orig_ns: u128 = stamp_arr[0].as_str().unwrap().parse().unwrap();
+        let orig_len = stamp_arr[1].as_u64().unwrap();
         std::fs::write(d.join("src/engine.rs"), "// externally modified\n").unwrap();
         let mut t_resumed = Tools::new(&d);
         t_resumed.restore_read_stamps(&[json!({
@@ -1814,7 +1824,10 @@ mod tests {
             "ts": (orig_ns / 1_000_000)
         })]);
         assert!(
-            t_resumed.stamped_meta("src/engine.rs").is_none(),
+            t_resumed
+                .outcome_stamps("read", &json!({"path": "src/engine.rs"}))
+                .0
+                .is_none(),
             "externally modified file must not be marked already-read after recovery"
         );
         std::fs::write(

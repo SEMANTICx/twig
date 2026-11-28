@@ -51,14 +51,10 @@ fn record_tool_outcome(
     audit_sink: &mut dyn FnMut(&ToolCall, &str),
     emit: &mut dyn FnMut(Value),
 ) -> Result<String, String> {
-    let stamp = if exit_code == Some(0) && matches!(call.name.as_str(), "read" | "edit" | "write") {
-        call.args
-            .get("path")
-            .and_then(Value::as_str)
-            .and_then(|p| env.tools.stamped_meta(p))
-            .map(|(ns, len)| json!([ns.to_string(), len]))
+    let (stamp, multi_stamps) = if exit_code == Some(0) {
+        env.tools.outcome_stamps(&call.name, &call.args)
     } else {
-        None
+        (None, None)
     };
     let mut rec_row = json!({
         "id": call.id,
@@ -68,8 +64,13 @@ fn record_tool_outcome(
         "output": output,
         "exit_code": exit_code
     });
-    if let (Some(s), Some(obj)) = (stamp, rec_row.as_object_mut()) {
-        obj.insert("stamp".into(), s);
+    if let Some(obj) = rec_row.as_object_mut() {
+        if let Some(s) = stamp {
+            obj.insert("stamp".into(), s);
+        }
+        if let Some(ms) = multi_stamps {
+            obj.insert("stamps".into(), ms);
+        }
     }
     env.record
         .append("tool.result", rec_row)
@@ -81,9 +82,10 @@ fn record_tool_outcome(
         emit(json!({"ev": "papercut.filed", "report": call.args}));
     }
     if call.name == "todo" && output.starts_with("todo updated") {
-        if let Some(items) = call.args.get("items") {
+        if let Some(items) = call.args.get("items").and_then(Value::as_array) {
+            let (normalized, _) = super::tools::normalize_todo_items(items);
             env.record
-                .append("todo.updated", json!({"items": items}))
+                .append("todo.updated", json!({"items": normalized}))
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -487,7 +489,7 @@ pub fn run_turn_live(
             record
                 .append(
                     "approval.requested",
-                    json!({"id": call.id, "name": call.name, "args": call.args}),
+                    json!({"id": call.id, "name": call.name, "args": call.args, "paused": !interactive}),
                 )
                 .map_err(|e| e.to_string())?;
             emit(json!({"ev": "approval.requested", "id": call.id, "name": call.name, "args": call.args}));

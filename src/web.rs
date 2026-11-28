@@ -233,84 +233,12 @@ fn write_http(
 }
 
 fn inspect_session_detail(sid: &str, state: &Arc<WebState>) -> Result<Value, String> {
-    if !paths::valid_session(sid) {
-        return Err("invalid session id".into());
-    }
-    let path = paths::state_dir()
-        .join("sessions")
-        .join(format!("{sid}.jsonl"));
-    if !path.exists() {
-        return Err("session not found".into());
-    }
-    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let mut worktree = state.default_repo.display().to_string();
-    let mut branch = String::new();
-    let mut model = String::new();
-    let mut messages = Vec::new();
-    let mut pending_map = serde_json::Map::new();
-
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(row) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        match row["kind"].as_str() {
-            Some("session.meta") => {
-                if let Some(w) = row["worktree"].as_str().filter(|s| !s.is_empty()) {
-                    worktree = w.to_owned();
-                }
-                if let Some(b) = row["branch"].as_str().filter(|s| !s.is_empty()) {
-                    branch = b.to_owned();
-                }
-                if let Some(m) = row["model"].as_str().filter(|s| !s.is_empty()) {
-                    model = m.to_owned();
-                }
-            }
-            Some("messages.checkpoint") => {
-                if let Some(arr) = row["messages"].as_array() {
-                    messages = arr.clone();
-                }
-            }
-            Some("message") => messages.push(row["message"].clone()),
-            Some("approval.requested") => {
-                if let Some(id) = row["id"].as_str() {
-                    pending_map.insert(id.to_owned(), row);
-                }
-            }
-            Some("approval.resolved") | Some("tool.result") => {
-                if let Some(id) = row["id"].as_str() {
-                    pending_map.remove(id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let diff = Command::new("git")
-        .args(["-C", &worktree, "diff", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.chars().take(64_000).collect::<String>()
-        })
-        .unwrap_or_default();
-    let running = state
+    let in_flight = state
         .running_sids
         .lock()
         .map(|g| g.contains(sid))
         .unwrap_or(false);
-
-    Ok(json!({
-        "sid": sid,
-        "worktree": worktree,
-        "branch": branch,
-        "model": model,
-        "running": running,
-        "messages": messages,
-        "pending": pending_map.into_values().collect::<Vec<_>>(),
-        "diff": diff,
-    }))
+    crate::runtime::session::inspect_session_detail(sid, &state.default_repo, in_flight)
 }
 
 fn dispatch_background_turn(req: &Value, state: &Arc<WebState>) -> Result<Value, String> {
