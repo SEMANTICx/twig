@@ -448,165 +448,6 @@ pub(super) fn recover_session(rows: &[Value], default_check: Option<Check>) -> S
     }
 }
 
-/// Capture a non-intrusive Git tree object snapshot of the worktree (tracked + untracked
-/// non-ignored files) using a temporary `GIT_INDEX_FILE` without touching `.git/index`.
-pub(super) fn capture_worktree_snapshot(worktree: &Path) -> Option<String> {
-    if !worktree.join(".git").exists() {
-        let probe = Command::new("git")
-            .args(["-C"])
-            .arg(worktree)
-            .args(["rev-parse", "--is-inside-work-tree"])
-            .output()
-            .ok()?;
-        if !probe.status.success() {
-            return None;
-        }
-    }
-    let tmp_idx = std::env::temp_dir().join(format!(
-        "twig-snap-idx-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let _ = std::fs::remove_file(&tmp_idx);
-    let read_head = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["read-tree", "HEAD"])
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output();
-    if let Ok(o) = read_head {
-        let _ = o;
-    }
-    let add_ok = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["add", "-A"])
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !add_ok {
-        let _ = std::fs::remove_file(&tmp_idx);
-        return None;
-    }
-    let tree_out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .arg("write-tree")
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output()
-        .ok();
-    let _ = std::fs::remove_file(&tmp_idx);
-    let out = tree_out?;
-    if !out.status.success() {
-        return None;
-    }
-    let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!oid.is_empty()).then_some(oid)
-}
-
-/// Restore the working tree to a previously captured Git tree OID without altering `HEAD`
-/// or the user's staged `.git/index` beyond matching the target snapshot.
-pub(super) fn restore_worktree_snapshot(worktree: &Path, tree_oid: &str) -> Result<String, String> {
-    if tree_oid.trim().is_empty() {
-        return Err("empty snapshot tree id".into());
-    }
-    let tmp_idx = std::env::temp_dir().join(format!(
-        "twig-restore-idx-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let cleanup = |p: &Path| {
-        let _ = std::fs::remove_file(p);
-    };
-    let rt = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["read-tree", tree_oid])
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output()
-        .map_err(|e| format!("git read-tree: {e}"))?;
-    if !rt.status.success() {
-        cleanup(&tmp_idx);
-        return Err(format!(
-            "git read-tree failed: {}",
-            String::from_utf8_lossy(&rt.stderr).trim()
-        ));
-    }
-    // Remove files created after the snapshot that do not exist in `tree_oid` (excluding ignored files).
-    let snap_files_out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["ls-files", "-z"])
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output()
-        .map_err(|e| format!("git ls-files: {e}"))?;
-    if !snap_files_out.status.success() {
-        cleanup(&tmp_idx);
-        return Err(format!(
-            "git ls-files snapshot failed: {}",
-            String::from_utf8_lossy(&snap_files_out.stderr).trim()
-        ));
-    }
-    let snap_set: HashSet<String> = String::from_utf8_lossy(&snap_files_out.stdout)
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-
-    let cur_files_out = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
-        .output()
-        .map_err(|e| format!("git ls-files current: {e}"))?;
-    if !cur_files_out.status.success() {
-        cleanup(&tmp_idx);
-        return Err(format!(
-            "git ls-files current failed: {}",
-            String::from_utf8_lossy(&cur_files_out.stderr).trim()
-        ));
-    }
-    let mut removed = 0usize;
-    for rel in String::from_utf8_lossy(&cur_files_out.stdout)
-        .split('\0')
-        .filter(|s| !s.is_empty())
-    {
-        if !snap_set.contains(rel) {
-            let p = worktree.join(rel);
-            if p.is_file() && std::fs::remove_file(&p).is_ok() {
-                removed += 1;
-            }
-        }
-    }
-
-    let co = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["checkout-index", "-a", "-f"])
-        .env("GIT_INDEX_FILE", &tmp_idx)
-        .output()
-        .map_err(|e| format!("git checkout-index: {e}"))?;
-    cleanup(&tmp_idx);
-    if !co.status.success() {
-        return Err(format!(
-            "git checkout-index failed: {}",
-            String::from_utf8_lossy(&co.stderr).trim()
-        ));
-    }
-    Ok(format!(
-        "restored worktree to snapshot {} ({} files, {} extra removed)",
-        &tree_oid[..tree_oid.len().min(10)],
-        snap_set.len(),
-        removed
-    ))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub sid: String,
@@ -1104,13 +945,13 @@ pub fn load_child_threads(parent_sid: &str, extra_subagents_root: Option<&Path>)
     matched
 }
 
-fn read_session_worktree(sid: &str) -> Option<String> {
+pub fn session_worktree(sid: &str) -> Option<String> {
     let path = locate_session_jsonl(sid)?;
     let rows = read_jsonl_lenient(&path).ok()?;
     recover_session(&rows, None).worktree
 }
 
-pub(super) fn load_session_patch(sid: &str, extra_artifacts: Option<&Path>) -> Result<String, String> {
+pub fn load_session_patch(sid: &str, extra_artifacts: Option<&Path>) -> Result<String, String> {
     let trimmed = sid.trim();
     if !paths::valid_session(trimmed) {
         return Err(format!("invalid session id {trimmed:?}"));
@@ -1152,7 +993,7 @@ pub(super) fn load_session_patch(sid: &str, extra_artifacts: Option<&Path>) -> R
             return Ok(text);
         }
     }
-    if let Some(wt) = read_session_worktree(trimmed) {
+    if let Some(wt) = session_worktree(trimmed) {
         let out = Command::new("git")
             .args(["-C", &wt, "diff", "HEAD"])
             .output()
@@ -1165,57 +1006,13 @@ pub(super) fn load_session_patch(sid: &str, extra_artifacts: Option<&Path>) -> R
     Err(format!("no saved patch or uncommitted diff found for session {trimmed:?}"))
 }
 
-fn apply_patch_in_repo(repo: &Path, patch_text: &str, sid: &str) -> Result<String, String> {
-    if patch_text.trim().is_empty() {
-        return Err(format!("empty patch for session {sid}"));
-    }
-    if patch_text.lines().any(|l| {
-        l.starts_with("new file mode 120000")
-            || l.starts_with("old mode 120000")
-            || l.starts_with("new mode 120000")
-    }) {
-        return Err(format!(
-            "refused patch from session {sid}: symlink mode 120000 is disallowed"
-        ));
-    }
-    let tmp = std::env::temp_dir().join(format!(
-        "twig-cli-apply-{}-{}.patch",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    std::fs::write(&tmp, patch_text).map_err(|e| e.to_string())?;
-    let chk = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["apply", "--check"])
-        .arg(&tmp)
-        .output()
-        .map_err(|e| format!("git apply --check: {e}"))?;
-    if !chk.status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "patch from {sid} does not apply cleanly:\n{}",
-            String::from_utf8_lossy(&chk.stderr).trim()
-        ));
-    }
-    let app = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("apply")
-        .arg(&tmp)
-        .output()
-        .map_err(|e| format!("git apply: {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    if !app.status.success() {
-        return Err(format!(
-            "git apply failed:\n{}",
-            String::from_utf8_lossy(&app.stderr).trim()
-        ));
-    }
-    Ok(format!("applied patch from session {sid}"))
+pub fn apply_session_patch(repo: &Path, sid: &str) -> Result<String, String> {
+    let patch = load_session_patch(sid, None)?;
+    let targets = super::git_ops::apply_confined_git_patch(repo, &patch, &format!("session:{sid}"))?;
+    Ok(format!(
+        "applied patch from session {sid} ({} file(s))",
+        targets.len()
+    ))
 }
 
 /// Clean up 0-byte empty session/lock remnants and stale clean subagent worktrees.
@@ -1257,303 +1054,6 @@ pub fn gc_sessions_and_subagents() -> Result<(usize, usize), String> {
     }
     let _ = Command::new("git").args(["worktree", "prune"]).output();
     Ok((wt_removed, empty_removed))
-}
-
-/// Non-interactive single-shot execution (`twig exec [flags] "<prompt>"`).
-pub fn run_headless_exec(args: &[String]) -> Result<i32, String> {
-    use std::io::Read;
-    let mut repo = String::from(".");
-    let mut role = String::from("code");
-    let mut model: Option<String> = None;
-    let mut effort: Option<String> = None;
-    let mut resume_sid: Option<String> = None;
-    let mut check_cmd: Option<String> = None;
-    let mut read_only = false;
-    let mut json_out = false;
-    let mut events_out = false;
-    let mut prompt_parts: Vec<String> = Vec::new();
-
-    let mut i = 0usize;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--repo" | "-C" => {
-                i += 1;
-                repo = args.get(i).cloned().ok_or("--repo requires a path")?;
-            }
-            "--role" => {
-                i += 1;
-                role = args.get(i).cloned().ok_or("--role requires a role name")?;
-            }
-            "--model" | "-m" => {
-                i += 1;
-                model = Some(args.get(i).cloned().ok_or("--model requires a model id")?);
-            }
-            "--effort" => {
-                i += 1;
-                effort = Some(args.get(i).cloned().ok_or("--effort requires a level")?);
-            }
-            "--resume" | "-r" => {
-                i += 1;
-                resume_sid = Some(args.get(i).cloned().ok_or("--resume requires a sid")?);
-            }
-            "--check" => {
-                i += 1;
-                check_cmd = Some(args.get(i).cloned().ok_or("--check requires a command")?);
-            }
-            "--read-only" | "--plan" => read_only = true,
-            "--json" => json_out = true,
-            "--events" | "--stream-json" => events_out = true,
-            "--" => {
-                prompt_parts.extend(args[i + 1..].iter().cloned());
-                break;
-            }
-            other if other.starts_with('-') && other != "-" => {
-                return Err(format!("unknown twig exec flag {other:?}"));
-            }
-            word => prompt_parts.push(word.to_owned()),
-        }
-        i += 1;
-    }
-
-    let mut prompt = prompt_parts.join(" ");
-    if prompt.trim().is_empty() || prompt.trim() == "-" {
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| format!("read stdin: {e}"))?;
-        prompt = buf;
-    }
-    if prompt.trim().is_empty() {
-        return Err(
-            "usage: twig exec [--repo DIR] [--role ROLE] [--model M] [--effort E] [--resume SID] [--read-only] [--check CMD] [--json] <PROMPT>"
-                .into(),
-        );
-    }
-
-    let sid = resume_sid.unwrap_or_else(paths::session_id);
-    if !paths::valid_session(&sid) {
-        return Err(format!("invalid session id {sid:?}"));
-    }
-    if repo == "." {
-        if let Some(saved_wt) = read_session_worktree(&sid) {
-            if Path::new(&saved_wt).is_dir() {
-                repo = saved_wt;
-            }
-        }
-    }
-
-    let (cfg, _) = crate::config::HarnessConfig::resolve()?;
-    let provider = crate::llm::Provider::new();
-    let runs_dir = paths::state_dir().join("sessions");
-    let mut daemon = super::Daemon::new(&provider, &repo, &runs_dir, &sid, &cfg)?;
-    if let Some(m) = model {
-        daemon.dispatch("model.set", &json!({"model": m}), &mut |_| {})?;
-    }
-    if let Some(e) = effort {
-        daemon.dispatch("effort.set", &json!({"effort": e}), &mut |_| {})?;
-    }
-    if read_only || matches!(role.as_str(), "plan" | "advisor" | "scout" | "reviewer") {
-        daemon.dispatch("mode.set", &json!({"plan": true}), &mut |_| {})?;
-    }
-    let mut turn_params = json!({"input": prompt, "role": role});
-    if let Some(cmd) = check_cmd {
-        turn_params["check"] = json!({"command": cmd});
-    }
-
-    let out = if events_out {
-        use std::io::Write;
-        daemon.dispatch("turn", &turn_params, &mut |ev| {
-            let mut stdout = std::io::stdout().lock();
-            let _ = writeln!(stdout, "{ev}");
-            let _ = stdout.flush();
-        })?
-    } else {
-        daemon.dispatch("turn", &turn_params, &mut |_| {})?
-    };
-    let done = out["done"] == true;
-    let reason = out["reason"].as_str().unwrap_or("unknown");
-    let text = out["text"].as_str().unwrap_or("");
-    let diff_stat = Command::new("git")
-        .args(["-C", &repo, "diff", "HEAD", "--shortstat"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty());
-
-    let rows: Vec<Value> = std::fs::read_to_string(daemon.record_path())
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .collect();
-    let usage = crate::llm::summarize_usage(&rows);
-
-    if events_out {
-        println!(
-            "{}",
-            json!({
-                "ev": "exec.completed",
-                "sid": sid,
-                "done": done,
-                "reason": reason,
-                "text": text,
-                "verified": out.get("verified").cloned().unwrap_or(Value::Null),
-                "diff_stat": diff_stat,
-                "usage": usage,
-            })
-        );
-    } else if json_out {
-        println!(
-            "{}",
-            json!({
-                "sid": sid,
-                "done": done,
-                "reason": reason,
-                "text": text,
-                "verified": out.get("verified").cloned().unwrap_or(Value::Null),
-                "diff_stat": diff_stat,
-                "usage": usage,
-            })
-        );
-    } else if !text.is_empty() {
-        println!("{text}");
-    } else if reason != "final" {
-        eprintln!("twig exec [{sid}]: ended with reason={reason}");
-    }
-
-    Ok(if done && reason == "final" {
-        0
-    } else if reason == "awaiting_approval" {
-        2
-    } else {
-        1
-    })
-}
-
-/// CLI management for first-class sessions (`twig session <list|search|show|spawn|send|diff|archive>`).
-pub fn run_session_cli(args: &[String]) -> Result<i32, String> {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    let has_flag = |f: &str| args.iter().any(|a| a == f);
-    let flag_val = |f: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == f)
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-    };
-
-    match sub {
-        "list" | "ls" => {
-            let all = has_flag("--all") || has_flag("-a");
-            let repo = flag_val("--repo").unwrap_or_else(|| ".".into());
-            let filter = (!all).then(|| Path::new(repo.as_str()));
-            let items = scan_sessions(filter, 40);
-            if has_flag("--json") {
-                println!("{}", serde_json::to_string_pretty(&items).unwrap_or_default());
-            } else if items.is_empty() {
-                println!("no sessions found (pass `--all` to list across all repositories)");
-            } else {
-                for s in items {
-                    let role = s.role.as_deref().unwrap_or("code");
-                    let wt = s.worktree.as_deref().unwrap_or("-");
-                    let badge = match s.status.as_str() {
-                        "approval" => "[▲ wait]  ",
-                        "running" => "[● run]   ",
-                        "dirty" => "[● diff]  ",
-                        _ => "[✓ ok]    ",
-                    };
-                    println!(
-                        "{badge}{:<24} {:<8} {:>3}t {:>7}  {}  ({})",
-                        s.sid, role, s.turns, s.age, s.label, wt
-                    );
-                }
-            }
-            Ok(0)
-        }
-        "search" => {
-            let query = args
-                .get(1)
-                .filter(|s| !s.starts_with('-'))
-                .ok_or("usage: twig session search <QUERY> [--all] [--json]")?;
-            let all = has_flag("--all") || has_flag("-a");
-            let repo = flag_val("--repo").unwrap_or_else(|| ".".into());
-            let filter = (!all).then(|| Path::new(repo.as_str()));
-            let hits = search_sessions(query, filter, 25);
-            if has_flag("--json") {
-                println!("{}", serde_json::to_string_pretty(&hits).unwrap_or_default());
-            } else if hits.is_empty() {
-                println!("no session matches for {query:?}");
-            } else {
-                for h in hits {
-                    println!(
-                        "session {} ({})",
-                        h["sid"].as_str().unwrap_or("?"),
-                        h["worktree"].as_str().unwrap_or("-")
-                    );
-                    for m in h["matches"].as_array().into_iter().flatten() {
-                        if let Some(line) = m.as_str() {
-                            println!("  {line}");
-                        }
-                    }
-                }
-            }
-            Ok(0)
-        }
-        "show" | "inspect" => {
-            let sid = args.get(1).ok_or("usage: twig session show <SID>")?;
-            let text = format_session_transcript(sid)?;
-            print!("{text}");
-            Ok(0)
-        }
-        "spawn" => {
-            let mut exec_args = vec!["--json".to_owned()];
-            exec_args.extend(args[1..].iter().cloned());
-            run_headless_exec(&exec_args)
-        }
-        "send" => {
-            let sid = args.get(1).ok_or("usage: twig session send <SID> <PROMPT...>")?;
-            if args.len() < 3 {
-                return Err("usage: twig session send <SID> <PROMPT...>".into());
-            }
-            let mut exec_args = vec![
-                "--resume".to_owned(),
-                sid.clone(),
-                "--json".to_owned(),
-            ];
-            exec_args.extend(args[2..].iter().cloned());
-            run_headless_exec(&exec_args)
-        }
-        "diff" => {
-            let sid = args.get(1).ok_or("usage: twig session diff <SID>")?;
-            let patch = load_session_patch(sid, None)?;
-            print!("{patch}");
-            Ok(0)
-        }
-        "apply" => {
-            let sid = args
-                .get(1)
-                .filter(|s| !s.starts_with('-'))
-                .ok_or("usage: twig session apply <SID> [--repo DIR]")?;
-            let repo = flag_val("--repo").unwrap_or_else(|| ".".into());
-            let patch = load_session_patch(sid, None)?;
-            let msg = apply_patch_in_repo(Path::new(&repo), &patch, sid)?;
-            println!("{msg}");
-            Ok(0)
-        }
-        "gc" => {
-            let (wt, empty) = gc_sessions_and_subagents()?;
-            println!("gc: removed {wt} clean subagent worktree(s) and {empty} empty session file(s)");
-            Ok(0)
-        }
-        "archive" => {
-            let sid = args.get(1).ok_or("usage: twig session archive <SID>")?;
-            let dst = archive_session(sid)?;
-            println!("{dst}");
-            Ok(0)
-        }
-        other => Err(format!(
-            "unknown session subcommand {other:?}; expected list, search, show, spawn, send, diff, apply, archive, or gc"
-        )),
-    }
 }
 
 #[cfg(test)]
@@ -1620,7 +1120,7 @@ mod tests {
             append_repo_instructions(&repo, "claude-sonnet", &mut sys);
             assert!(!sys.contains("SECRET_HOST_KEY"));
         }
-        assert!(run_session_cli(&["archive".into(), "../escape".into()]).is_err());
+        assert!(archive_session("../escape").is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 

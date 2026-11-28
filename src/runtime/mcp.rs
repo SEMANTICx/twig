@@ -52,8 +52,11 @@ struct McpProcess {
 
 fn clip_mcp_text(text: String) -> String {
     if text.len() > MAX_MCP_OUTPUT_BYTES {
-        let clipped: String = text.chars().take(MAX_MCP_OUTPUT_BYTES).collect();
-        format!("{clipped}\n... [mcp output truncated]")
+        let mut end = MAX_MCP_OUTPUT_BYTES.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n... [mcp output truncated]", &text[..end])
     } else {
         text
     }

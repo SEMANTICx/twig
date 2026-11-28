@@ -256,68 +256,7 @@ fn collect_worktree_diff(worktree: &Path) -> (Option<String>, String) {
 /// and untracked non-ignored files, then record a local detached baseline commit so
 /// `git diff HEAD` inside the subagent reflects ONLY the subagent's own delta!
 fn hydrate_from_parent_worktree(repo: &Path, sub_wt: &Path) {
-    use std::io::Write;
-    let mut dirty = false;
-    if let Ok(diff_out) = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["diff", "HEAD", "--binary"])
-        .output()
-    {
-        if diff_out.status.success() && !diff_out.stdout.is_empty() {
-            if let Ok(mut child) = Command::new("git")
-                .arg("-C")
-                .arg(sub_wt)
-                .args(["apply", "--whitespace=nowarn", "-"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&diff_out.stdout);
-                }
-                if child.wait().is_ok_and(|s| s.success()) {
-                    dirty = true;
-                }
-            }
-        }
-    }
-
-    if let Ok(untracked) = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["ls-files", "-z", "--others", "--exclude-standard"])
-        .output()
-    {
-        if untracked.status.success() {
-            for rel in String::from_utf8_lossy(&untracked.stdout)
-                .split('\0')
-                .filter(|s| !s.is_empty())
-            {
-                let src = repo.join(rel);
-                if super::policy::is_sensitive_secret_path(rel) {
-                    continue;
-                }
-                if let Ok(meta) = std::fs::symlink_metadata(&src) {
-                    if !meta.file_type().is_symlink()
-                        && meta.is_file()
-                        && meta.len() <= 4 * 1024 * 1024
-                    {
-                        let dst = sub_wt.join(rel);
-                        if let Some(parent) = dst.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if std::fs::copy(&src, &dst).is_ok() {
-                            dirty = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if dirty {
+    if super::git_ops::carry_uncommitted_state(repo, sub_wt) {
         let _ = Command::new("git")
             .arg("-C")
             .arg(sub_wt)

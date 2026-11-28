@@ -289,14 +289,14 @@ fn main() {
     match cmd {
         "--version" | "version" => println!("twig {}", env!("CARGO_PKG_VERSION")),
         "selfcheck" => selfcheck(),
-        "exec" => match twig::runtime::session::run_headless_exec(&args[1..]) {
+        "exec" => match twig::cli::run_headless_exec(&args[1..]) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("twig exec: {e}");
                 std::process::exit(2);
             }
         },
-        "session" | "sessions" => match twig::runtime::session::run_session_cli(&args[1..]) {
+        "session" | "sessions" => match twig::cli::run_session_cli(&args[1..]) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("twig session: {e}");
@@ -327,138 +327,7 @@ fn main() {
             }
         }
         "doctor" => {
-            let mut failed = false;
-            println!(
-                "config_path: {}\nstate_dir:   {}",
-                paths::config_path().display(),
-                paths::state_dir().display()
-            );
-            match HarnessConfig::resolve() {
-                Ok((_, src)) => println!("config:      ok ({src})"),
-                Err(e) => {
-                    println!("config:      FAIL ({e})");
-                    failed = true;
-                }
-            }
-            let provider = Provider::new();
-            let env_model = std::env::var_os("TWIG_MODEL").is_some();
-            let env_roles = std::env::var_os("TWIG_ROLES").is_some();
-            let saved_model = Provider::saved_model();
-            let model_src = if env_model {
-                "env TWIG_MODEL"
-            } else if env_roles {
-                "env TWIG_ROLES"
-            } else if saved_model.is_some() {
-                "saved model.txt"
-            } else {
-                "default"
-            };
-            println!(
-                "model:       {} ({model_src}) · effort: {}",
-                provider.roles().get("code"),
-                provider.effort().as_deref().unwrap_or("off")
-            );
-            if let Ok(roles_val) = Provider::apply_config(twig::llm::ConfigOp::RolesReport) {
-                if let Some(roles_text) = roles_val["report"].as_str() {
-                    for line in roles_text.lines().skip(1) {
-                        println!("{line}");
-                    }
-                }
-            }
-            if (env_model || env_roles) && saved_model.is_some() {
-                println!(
-                    "  warn: saved model ({}) is overridden by shell env (TWIG_MODEL/TWIG_ROLES)",
-                    saved_model.as_deref().unwrap_or("")
-                );
-            }
-            let tools_to_check: &[&str] = if cfg!(target_os = "linux") {
-                &["git", "gh", "bwrap"]
-            } else {
-                &["git", "gh"]
-            };
-            for exe in tools_to_check {
-                let ok = std::process::Command::new(exe)
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                println!("{exe:<12} {}", if ok { "available" } else { "missing" });
-                if *exe == "git" && !ok {
-                    failed = true;
-                }
-            }
-            #[cfg(target_os = "linux")]
-            {
-                println!(
-                    "bwrap_ns:    {}",
-                    if twig::isolation::bwrap_userns_usable() {
-                        "ok (user namespaces enabled)"
-                    } else {
-                        "unavailable (sandbox/subagent bwrap restricted in this environment)"
-                    }
-                );
-            }
-            #[cfg(not(target_os = "linux"))]
-            println!("sandbox:     worktree-only (bwrap OS isolation is Linux-only)");
-            match provider.list_models() {
-                Ok(models) => println!(
-                    "magpie:      ok ({} models at {})",
-                    models.len(),
-                    provider.base()
-                ),
-                Err(e) => println!("magpie:      unreachable ({e})"),
-            }
-            let repo_opt = Path::new(".twig/skills").is_dir().then(|| PathBuf::from("."));
-            let store = twig::playbook::SkillStore::default_for(repo_opt.as_deref());
-            let (skills_ok, skills_report) = store.doctor_report();
-            println!(
-                "skills:      {}",
-                if skills_ok { "ok" } else { "WARN" }
-            );
-            for line in skills_report.lines() {
-                println!("  {line}");
-            }
-            {
-                let mut doc_notes = Vec::new();
-                let mut doc_warn = false;
-                let has_agents = Path::new("AGENTS.md").is_file();
-                let has_claude = Path::new("CLAUDE.md").is_file();
-                if has_agents && has_claude {
-                    doc_warn = true;
-                    doc_notes.push("WARN duplicate root AGENTS.md + CLAUDE.md (twig prioritizes AGENTS.md; consolidate to avoid drift)".to_owned());
-                }
-                for (doc, max_lines, max_chars) in [
-                    ("AGENTS.md", 200usize, 8_000usize),
-                    ("CLAUDE.md", 200usize, 8_000usize),
-                    (".twig/preferences.md", 80usize, 2_400usize),
-                ] {
-                    if let Ok(body) = std::fs::read_to_string(doc) {
-                        let lines = body.lines().count();
-                        let chars = body.chars().count();
-                        if lines > max_lines || chars > max_chars {
-                            doc_warn = true;
-                            doc_notes.push(format!(
-                                "WARN {doc}: {lines} lines / {chars} chars exceeds {max_lines}L/{max_chars}c budget — move style rules to deterministic linters"
-                            ));
-                        } else {
-                            doc_notes.push(format!("ok   {doc}: {lines} lines ({chars} chars)"));
-                        }
-                    }
-                }
-                println!(
-                    "prompt_audit:{}",
-                    if doc_warn {
-                        " WARN"
-                    } else if doc_notes.is_empty() {
-                        " ok (no repo instruction files)"
-                    } else {
-                        " ok"
-                    }
-                );
-                for note in doc_notes {
-                    println!("  {note}");
-                }
-            }
-            if failed {
+            if !twig::cli::run_doctor() {
                 std::process::exit(1);
             }
         }
@@ -878,169 +747,9 @@ fn main() {
         }
 
         "verify" => {
-            if args.get(1).map(String::as_str) == Some("record") {
-                let mut raw_cli = false;
-                let mut inputs_file: Option<String> = None;
-                let mut inline_cases: Vec<Value> = Vec::new();
-                let mut pos: Vec<String> = Vec::new();
-                let mut i = 2usize;
-                while i < args.len() {
-                    match args[i].as_str() {
-                        "--raw" => raw_cli = true,
-                        "--inputs" => {
-                            i += 1;
-                            inputs_file = args.get(i).cloned();
-                        }
-                        "--stdin" => {
-                            i += 1;
-                            if let Some(s) = args.get(i) {
-                                raw_cli = true;
-                                inline_cases.push(json!({"_cli": {"args": [], "stdin": s}}));
-                            }
-                        }
-                        "--arg-case" => {
-                            i += 1;
-                            if let Some(s) = args.get(i) {
-                                raw_cli = true;
-                                let split: Vec<String> =
-                                    s.split_whitespace().map(str::to_owned).collect();
-                                inline_cases.push(json!({"_cli": {"args": split, "stdin": ""}}));
-                            }
-                        }
-                        "--" => {
-                            pos.extend(args[i + 1..].iter().cloned());
-                            break;
-                        }
-                        other => pos.push(other.to_owned()),
-                    }
-                    i += 1;
-                }
-                if pos.len() < 2 {
-                    eprintln!(
-                        "usage: twig verify record <journal.jsonl> <oracle_program> [args...] [--raw] [--inputs seeds.jsonl] [--stdin TEXT] [--arg-case \"FLAGS\"]"
-                    );
-                    std::process::exit(2);
-                }
-                if let Some(path) = inputs_file {
-                    let body = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-                        eprintln!("read {path}: {e}");
-                        std::process::exit(1);
-                    });
-                    for line in body.lines().filter(|l| !l.trim().is_empty()) {
-                        let v = serde_json::from_str::<Value>(line)
-                            .unwrap_or_else(|_| Value::String(format!("{line}\n")));
-                        inline_cases.push(v);
-                    }
-                }
-                if inline_cases.is_empty() {
-                    inline_cases = if raw_cli {
-                        vec![json!({"_cli": {"args": [], "stdin": ""}})]
-                    } else {
-                        twig::verify::derive_edges(&[json!({"ping": 1})])
-                    };
-                }
-                let journal = Path::new(&pos[0]);
-                let oracle = twig::verify::Candidate::new(pos[1].clone(), pos[2..].to_vec())
-                    .with_raw_cli(raw_cli);
-                match twig::verify::record_oracle(journal, &oracle, &inline_cases) {
-                    Ok(n) => {
-                        println!(
-                            "recorded {n} oracle case(s) into {}",
-                            journal.display()
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("verify record failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-
-            let mut min_cases = 1usize;
-            let mut min_branch = 0.0f64;
-            let mut json_out = false;
-            let mut raw_cli = false;
-            let mut ignore_fields: Vec<String> = Vec::new();
-            let mut pos: Vec<String> = Vec::new();
-            let mut i = 1usize;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--min-cases" => {
-                        i += 1;
-                        let parsed = args.get(i).and_then(|s| s.parse::<usize>().ok());
-                        match parsed {
-                            Some(n) if n >= 1 => min_cases = n,
-                            _ => {
-                                eprintln!("twig verify: --min-cases must be an integer >= 1");
-                                std::process::exit(2);
-                            }
-                        }
-                    }
-                    "--min-branch" => {
-                        i += 1;
-                        min_branch = args
-                            .get(i)
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0.0);
-                    }
-                    "--ignore" => {
-                        i += 1;
-                        if let Some(s) = args.get(i) {
-                            ignore_fields.extend(
-                                s.split(',')
-                                    .map(str::trim)
-                                    .filter(|x| !x.is_empty())
-                                    .map(str::to_owned),
-                            );
-                        }
-                    }
-                    "--raw" => raw_cli = true,
-                    "--json" => json_out = true,
-                    "--" => {
-                        pos.extend(args[i + 1..].iter().cloned());
-                        break;
-                    }
-                    other => pos.push(other.to_owned()),
-                }
-                i += 1;
-            }
-            if pos.len() < 2 {
-                eprintln!(
-                    "usage: twig verify [record] <journal.jsonl> <program> [args...] [--raw] [--ignore k1,k2] [--min-cases N] [--min-branch 0..1] [--json]"
-                );
-                std::process::exit(2);
-            }
-            let journal = Path::new(&pos[0]);
-            let candidate = twig::verify::Candidate::new(pos[1].clone(), pos[2..].to_vec())
-                .with_raw_cli(raw_cli)
-                .with_ignore_fields(ignore_fields);
-            let verdict = twig::verify::gate(journal, &candidate, min_cases, None, min_branch, None);
-            if json_out {
-                println!("{}", serde_json::to_string_pretty(&verdict).unwrap_or_default());
-            } else if verdict.ok {
-                println!(
-                    "verify ok: {}/{} case(s) matched oracle ({})",
-                    verdict.covered,
-                    verdict.total,
-                    journal.display()
-                );
-            } else {
-                eprintln!(
-                    "verify FAILED ({}/{} matched): {}",
-                    verdict.covered,
-                    verdict.total,
-                    verdict.why.as_deref().unwrap_or("mismatch")
-                );
-                for fail in verdict.fails.iter().take(10) {
-                    eprintln!(
-                        "  input={} want={} got={}",
-                        fail.input, fail.want, fail.got
-                    );
-                }
-            }
-            if !verdict.ok {
-                std::process::exit(1);
+            let code = twig::cli::run_verify_cli(&args[1..]);
+            if code != 0 {
+                std::process::exit(code);
             }
         }
 

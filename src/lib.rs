@@ -12,6 +12,7 @@
 //!   Automation : `automation` (durable GitHub maintenance queue, isolated worktrees & shipping)
 
 pub mod automation;
+pub mod cli;
 pub mod config;
 pub mod control;
 pub mod eval;

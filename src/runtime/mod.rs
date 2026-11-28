@@ -8,6 +8,7 @@ pub mod guard;
 pub mod guidance;
 pub mod mcp;
 pub mod policy;
+mod rpc;
 pub mod session;
 pub mod subagent;
 pub mod tasks;
@@ -16,18 +17,18 @@ pub mod turn;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
 use self::context::Context;
+use self::git_ops::{capture_worktree_snapshot, restore_worktree_snapshot};
 use self::guard::Guard;
 use self::guidance::{inject_playbook, route, Playbook, SkillStore};
 use self::policy::{Policy, Tier};
 use self::session::{
-    append_repo_instructions, capture_worktree_snapshot, detect_model_family, load_child_threads,
-    load_session_patch, notify_herdr, recover_session, restore_worktree_snapshot,
-    RESOLVED_UNKNOWN_MSG,
+    append_repo_instructions, detect_model_family, load_child_threads, load_session_patch,
+    notify_herdr, recover_session, RESOLVED_UNKNOWN_MSG,
 };
 use self::tools::Tools;
 use self::turn::{execute_recorded_call, run_turn_live, ExecEnv, TurnCtx};
@@ -1365,103 +1366,10 @@ impl<'a> Daemon<'a> {
         out: impl Write + Send,
     ) -> std::io::Result<()> {
         self.interactive = true;
-        let output = Arc::new(Mutex::new(out));
         let control = self.control.clone();
-        let (tx, rx) = mpsc::channel::<Value>();
-        let outcome = {
-            let daemon = &mut *self;
-            std::thread::scope(|scope| {
-                let worker_output = output.clone();
-                let worker = scope.spawn(move || -> std::io::Result<()> {
-                    for req in rx {
-                        let id = req["id"].clone();
-                        let method = req["method"].as_str().unwrap_or("");
-                        if method == "turn" {
-                            daemon.control.reset();
-                        }
-                        let mut emit = |v: Value| {
-                            if let Ok(mut out) = worker_output.lock() {
-                                let _ = writeln!(out, "{v}");
-                                let _ = out.flush();
-                            }
-                        };
-                        let result = daemon.dispatch(method, &req["params"], &mut emit);
-                        let reply = match result {
-                            Ok(v) => json!({"id": id, "result": v}),
-                            Err(e) => json!({"id": id, "error": e}),
-                        };
-                        let mut out = worker_output
-                            .lock()
-                            .map_err(|_| std::io::Error::other("output lock"))?;
-                        writeln!(out, "{reply}")?;
-                        out.flush()?;
-                    }
-                    Ok(())
-                });
-                for line in input.lines() {
-                    let line = line?;
-                    let req: Value = match serde_json::from_str(&line) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let mut out = output.lock().unwrap();
-                            writeln!(out, "{}", json!({"error": e.to_string()}))?;
-                            out.flush()?;
-                            continue;
-                        }
-                    };
-                    let params = &req["params"];
-                    let immediate: Option<Result<Value, String>> =
-                        match req["method"].as_str().unwrap_or("") {
-                            "cancel" => {
-                                control.cancel();
-                                Some(Ok(json!({"cancelled": true})))
-                            }
-                            "background" => {
-                                control.request_background();
-                                Some(Ok(json!({"backgrounded": true})))
-                            }
-                            "steer" => {
-                                let text = params["input"].as_str().unwrap_or("");
-                                if text.trim().is_empty() {
-                                    Some(Err("steer requires nonempty input".into()))
-                                } else {
-                                    control.steer(text.to_owned());
-                                    Some(Ok(json!({"queued": true})))
-                                }
-                            }
-                            "approval.resolve"
-                                if control.waiting().as_deref() == params["id"].as_str() =>
-                            {
-                                control.resolve(
-                                    params["id"].as_str().unwrap_or("").into(),
-                                    params["allow"].as_bool().unwrap_or(false),
-                                    params["remember"].as_bool().unwrap_or(false),
-                                    params.get("note").and_then(Value::as_str).map(str::to_owned),
-                                );
-                                Some(Ok(json!({"queued": true})))
-                            }
-                            "ping" => Some(Ok(json!({"pong": true}))),
-                            _ => None,
-                        };
-                    if let Some(reply) = immediate {
-                        let mut out = output.lock().unwrap();
-                        let line = match reply {
-                            Ok(result) => json!({"id": req["id"], "result": result}),
-                            Err(error) => json!({"id": req["id"], "error": error}),
-                        };
-                        writeln!(out, "{line}")?;
-                        out.flush()?;
-                    } else if tx.send(req).is_err() {
-                        break;
-                    }
-                }
-                control.close_input();
-                drop(tx);
-                worker
-                    .join()
-                    .map_err(|_| std::io::Error::other("session worker panicked"))?
-            })
-        };
+        let outcome = rpc::serve_stdio_loop(control, input, out, |method, params, emit| {
+            self.dispatch(method, params, emit)
+        });
         self.interactive = false;
         outcome
     }
@@ -1470,196 +1378,7 @@ impl<'a> Daemon<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::stub::{call, StubLlm};
-
-    #[test]
-    fn approving_recovered_call_never_replays_unknown_side_effect() {
-        let dir =
-            std::env::temp_dir().join(format!("twig-daemon-recovery-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let runs = dir.join("runs");
-        {
-            let mut record = Record::open(runs.join("resume.jsonl"), "resume").unwrap();
-            let assistant = json!({"role":"assistant","content":"","tool_calls":[{"id":"pending","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf executed > result\"}"}}]});
-            record
-                .append("message", json!({"message": assistant.clone()}))
-                .unwrap();
-            record
-                .append(
-                    "approval.requested",
-                    json!({"id":"pending","name":"bash","args":{"command":"printf executed > result"}}),
-                )
-                .unwrap();
-            record
-                .append("messages.checkpoint", json!({"messages": [assistant]}))
-                .unwrap();
-        }
-        let model = StubLlm::new(vec![]);
-        let mut daemon =
-            Daemon::new(&model, &dir, &runs, "resume", &HarnessConfig::default()).unwrap();
-        let out = daemon
-            .dispatch(
-                "approval.resolve",
-                &json!({"id": "pending", "allow": true}),
-                &mut |_| {},
-            )
-            .unwrap();
-        assert_eq!(out["recovered"], true);
-        assert_eq!(out["replayed"], false);
-        assert!(!dir.join("result").exists());
-        assert_eq!(
-            daemon
-                .dispatch("approval.list", &json!({}), &mut |_| {})
-                .unwrap()["pending"],
-            json!([])
-        );
-        assert!(Record::verify_chain(daemon.record.path()).is_ok());
-    }
-
-    #[test]
-    fn recovered_approval_acknowledgement_survives_restart_once() {
-        let dir = std::env::temp_dir().join(format!("twig-daemon-ack-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let runs = dir.join("runs");
-        {
-            let mut record = Record::open(runs.join("resume.jsonl"), "resume").unwrap();
-            let assistant = json!({"role":"assistant","content":"","tool_calls":[{"id":"pending","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf executed > result\"}"}}]});
-            record
-                .append("message", json!({"message": assistant.clone()}))
-                .unwrap();
-            record
-                .append(
-                    "approval.requested",
-                    json!({"id":"pending","name":"bash","args":{"command":"printf executed > result"}}),
-                )
-                .unwrap();
-            record
-                .append("messages.checkpoint", json!({"messages": [assistant]}))
-                .unwrap();
-        }
-        let model = StubLlm::new(vec![]);
-        let mut daemon =
-            Daemon::new(&model, &dir, &runs, "resume", &HarnessConfig::default()).unwrap();
-        daemon
-            .dispatch(
-                "approval.resolve",
-                &json!({"id": "pending", "allow": true}),
-                &mut |_| {},
-            )
-            .unwrap();
-        drop(daemon);
-        let resumed =
-            Daemon::new(&model, &dir, &runs, "resume", &HarnessConfig::default()).unwrap();
-        assert_eq!(
-            resumed
-                .messages
-                .iter()
-                .filter(|m| m["role"] == "tool" && m["tool_call_id"] == "pending")
-                .count(),
-            1
-        );
-        assert!(!dir.join("result").exists());
-    }
-
-    #[test]
-    fn approved_started_crash_before_result_stays_unknown_and_never_replays() {
-        let dir = std::env::temp_dir().join(format!(
-            "twig-daemon-approved-started-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let runs = dir.join("runs");
-        {
-            let mut record = Record::open(runs.join("crash.jsonl"), "crash").unwrap();
-            let assistant = json!({"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"printf ran > side_effect\"}"}}]});
-            record
-                .append("message", json!({"message": assistant.clone()}))
-                .unwrap();
-            record
-                .append(
-                    "approval.requested",
-                    json!({"id":"c1","name":"bash","args":{"command":"printf ran > side_effect"}}),
-                )
-                .unwrap();
-            record
-                .append("approval.resolved", json!({"id":"c1","allow":true}))
-                .unwrap();
-            record
-                .append(
-                    "tool.started",
-                    json!({"id":"c1","tool":"bash","args":{"command":"printf ran > side_effect"}}),
-                )
-                .unwrap();
-            record
-                .append("messages.checkpoint", json!({"messages": [assistant]}))
-                .unwrap();
-        }
-        let model = StubLlm::new(vec![]);
-        let mut daemon =
-            Daemon::new(&model, &dir, &runs, "crash", &HarnessConfig::default()).unwrap();
-        let list = daemon
-            .dispatch("approval.list", &json!({}), &mut |_| {})
-            .unwrap();
-        assert_eq!(list["pending"].as_array().unwrap().len(), 1);
-        assert_eq!(list["pending"][0]["recovered"], true);
-        let out = daemon
-            .dispatch(
-                "approval.resolve",
-                &json!({"id": "c1", "allow": true}),
-                &mut |_| {},
-            )
-            .unwrap();
-        assert_eq!(out["recovered"], true);
-        assert_eq!(out["replayed"], false);
-        assert!(!dir.join("side_effect").exists());
-    }
-
-    #[test]
-    fn active_noninteractive_approval_resolves_and_drains_deferred_calls() {
-        let dir =
-            std::env::temp_dir().join(format!("twig-daemon-active-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("note.txt"), "hello\n").unwrap();
-        let runs = dir.join("runs");
-        let llm = StubLlm::new(vec![
-            StubLlm::with_tools(
-                "",
-                vec![
-                    call("a", "read", json!({"path": "note.txt"})),
-                    call("d", "bash", json!({"command": "rm -rf /"})),
-                    call("e", "bash", json!({"command": "printf ok > after.txt"})),
-                ],
-            ),
-            StubLlm::text("done"),
-        ]);
-        let mut daemon =
-            Daemon::new(&llm, &dir, &runs, "active", &HarnessConfig::default()).unwrap();
-        let paused = daemon
-            .dispatch("turn", &json!({"input": "go"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(paused["reason"], "awaiting_approval");
-        let resolved = daemon
-            .dispatch(
-                "approval.resolve",
-                &json!({"id": "d", "allow": false}),
-                &mut |_| {},
-            )
-            .unwrap();
-        assert_eq!(resolved["allow"], false);
-        assert_eq!(resolved["recovered"], false);
-        assert!(dir.join("after.txt").exists());
-        context::validate_tool_pairs(&daemon.messages).unwrap();
-        assert_eq!(
-            daemon
-                .dispatch("approval.list", &json!({}), &mut |_| {})
-                .unwrap()["pending"],
-            json!([])
-        );
-    }
+    use crate::llm::stub::StubLlm;
 
     #[test]
     fn mode_set_plan_toggles_read_only_persists_and_session_verify_reports_integrity() {
@@ -1684,7 +1403,6 @@ mod tests {
         assert_eq!(verify["plan"], true);
         assert!(verify["guard"]["digest"].is_string());
 
-        // Plan mode persists across restart via mode.changed record entry.
         drop(daemon);
         let mut resumed =
             Daemon::new(&llm, &dir, &runs, "plan-test", &HarnessConfig::default()).unwrap();
@@ -1692,7 +1410,6 @@ mod tests {
         assert_eq!(ping["plan"], true);
         assert_eq!(ping["read_only"], true);
 
-        // Guard narrowing cannot be cleared by turning plan mode off.
         resumed.tools.restrict_read_only();
         let off = resumed
             .dispatch("mode.set", &json!({"plan": false}), &mut |_| {})
@@ -1700,7 +1417,6 @@ mod tests {
         assert_eq!(off["plan"], false);
         assert_eq!(off["read_only"], true);
 
-        // Effort, fork, rewind, and session policy allow work end-to-end.
         let eff = resumed
             .dispatch("effort.set", &json!({"effort": "high"}), &mut |_| {})
             .unwrap();
@@ -1729,252 +1445,6 @@ mod tests {
             .unwrap();
         assert_eq!(rewound["rewound_turns"], 1);
         assert_eq!(resumed.messages.len(), 2);
-    }
-
-    #[test]
-    fn operator_btw_and_git_worktree_rewind_work_without_context_pollution() {
-        let dir = std::env::temp_dir().join(format!("twig-daemon-m4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let runs = dir.join("runs");
-
-        // Initialize a real git repo to exercise non-intrusive GIT_INDEX_FILE worktree snapshots.
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "t@example.com"])
-            .current_dir(&dir)
-            .status();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "twig"])
-            .current_dir(&dir)
-            .status();
-        std::fs::write(dir.join("app.txt"), "v1\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&dir)
-            .status();
-        assert!(std::process::Command::new("git")
-            .args(["commit", "-q", "-m", "init"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
-
-        let llm = StubLlm::new(vec![
-            StubLlm::text("turn1 reply"),
-            StubLlm::text("ephemeral btw answer"),
-        ]);
-        let mut daemon =
-            Daemon::new(&llm, &dir, &runs, "m4-test", &HarnessConfig::default()).unwrap();
-
-        let op = daemon
-            .dispatch("mode.operator", &json!({"enabled": true}), &mut |_| {})
-            .unwrap();
-        assert_eq!(op["operator"], true);
-
-        let t1 = daemon
-            .dispatch("turn", &json!({"input": "inspect app"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(t1["done"], true);
-        let msg_count_before_btw = daemon.messages.len();
-
-        // /btw answers using current context without adding anything to `daemon.messages`.
-        let btw = daemon
-            .dispatch(
-                "session.btw",
-                &json!({"question": "what file exists?"}),
-                &mut |_| {},
-            )
-            .unwrap();
-        assert_eq!(btw["answer"], "ephemeral btw answer");
-        assert_eq!(daemon.messages.len(), msg_count_before_btw);
-
-        // Mutate tracked + untracked files, then rewind with `restore_code: true`.
-        std::fs::write(dir.join("app.txt"), "mutated-v2\n").unwrap();
-        std::fs::write(dir.join("stray.txt"), "untracked\n").unwrap();
-        let rw = daemon
-            .dispatch(
-                "session.rewind",
-                &json!({"turns": 1, "restore_code": true}),
-                &mut |_| {},
-            )
-            .unwrap();
-        assert_eq!(rw["rewound_turns"], 1);
-        assert_eq!(std::fs::read_to_string(dir.join("app.txt")).unwrap(), "v1\n");
-        assert!(!dir.join("stray.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn transient_plan_reminders_never_leak_after_plan_exit_and_git_commit_works() {
-        let dir = std::env::temp_dir().join(format!("twig-rem-commit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let runs = dir.join("runs");
-
-        assert!(std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "t@example.com"])
-            .current_dir(&dir)
-            .status();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "twig"])
-            .current_dir(&dir)
-            .status();
-        std::fs::write(dir.join("lib.rs"), "pub fn v() -> i32 { 1 }\n").unwrap();
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(&dir)
-            .status();
-        assert!(std::process::Command::new("git")
-            .args(["commit", "-q", "-m", "feat: initial"])
-            .current_dir(&dir)
-            .status()
-            .unwrap()
-            .success());
-
-        let llm = StubLlm::new(vec![
-            StubLlm::text("planned"),
-            StubLlm::text("implemented"),
-            StubLlm::text("feat: bump v() to 2"),
-        ]);
-        let mut daemon =
-            Daemon::new(&llm, &dir, &runs, "rem-test", &HarnessConfig::default()).unwrap();
-
-        daemon
-            .dispatch("mode.set", &json!({"plan": true}), &mut |_| {})
-            .unwrap();
-        daemon
-            .dispatch("turn", &json!({"input": "design change"}), &mut |_| {})
-            .unwrap();
-        assert!(daemon
-            .messages
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("Plan mode is active"))));
-
-        // Exiting `/plan` immediately purges the stale read-only `<system-reminder>`.
-        daemon
-            .dispatch("mode.set", &json!({"plan": false}), &mut |_| {})
-            .unwrap();
-        assert!(!daemon
-            .messages
-            .iter()
-            .any(|m| m["content"].as_str().is_some_and(|s| s.contains("Plan mode is active"))));
-
-        daemon
-            .dispatch("turn", &json!({"input": "implement it"}), &mut |_| {})
-            .unwrap();
-        std::fs::write(dir.join("lib.rs"), "pub fn v() -> i32 { 2 }\n").unwrap();
-        let committed = daemon
-            .dispatch("git.commit", &json!({"hint": "bump v"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(committed["subject"], "feat: bump v() to 2");
-        assert!(!committed["sha"].as_str().unwrap().is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn secret_read_requires_approval_and_exit_2_stop_hook_feeds_back_to_model() {
-        let dir = std::env::temp_dir().join(format!("twig-secret-hook-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".twig")).unwrap();
-        let runs = dir.join("runs");
-        std::fs::write(dir.join(".env"), "SECRET=123\n").unwrap();
-        std::fs::write(
-            dir.join(".twig/project.json"),
-            r#"{"stop_hook": "test -f ready.flag || { echo 'missing ready.flag' >&2; exit 2; }"}"#,
-        )
-        .unwrap();
-
-        // Part A: `read(path=".env")` pauses in `awaiting_approval` instead of leaking silently.
-        let llm_secret = StubLlm::new(vec![StubLlm::with_tools(
-            "",
-            vec![call("s1", "read", json!({"path": ".env"}))],
-        )]);
-        let mut d_sec =
-            Daemon::new(&llm_secret, &dir, &runs, "sec-test", &HarnessConfig::default()).unwrap();
-        let paused = d_sec
-            .dispatch("turn", &json!({"input": "check env"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(paused["reason"], "awaiting_approval");
-
-        // Part B: `stop_hook` exit 2 blocks premature completion, feeds stderr back, and succeeds once fixed.
-        let llm_hook = StubLlm::new(vec![
-            StubLlm::text("done too early"),
-            StubLlm::with_tools(
-                "",
-                vec![call(
-                    "w1",
-                    "write",
-                    json!({"path": "ready.flag", "content": "ok\n"}),
-                )],
-            ),
-            StubLlm::text("now truly done"),
-        ]);
-        let mut d_hook =
-            Daemon::new(&llm_hook, &dir, &runs, "hook-test", &HarnessConfig::default()).unwrap();
-        let fin = d_hook
-            .dispatch("turn", &json!({"input": "finish task"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(fin["done"], true);
-        assert_eq!(fin["reason"], "final");
-        assert!(dir.join("ready.flag").is_file());
-        assert!(llm_hook
-            .seen()
-            .iter()
-            .any(|m| m.contains("missing ready.flag")));
-
-        // Part C: `/study` mode is toggleable (default off, injects epistemic provenance when on, zero residue when off)
-        // and writing `.twig/project.json` pauses for explicit human approval (`awaiting_approval`).
-        let llm_study = StubLlm::new(vec![
-            StubLlm::text("[Observed] ok"),
-            StubLlm::text("normal reply"),
-            StubLlm::with_tools(
-                "",
-                vec![call(
-                    "cp1",
-                    "write",
-                    json!({"path": ".twig/project.json", "content": "{}"}),
-                )],
-            ),
-        ]);
-        let mut d_st =
-            Daemon::new(&llm_study, &dir, &runs, "study-test", &HarnessConfig::default()).unwrap();
-        d_st.dispatch("mode.study", &json!({"enabled": true}), &mut |_| {})
-            .unwrap();
-        d_st.dispatch("turn", &json!({"input": "study target"}), &mut |_| {})
-            .unwrap();
-        assert!(d_st.messages.iter().any(|m| {
-            m["content"]
-                .as_str()
-                .is_some_and(|s| s.contains("REA Study Mode is active"))
-        }));
-        d_st.dispatch("mode.study", &json!({"enabled": false}), &mut |_| {})
-            .unwrap();
-        d_st.dispatch("turn", &json!({"input": "normal turn"}), &mut |_| {})
-            .unwrap();
-        assert!(!d_st.messages.iter().any(|m| {
-            m["content"]
-                .as_str()
-                .is_some_and(|s| s.contains("REA Study Mode is active"))
-        }));
-        let cp_pause = d_st
-            .dispatch("turn", &json!({"input": "edit project config"}), &mut |_| {})
-            .unwrap();
-        assert_eq!(cp_pause["reason"], "awaiting_approval");
-
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

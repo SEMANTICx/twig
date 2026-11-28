@@ -843,8 +843,8 @@ mod tests {
         let out = run_check(
             Path::new("/tmp"),
             &Check {
-                command: "while :; do echo loud; done".into(),
-                timeout_ms: 40,
+                command: "printf '%0300d\\n' 0; sleep 5".into(),
+                timeout_ms: 150,
                 max_output_bytes: 100,
             },
         )

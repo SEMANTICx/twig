@@ -1,11 +1,13 @@
 //! T3-style Git workflow primitives: live mid-session worktree handoff (`/worktree`),
+//! non-intrusive `GIT_INDEX_FILE` turn snapshots, confined patch application,
 //! zero-trailer one-click Pull Request shipping (`/pr`), AI trailer hygiene, and
 //! host keep-awake inhibition during long-running agent turns.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -94,7 +96,10 @@ fn sanitize_slug(raw: &str) -> String {
         .to_owned()
 }
 
-fn carry_uncommitted_state(src_wt: &Path, dst_wt: &Path) {
+/// Copy tracked uncommitted diffs and non-ignored untracked files (`<= 4 MiB`, non-symlink,
+/// non-secret) from `src_wt` into `dst_wt`, returning `true` if `dst_wt` received any changes.
+pub(super) fn carry_uncommitted_state(src_wt: &Path, dst_wt: &Path) -> bool {
+    let mut dirty = false;
     if let Ok(diff_out) = Command::new("git")
         .arg("-C")
         .arg(src_wt)
@@ -114,7 +119,9 @@ fn carry_uncommitted_state(src_wt: &Path, dst_wt: &Path) {
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(&diff_out.stdout);
                 }
-                let _ = child.wait();
+                if child.wait().is_ok_and(|s| s.success()) {
+                    dirty = true;
+                }
             }
         }
     }
@@ -142,12 +149,292 @@ fn carry_uncommitted_state(src_wt: &Path, dst_wt: &Path) {
                         if let Some(p) = dst.parent() {
                             let _ = std::fs::create_dir_all(p);
                         }
-                        let _ = std::fs::copy(&src, &dst);
+                        if std::fs::copy(&src, &dst).is_ok() {
+                            dirty = true;
+                        }
                     }
                 }
             }
         }
     }
+    dirty
+}
+
+/// Resolve a relative writable path strictly inside `worktree` (rejecting absolute paths,
+/// `..` traversal, and ancestor symlinks escaping the canonical worktree root).
+pub(crate) fn resolve_writable_under(
+    worktree: &Path,
+    path: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    if path.trim().is_empty() {
+        return Err("refused: empty path".into());
+    }
+    let rel = Path::new(path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!("refused: {path} must stay inside the worktree"));
+    }
+    let root = worktree
+        .canonicalize()
+        .map_err(|e| format!("worktree: {e}"))?;
+    let candidate = root.join(rel);
+    let mut ancestor = candidate.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| format!("refused: invalid path {path}"))?;
+    }
+    let canon_ancestor = ancestor
+        .canonicalize()
+        .map_err(|e| format!("{path}: {e}"))?;
+    if !canon_ancestor.starts_with(&root) {
+        return Err(format!("refused: {path} resolves outside the worktree"));
+    }
+    let tail = candidate
+        .strip_prefix(ancestor)
+        .map_err(|_| format!("refused: {path} resolves outside the worktree"))?;
+    Ok((root, canon_ancestor.join(tail)))
+}
+
+/// Apply a unified git diff inside `worktree` after blocking mode `120000` symlinks and
+/// verifying every touched path stays strictly confined inside `worktree`.
+/// Returns `(rel, target_abs, previous_content)` for undo/stamp bookkeeping.
+pub(crate) fn apply_confined_git_patch(
+    worktree: &Path,
+    patch_text: &str,
+    label: &str,
+) -> Result<Vec<(String, PathBuf, Option<String>)>, String> {
+    if patch_text.trim().is_empty() {
+        return Err(format!("no diff changes found for {label}"));
+    }
+    if patch_text.lines().any(|l| {
+        l.starts_with("new file mode 120000")
+            || l.starts_with("old mode 120000")
+            || l.starts_with("new mode 120000")
+    }) {
+        return Err("refused: symlink git patches (mode 120000) are not permitted".into());
+    }
+    let mut touched_rels: Vec<String> = Vec::new();
+    for line in patch_text.lines() {
+        if let Some(p) = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+        {
+            let trimmed = p.trim();
+            if trimmed != "/dev/null"
+                && !trimmed.is_empty()
+                && !touched_rels.iter().any(|x| x == trimmed)
+            {
+                touched_rels.push(trimmed.to_owned());
+            }
+        }
+    }
+    let mut targets = Vec::with_capacity(touched_rels.len());
+    for rel in &touched_rels {
+        let (_, target) = resolve_writable_under(worktree, rel)?;
+        let prev = target
+            .exists()
+            .then(|| std::fs::read_to_string(&target).ok())
+            .flatten();
+        targets.push((rel.clone(), target, prev));
+    }
+
+    let tmp = std::env::temp_dir().join(format!(
+        "twig-apply-{}-{}.patch",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&tmp, patch_text).map_err(|e| e.to_string())?;
+    let check_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["apply", "--check"])
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("git apply --check: {e}"))?;
+    if !check_out.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "patch {label} does not apply cleanly:\n{}",
+            String::from_utf8_lossy(&check_out.stderr).trim()
+        ));
+    }
+    let apply_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("apply")
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("git apply: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    if !apply_out.status.success() {
+        return Err(format!(
+            "git apply failed:\n{}",
+            String::from_utf8_lossy(&apply_out.stderr).trim()
+        ));
+    }
+    Ok(targets)
+}
+
+/// Capture a non-intrusive Git tree object snapshot of the worktree (tracked + untracked
+/// non-ignored files) using a temporary `GIT_INDEX_FILE` without touching `.git/index`.
+pub(super) fn capture_worktree_snapshot(worktree: &Path) -> Option<String> {
+    if !worktree.join(".git").exists() {
+        let probe = Command::new("git")
+            .args(["-C"])
+            .arg(worktree)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .ok()?;
+        if !probe.status.success() {
+            return None;
+        }
+    }
+    let tmp_idx = std::env::temp_dir().join(format!(
+        "twig-snap-idx-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&tmp_idx);
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["read-tree", "HEAD"])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output();
+    let add_ok = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["add", "-A"])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !add_ok {
+        let _ = std::fs::remove_file(&tmp_idx);
+        return None;
+    }
+    let tree_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .arg("write-tree")
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .ok();
+    let _ = std::fs::remove_file(&tmp_idx);
+    let out = tree_out?;
+    if !out.status.success() {
+        return None;
+    }
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!oid.is_empty()).then_some(oid)
+}
+
+/// Restore the working tree to a previously captured Git tree OID without altering `HEAD`
+/// or the user's staged `.git/index` beyond matching the target snapshot.
+pub(super) fn restore_worktree_snapshot(worktree: &Path, tree_oid: &str) -> Result<String, String> {
+    if tree_oid.trim().is_empty() {
+        return Err("empty snapshot tree id".into());
+    }
+    let tmp_idx = std::env::temp_dir().join(format!(
+        "twig-restore-idx-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let cleanup = |p: &Path| {
+        let _ = std::fs::remove_file(p);
+    };
+    let rt = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["read-tree", tree_oid])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .map_err(|e| format!("git read-tree: {e}"))?;
+    if !rt.status.success() {
+        cleanup(&tmp_idx);
+        return Err(format!(
+            "git read-tree failed: {}",
+            String::from_utf8_lossy(&rt.stderr).trim()
+        ));
+    }
+    let snap_files_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["ls-files", "-z"])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !snap_files_out.status.success() {
+        cleanup(&tmp_idx);
+        return Err(format!(
+            "git ls-files snapshot failed: {}",
+            String::from_utf8_lossy(&snap_files_out.stderr).trim()
+        ));
+    }
+    let snap_set: HashSet<String> = String::from_utf8_lossy(&snap_files_out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let cur_files_out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .output()
+        .map_err(|e| format!("git ls-files current: {e}"))?;
+    if !cur_files_out.status.success() {
+        cleanup(&tmp_idx);
+        return Err(format!(
+            "git ls-files current failed: {}",
+            String::from_utf8_lossy(&cur_files_out.stderr).trim()
+        ));
+    }
+    let mut removed = 0usize;
+    for rel in String::from_utf8_lossy(&cur_files_out.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+    {
+        if !snap_set.contains(rel) {
+            let p = worktree.join(rel);
+            if p.is_file() && std::fs::remove_file(&p).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+
+    let co = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["checkout-index", "-a", "-f"])
+        .env("GIT_INDEX_FILE", &tmp_idx)
+        .output()
+        .map_err(|e| format!("git checkout-index: {e}"))?;
+    cleanup(&tmp_idx);
+    if !co.status.success() {
+        return Err(format!(
+            "git checkout-index failed: {}",
+            String::from_utf8_lossy(&co.stderr).trim()
+        ));
+    }
+    Ok(format!(
+        "restored worktree to snapshot {} ({} files, {} extra removed)",
+        &tree_oid[..tree_oid.len().min(10)],
+        snap_set.len(),
+        removed
+    ))
 }
 
 fn primary_worktree_path(repo: &Path) -> Option<PathBuf> {

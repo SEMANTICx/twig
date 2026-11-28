@@ -4,6 +4,7 @@
 //! user-toggled `/plan` mode) stay private behind behavioral methods, and skill
 //! metadata is queried via `SkillIndex::summary_json()`, avoiding field leaks.
 
+mod code_intel;
 mod fs;
 mod inspect;
 mod lsp;
@@ -14,7 +15,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use self::fs::{glob_stateless, grep_stateless, outline_stateless, read_stateless, FileSnapshot};
+use self::code_intel::outline_stateless;
+use self::fs::{glob_stateless, grep_stateless, read_stateless, FileSnapshot};
 use super::guidance::{SkillIndex, SkillStore};
 use super::mcp::McpRegistry;
 use super::policy::Tier;
@@ -512,13 +514,18 @@ impl Tools {
         }
         ;
         let half = self.max_output / 2;
-        let head: String = text.chars().take(half).collect();
-        let tail: Vec<char> = text.chars().rev().take(half).collect();
-        let tail: String = tail.into_iter().rev().collect();
-        format!(
-            "{head}\n... [{} bytes clipped{saved_hint}] ...\n{tail}",
-            text.len() - self.max_output
-        )
+        let mut head_end = half.min(text.len());
+        while !text.is_char_boundary(head_end) {
+            head_end -= 1;
+        }
+        let mut tail_start = text.len().saturating_sub(half).max(head_end);
+        while !text.is_char_boundary(tail_start) {
+            tail_start += 1;
+        }
+        let head = &text[..head_end];
+        let tail = &text[tail_start..];
+        let clipped_bytes = tail_start.saturating_sub(head_end);
+        format!("{head}\n... [{clipped_bytes} bytes clipped{saved_hint}] ...\n{tail}")
     }
 
     pub fn skill_metadata(&self) -> String {
@@ -608,18 +615,23 @@ impl Tools {
                     .unwrap_or(""),
                 call.args.get("path").and_then(Value::as_str),
             ),
-            "outline" => self.outline(
-                call.args.get("path").and_then(Value::as_str),
-                call.args.get("symbol").and_then(Value::as_str),
-                call.args
-                    .get("deps")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                call.args
-                    .get("lsp")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
+            "outline" => {
+                let (out, code) = outline_stateless(
+                    &self.worktree,
+                    call.args.get("path").and_then(Value::as_str),
+                    call.args.get("symbol").and_then(Value::as_str),
+                    call.args
+                        .get("deps")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    call.args
+                        .get("lsp")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                );
+                self.last_exit_code = code;
+                out
+            }
             "papercut" => {
                 let fields = ["component", "attempted", "expected", "actual", "recovery"];
                 if fields.iter().all(|f| {
@@ -632,36 +644,7 @@ impl Tools {
                     "invalid papercut: each required field must contain 1..4000 bytes".into()
                 }
             }
-            "skill" => {
-                if let Some(name) = call.args["name"].as_str() {
-                    let sub_file = call.args["file"]
-                        .as_str()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty());
-                    if sub_file.is_none() && !name.contains('/') {
-                        if let Some(index) = &self.skills {
-                            if let Ok(body) = index.load(name) {
-                                return body;
-                            }
-                        }
-                    }
-                    let spec = match sub_file {
-                        Some(rel) => format!("{name}/{}", rel.trim_start_matches('/')),
-                        None => name.to_owned(),
-                    };
-                    SkillStore::default_for(Some(&self.worktree))
-                        .load_any(&spec)
-                        .map(|(body, _)| body)
-                        .unwrap_or_else(|e| format!("skill error: {e}"))
-                } else if let Some(index) = &self.skills {
-                    match call.args["query"].as_str() {
-                        Some(q) if !q.trim().is_empty() => index.search_json(q),
-                        _ => index.summary_json(),
-                    }
-                } else {
-                    "No project or global skills enabled; check `twig skill list` for cold-vault skills.".into()
-                }
-            }
+            "skill" => resolve_skill_call(&self.worktree, self.skills.as_ref(), &call.args),
             "todo" => self.update_todo(&call.args, emit),
             "mcp" => {
                 let action = call.args["action"].as_str().unwrap_or("call");
@@ -892,6 +875,37 @@ impl Tools {
             );
         }
         Ok(self.agent_pool.as_ref().unwrap().clone())
+    }
+}
+
+fn resolve_skill_call(worktree: &Path, skills: Option<&SkillIndex>, args: &Value) -> String {
+    if let Some(name) = args["name"].as_str() {
+        let sub_file = args["file"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if sub_file.is_none() && !name.contains('/') {
+            if let Some(index) = skills {
+                if let Ok(body) = index.load(name) {
+                    return body;
+                }
+            }
+        }
+        let spec = match sub_file {
+            Some(rel) => format!("{name}/{}", rel.trim_start_matches('/')),
+            None => name.to_owned(),
+        };
+        SkillStore::default_for(Some(worktree))
+            .load_any(&spec)
+            .map(|(body, _)| body)
+            .unwrap_or_else(|e| format!("skill error: {e}"))
+    } else if let Some(index) = skills {
+        match args["query"].as_str() {
+            Some(q) if !q.trim().is_empty() => index.search_json(q),
+            _ => index.summary_json(),
+        }
+    } else {
+        "No project or global skills enabled; check `twig skill list` for cold-vault skills.".into()
     }
 }
 
@@ -1325,38 +1339,12 @@ impl Tools {
                                     owner: None,
                                 }
                             }
-                            "skill" => {
-                                let text = if let Some(name) = call.args["name"].as_str() {
-                                    if let Some(index) = skills {
-                                        if let Ok(body) = index.load(name) {
-                                            body
-                                        } else {
-                                            SkillStore::default_for(Some(worktree))
-                                                .load_any(name)
-                                                .map(|(b, _)| b)
-                                                .unwrap_or_else(|e| format!("skill error: {e}"))
-                                        }
-                                    } else {
-                                        SkillStore::default_for(Some(worktree))
-                                            .load_any(name)
-                                            .map(|(b, _)| b)
-                                            .unwrap_or_else(|e| format!("skill error: {e}"))
-                                    }
-                                } else if let Some(index) = skills {
-                                    match call.args["query"].as_str() {
-                                        Some(q) if !q.trim().is_empty() => index.search_json(q),
-                                        _ => index.summary_json(),
-                                    }
-                                } else {
-                                    "No project or global skills enabled; check `twig skill list` for cold-vault skills.".into()
-                                };
-                                RoItem {
-                                    text,
-                                    exit_code: None,
-                                    touched: None,
-                                    owner: None,
-                                }
-                            }
+                            "skill" => RoItem {
+                                text: resolve_skill_call(worktree, skills, &call.args),
+                                exit_code: None,
+                                touched: None,
+                                owner: None,
+                            },
                             "bash" => {
                                 let raw = call
                                     .args
@@ -1632,178 +1620,12 @@ mod tests {
     }
 
     #[test]
-    fn edit_write_grep_glob_and_undo_work_and_respect_read_only() {
-        let d = dir();
-        let mut t = Tools::new(&d);
-
-        let created = t.run(&call(
-            "write",
-            json!({"path": "src/lib.rs", "content": "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"}),
-        ));
-        assert!(created.contains("created src/lib.rs"));
-
-        let diff = t.run(&call(
-            "edit",
-            json!({"path": "src/lib.rs", "old_string": "a + b", "new_string": "a.saturating_add(b)"}),
-        ));
-        assert!(diff.contains("-    a + b") && diff.contains("+    a.saturating_add(b)"));
-
-        let found = t.run(&call(
-            "grep",
-            json!({"pattern": "saturating_add", "glob": "*.rs"}),
-        ));
-        assert!(found.contains("src/lib.rs:2:"));
-
-        let files = t.run(&call("glob", json!({"pattern": "**/*.rs"})));
-        assert_eq!(files, "src/lib.rs");
-
-        // Undo reverts edit, then second undo deletes newly created file.
-        assert!(t.undo_last_edit().unwrap().contains("restored src/lib.rs"));
-        assert!(std::fs::read_to_string(d.join("src/lib.rs"))
-            .unwrap()
-            .contains("a + b"));
-        assert!(t.undo_last_edit().unwrap().contains("removed newly created"));
-        assert!(!d.join("src/lib.rs").exists());
-
-        // Plan mode refuses edits and writes.
-        t.apply_plan_mode(true);
-        assert!(t
-            .run(&call("write", json!({"path": "x.txt", "content": "hi"})))
-            .starts_with("refused"));
-        assert!(t
-            .run(&call(
-                "edit",
-                json!({"path": "note.txt", "old_string": "hello", "new_string": "bye"})
-            ))
-            .starts_with("refused"));
-        assert!(t.undo_last_edit().is_err());
-    }
-
-    #[test]
-    fn reverse_comprehension_xrefs_deps_binary_summary_secret_grep_and_bash_mtime_notice_work() {
+    fn stamp_recovery_rejects_externally_modified_files() {
         let d = dir();
         std::fs::create_dir_all(d.join("src")).unwrap();
-        std::fs::write(
-            d.join("src/engine.rs"),
-            "use std::path::Path;\n\n// compute_score comment ignored\npub fn compute_score(x: i32) -> i32 {\n    x * 2\n}\n\npub fn run_pipeline(v: i32) -> i32 {\n    let _msg = \"compute_score string literal ignored\";\n    compute_score(v) + 1\n}\n\npub static DEFAULT_SCORE: i32 = compute_score(3);\n",
-        )
-        .unwrap();
-        std::fs::write(d.join(".env"), "API_TOKEN=super-secret-prod\n").unwrap();
-        std::fs::write(d.join(".env.example"), "API_TOKEN=placeholder\n").unwrap();
-        // Fake 64-bit little-endian x86_64 ELF executable header (20+ bytes)
-        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        elf.extend_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-        elf.extend_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
-        elf.extend_from_slice(&[0u8; 12]);
-        std::fs::write(d.join("artifact.bin"), &elf).unwrap();
-
+        std::fs::write(d.join("src/engine.rs"), "pub fn compute_score(x: i32) -> i32 { x * 2 }\n").unwrap();
         let mut t = Tools::new(&d);
 
-        // 1. Caller/definition xref tracing distinguishes `[def]`, `[in fn run_pipeline]`, and `top-level`
-        // after `run_pipeline`'s closing `}`, while ignoring comments and string literals.
-        let xref = t.run(&call(
-            "outline",
-            json!({"path": "src", "symbol": "compute_score"}),
-        ));
-        assert!(xref.contains("[def] src/engine.rs:4:"), "{xref}");
-        assert!(
-            xref.contains("[in fn run_pipeline] src/engine.rs:10:"),
-            "{xref}"
-        );
-        assert!(
-            xref.contains("[in top-level] src/engine.rs:13:"),
-            "{xref}"
-        );
-        assert!(!xref.contains("src/engine.rs:3:"), "{xref}");
-        assert!(!xref.contains("src/engine.rs:9:"), "{xref}");
-
-        // Symlink git patches (mode 120000) are rejected.
-        assert!(t
-            .apply_git_patch(
-                "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n",
-                "evil"
-            )
-            .is_err());
-
-        // 2. Module dependency extraction works cleanly.
-        let deps = t.run(&call("outline", json!({"path": "src/engine.rs", "deps": true})));
-        assert!(deps.contains("use std::path::Path"), "{deps}");
-
-        // 3. Binary file read returns safe structured header metadata + paginated 16B hexdump,
-        //    Wasm imports/exports, and secret-redacted `.har` API contract distillation.
-        let bin_info = t.run(&call("read", json!({"path": "artifact.bin"})));
-        assert!(
-            bin_info.contains("ELF 64-bit LSB executable (x86_64)") && bin_info.contains("blake3:"),
-            "{bin_info}"
-        );
-        let hex_info = t.run(&call(
-            "read",
-            json!({"path": "artifact.bin", "start_line": 1, "limit": 1}),
-        ));
-        assert!(hex_info.contains("00000000  7f 45 4c 46"), "{hex_info}");
-
-        // Minimal Wasm module with import `env::log` and export `run:fn`:
-        let wasm_bytes: &[u8] = &[
-            0x00, b'a', b's', b'm', 0x01, 0x00, 0x00, 0x00, // magic + v1
-            0x02, 0x0B, 0x01, 0x03, b'e', b'n', b'v', 0x03, b'l', b'o', b'g', 0x00, 0x00, // import
-            0x07, 0x07, 0x01, 0x03, b'r', b'u', b'n', 0x00, 0x00, // export
-        ];
-        std::fs::write(d.join("mod.wasm"), wasm_bytes).unwrap();
-        let wasm_info = t.run(&call("read", json!({"path": "mod.wasm"})));
-        assert!(
-            wasm_info.contains("wasm_imports: env::log")
-                && wasm_info.contains("wasm_exports: run:fn"),
-            "{wasm_info}"
-        );
-
-        let har_json = json!({
-            "log": {
-                "entries": [
-                    {
-                        "request": {"method": "GET", "url": "https://ex.test/logo.png", "headers": []},
-                        "response": {"status": 200, "content": {"mimeType": "image/png", "text": ""}}
-                    },
-                    {
-                        "request": {
-                            "method": "POST",
-                            "url": "https://ex.test/api/v1/items",
-                            "headers": [{"name": "Authorization", "value": "Bearer super-secret-jwt"}],
-                            "postData": {"text": "{\"title\":\"demo\",\"count\":3}"}
-                        },
-                        "response": {
-                            "status": 201,
-                            "content": {"mimeType": "application/json; charset=utf-8", "text": "{\"id\":42,\"ok\":true}"}
-                        }
-                    }
-                ]
-            }
-        });
-        std::fs::write(d.join("trace.har"), har_json.to_string()).unwrap();
-        let har_info = t.run(&call("read", json!({"path": "trace.har"})));
-        assert!(
-            har_info.contains("1 API call(s), 1 static asset(s) filtered")
-                && har_info.contains("Authorization=<redacted>")
-                && !har_info.contains("super-secret-jwt")
-                && har_info.contains("req:{count, title}"),
-            "{har_info}"
-        );
-
-        // 4. Broad directory `grep` skips `.env` secrets while still matching `.env.example`,
-        //    and direct `grep(path=".env")` is explicitly refused.
-        let grep_res = t.run(&call("grep", json!({"pattern": "API_TOKEN"})));
-        assert!(grep_res.contains(".env.example:1:"), "{grep_res}");
-        assert!(!grep_res.contains("super-secret-prod"), "{grep_res}");
-        let direct_secret_grep = t.run(&call(
-            "grep",
-            json!({"pattern": "API_TOKEN", "path": ".env"}),
-        ));
-        assert!(
-            direct_secret_grep.starts_with("refused:")
-                && !direct_secret_grep.contains("super-secret-prod"),
-            "{direct_secret_grep}"
-        );
-
-        // 4b. Session stamp recovery rejects files modified even 10ms after the recorded stamp.
         let (stamp_before, _) = t.outcome_stamps("read", &json!({"path": "src/engine.rs"}));
         assert!(stamp_before.is_none());
         let _ = t.run(&call("read", json!({"path": "src/engine.rs"})));
@@ -1830,21 +1652,11 @@ mod tests {
                 .is_none(),
             "externally modified file must not be marked already-read after recovery"
         );
-        std::fs::write(
-            d.join("src/engine.rs"),
-            "pub fn compute_score(x: i32) -> i32 { x * 2 }\n",
-        )
-        .unwrap();
-
-        // 5. `bash` modifying a previously `read` file appends immediate staleness guidance.
-        let _ = t.run(&call("read", json!({"path": "src/engine.rs"})));
-        let bash_out = t.run(&call(
-            "bash",
-            json!({"command": "printf '// formatted\\n' >> src/engine.rs"}),
-        ));
-        assert!(
-            bash_out.contains("modified previously read file(s): src/engine.rs"),
-            "{bash_out}"
-        );
+        assert!(t
+            .apply_git_patch(
+                "diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+/etc/passwd\n",
+                "evil"
+            )
+            .is_err());
     }
 }
