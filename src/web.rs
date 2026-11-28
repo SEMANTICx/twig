@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 
 use crate::config::{paths, HarnessConfig};
 use crate::exec::{run_process, shell_command};
-use crate::llm::{cli, Llm, Provider};
+use crate::llm::{cli, ConfigOp, Llm, Provider};
 use crate::runtime::guidance::SkillStore;
+use crate::runtime::mcp::McpRegistry;
 use crate::runtime::policy::{Policy, Tier};
 use crate::runtime::session::{archive_session, scan_sessions};
 use crate::runtime::workflows::build_goal_prompt;
@@ -203,6 +204,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
     let resp_json: Result<Value, String> = match (method, path) {
         ("GET", "/api/meta") => Ok(collect_meta(state)),
         ("GET", "/api/files") => Ok(list_worktree_files(query, &state.default_repo)),
+        ("GET", "/api/settings") => collect_settings(query, &state.default_repo),
         ("GET", "/api/sessions") => {
             let all = query.split('&').any(|kv| kv == "all=1");
             let running: std::collections::HashSet<String> = state
@@ -254,6 +256,9 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<WebState>) -> std::io::Result<
         ("POST", "/api/shell") => serde_json::from_slice::<Value>(&body_bytes)
             .map_err(|e| e.to_string())
             .and_then(|req| run_quick_shell(&req, &state.default_repo)),
+        ("POST", "/api/settings") => serde_json::from_slice::<Value>(&body_bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|req| apply_settings(&req, &state.default_repo)),
         _ => Err(format!("not found: {method} {path}")),
     };
 
@@ -707,6 +712,238 @@ fn run_quick_shell(req: &Value, default_repo: &Path) -> Result<Value, String> {
         "stdout": String::from_utf8_lossy(&out.stdout),
         "stderr": String::from_utf8_lossy(&out.stderr),
     }))
+}
+
+fn read_mcp_entries(wt: &Path) -> Vec<Value> {
+    let mut merged: std::collections::BTreeMap<String, (Value, &'static str)> =
+        std::collections::BTreeMap::new();
+    for (p, scope) in [
+        (paths::config_dir().join("mcp.json"), "global"),
+        (wt.join(".twig/mcp.json"), "project"),
+    ] {
+        let Ok(raw) = std::fs::read_to_string(p) else { continue };
+        let Ok(val) = serde_json::from_str::<Value>(&raw) else { continue };
+        if let Some(obj) = val.get("mcpServers").and_then(Value::as_object) {
+            for (k, v) in obj {
+                merged.insert(k.clone(), (v.clone(), scope));
+            }
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(name, (v, scope))| {
+            let args: Vec<String> = v
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                .unwrap_or_default();
+            json!({
+                "name": name,
+                "command": v.get("command").and_then(Value::as_str).unwrap_or(""),
+                "args": args,
+                "disabled": v.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+                "scope": scope,
+            })
+        })
+        .collect()
+}
+
+fn collect_settings(query: &str, default_repo: &Path) -> Result<Value, String> {
+    let wt = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("wt="))
+        .map(url_decode_simple)
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+    let provider = Provider::new();
+    let roles_rep = Provider::apply_config(ConfigOp::RolesReport)?;
+    let (harness, harness_src) = HarnessConfig::resolve()?;
+    let store = SkillStore::default_for(Some(&wt));
+    let (active_cnt, vault_cnt) = store.counts();
+    let (skills_ok, _) = store.doctor_report();
+    let skills: Vec<Value> = store
+        .catalog_for_autocomplete()
+        .into_iter()
+        .map(|(name, scope, desc)| json!({"name": name, "scope": scope, "desc": desc}))
+        .collect();
+
+    let proj_cfg_raw = std::fs::read_to_string(wt.join(".twig/project.json")).unwrap_or_default();
+    let proj_cfg: Value = serde_json::from_str(&proj_cfg_raw).unwrap_or_else(|_| json!({}));
+    let check_cmd = proj_cfg
+        .get("check")
+        .and_then(|c| c.as_str().or_else(|| c.get("command").and_then(Value::as_str)))
+        .unwrap_or("")
+        .to_owned();
+    let post_edit_cmd = proj_cfg
+        .get("post_edit_check")
+        .and_then(|c| c.as_str().or_else(|| c.get("command").and_then(Value::as_str)))
+        .unwrap_or("")
+        .to_owned();
+
+    let global_mem =
+        std::fs::read_to_string(paths::config_dir().join("preferences.md")).unwrap_or_default();
+    let proj_mem = std::fs::read_to_string(wt.join(".twig/preferences.md")).unwrap_or_default();
+
+    Ok(json!({
+        "gateway_base": provider.base(),
+        "cli_runners": cli::detected_runners(),
+        "roles": roles_rep.get("roles").cloned().unwrap_or_else(|| json!([])),
+        "harness": harness,
+        "harness_source": harness_src,
+        "hooks": {
+            "check": check_cmd,
+            "post_edit_check": post_edit_cmd,
+        },
+        "skills": {
+            "active_count": active_cnt,
+            "vault_count": vault_cnt,
+            "healthy": skills_ok,
+            "items": skills,
+        },
+        "mcp": read_mcp_entries(&wt),
+        "memory": {
+            "global": global_mem,
+            "project": proj_mem,
+        }
+    }))
+}
+
+fn apply_settings(req: &Value, default_repo: &Path) -> Result<Value, String> {
+    let section = req["section"].as_str().ok_or("section required")?;
+    let wt = req["worktree"]
+        .as_str()
+        .filter(|s| !s.is_empty() && Path::new(s).is_dir())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_repo.to_path_buf());
+
+    match section {
+        "roles" => {
+            if req["action"].as_str() == Some("reset") {
+                return Provider::apply_config(ConfigOp::ResetRoles);
+            }
+            if let Some(items) = req["items"].as_array() {
+                for it in items {
+                    let Some(role) = it["role"].as_str() else { continue };
+                    Provider::apply_config(ConfigOp::SetRole {
+                        role,
+                        model: it["model"].as_str(),
+                        effort: it["effort"].as_str(),
+                    })?;
+                }
+                return Provider::apply_config(ConfigOp::RolesReport);
+            }
+            let role = req["role"].as_str().ok_or("role required")?;
+            Provider::apply_config(ConfigOp::SetRole {
+                role,
+                model: req.get("model").and_then(Value::as_str),
+                effort: req.get("effort").and_then(Value::as_str),
+            })
+        }
+        "harness" => {
+            let (cur, _) = HarnessConfig::resolve()?;
+            let next = cur.merged(req.get("patch").unwrap_or(&json!({})))?;
+            let cfg_path = paths::config_path();
+            if let Some(p) = cfg_path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            next.save(&cfg_path).map_err(|e| e.to_string())?;
+
+            if let Some(hooks) = req.get("hooks").and_then(Value::as_object) {
+                let pj_path = wt.join(".twig/project.json");
+                let mut pj: Value = std::fs::read_to_string(&pj_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| json!({}));
+                if let Some(obj) = pj.as_object_mut() {
+                    for k in ["check", "post_edit_check"] {
+                        if let Some(v) = hooks.get(k).and_then(Value::as_str) {
+                            let t = v.trim();
+                            if t.is_empty() {
+                                obj.remove(k);
+                            } else {
+                                obj.insert(k.to_owned(), Value::String(t.to_owned()));
+                            }
+                        }
+                    }
+                }
+                if let Some(parent) = pj_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let body = serde_json::to_string_pretty(&pj).map_err(|e| e.to_string())?;
+                std::fs::write(&pj_path, format!("{body}\n")).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({"saved": true}))
+        }
+        "skill" => {
+            let name = req["name"].as_str().ok_or("skill name required")?;
+            let enable = req["enable"].as_bool().unwrap_or(true);
+            let project = req["project"].as_bool().unwrap_or(false);
+            let store = SkillStore::default_for(Some(&wt));
+            let msg = if enable {
+                store.enable(name, project)?
+            } else {
+                store.disable(name, project)?
+            };
+            Ok(json!({"ok": true, "summary": msg}))
+        }
+        "mcp" => {
+            let action = req["action"].as_str().unwrap_or("enable");
+            if matches!(action, "enable" | "disable" | "init_rea") {
+                let msg = McpRegistry::configure_project_file(&wt, req)?;
+                return Ok(json!({"ok": true, "summary": msg}));
+            }
+            let path = wt.join(".twig/mcp.json");
+            let mut root: Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| json!({"mcpServers": {}}));
+            if !root.get("mcpServers").is_some_and(Value::is_object) {
+                root["mcpServers"] = json!({});
+            }
+            let servers = root["mcpServers"].as_object_mut().ok_or("invalid mcp.json")?;
+            if action == "add" {
+                let name = req["server"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("server name required")?;
+                let cmd = req["command"].as_str().map(str::trim).filter(|s| !s.is_empty()).ok_or("command required")?;
+                let args: Vec<String> = req["args"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+                servers.insert(name.to_owned(), json!({"command": cmd, "args": args}));
+            } else if action == "remove" {
+                let name = req["server"].as_str().ok_or("server name required")?;
+                servers.remove(name);
+            } else {
+                return Err(format!("unknown mcp action {action:?}"));
+            }
+            if let Some(p) = path.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?))
+                .map_err(|e| e.to_string())?;
+            Ok(json!({"ok": true, "summary": "Saved .twig/mcp.json"}))
+        }
+        "memory" => {
+            if let Some(g) = req.get("global").and_then(Value::as_str) {
+                let gp = paths::config_dir().join("preferences.md");
+                if let Some(p) = gp.parent() {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&gp, g).map_err(|e| e.to_string())?;
+            }
+            if let Some(pr) = req.get("project").and_then(Value::as_str) {
+                let pp = wt.join(".twig/preferences.md");
+                if let Some(p) = pp.parent() {
+                    std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&pp, pr).map_err(|e| e.to_string())?;
+            }
+            Ok(json!({"saved": true}))
+        }
+        other => Err(format!("unknown settings section {other:?}")),
+    }
 }
 
 #[cfg(test)]
